@@ -9,6 +9,8 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(PCL REQUIRED)
+
 
 add_executable(mapper_node src/mapper_node.cpp)
 target_include_directories(mapper_node PUBLIC
@@ -19,6 +21,7 @@ ament_target_dependencies(
   mapper_node
   "rclcpp"
   "geometry_msgs"
+  PCL
 )
 
 install(TARGETS mapper_node

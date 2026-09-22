@@ -1,4 +1,4 @@
 /pepsi/mapper:
   ros__parameters:
-    map_path: /home/user/LRS-URK/worlds/fei_lrs_gazebo.world
+    map_path: /home/user/LRS-URK/maps/FEI_LRS_PCD/map.pcd
 
