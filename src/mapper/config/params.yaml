@@ -1,0 +1,4 @@
+/pepsi/mapper:
+  ros__parameters:
+    map_path: /home/user/LRS-URK/worlds/fei_lrs_gazebo.world
+
