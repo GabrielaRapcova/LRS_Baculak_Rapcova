@@ -3,7 +3,7 @@
 <package format="3">
   <name>mapper</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Static PCD occupancy map provider</description>
   <maintainer email="michal.baculak@gmail.com">user</maintainer>
   <license>TODO: License declaration</license>
 
@@ -13,13 +13,15 @@
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>pcl_conversions</depend>
-  <depend>pcl_ros</depend>
+  <depend>libpcl-all-dev</depend>
+  <depend>voxel_grid_core</depend>
   <depend>uav_navigation_msgs</depend>
 
-  <test_depend>ament_lint_auto</test_depend>
-  <test_depend>ament_lint_common</test_depend>
+  <test_depend>rclpy</test_depend>
+  <test_depend>ros2run</test_depend>
 
   <exec_depend>ros2launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
 
   <export>
     <build_type>ament_cmake</build_type>
