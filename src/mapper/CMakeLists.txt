@@ -10,6 +10,9 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(PCL REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(pcl_conversions REQUIRED)
+find_package(uav_navigation_msgs REQUIRED)
 
 
 add_executable(mapper_node src/mapper_node.cpp)
@@ -22,6 +25,13 @@ ament_target_dependencies(
   "rclcpp"
   "geometry_msgs"
   PCL
+  sensor_msgs
+  pcl_conversions
+  uav_navigation_msgs
+)
+
+target_link_libraries(mapper_node
+  ${PCL_LIBRARIES}
 )
 
 install(TARGETS mapper_node
