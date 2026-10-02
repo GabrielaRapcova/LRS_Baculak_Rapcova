@@ -1,19 +1,16 @@
 from launch import LaunchDescription
-from launch.substitutions import PathJoinSubstitution
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 
-
 def generate_launch_description():
     return LaunchDescription([
-        Node(
-            package='mapper',
-            executable='mapper_node',
-            namespace='pepsi',
-            name='mapper',
-            parameters=[PathJoinSubstitution([
-                FindPackageShare('mapper'), 'config', 'params.yaml'])
-            ],
-        ),
+        DeclareLaunchArgument('map_file', description='Path to the static PCD map'),
+        DeclareLaunchArgument('params_file', default_value=PathJoinSubstitution([
+            FindPackageShare('mapper'), 'config', 'params.yaml'])),
+        Node(package='mapper', executable='static_mapper', name='static_mapper',
+             parameters=[LaunchConfiguration('params_file'),
+                         {'map_file': LaunchConfiguration('map_file')}], output='screen'),
     ])

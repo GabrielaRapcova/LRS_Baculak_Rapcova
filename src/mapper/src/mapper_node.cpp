@@ -1,710 +1,179 @@
 #include <algorithm>
+#include <chrono>
 #include <cmath>
-#include <cstdint>
-#include <limits>
+#include <map>
 #include <memory>
-#include <string>
+#include <stdexcept>
+#include <tuple>
 #include <vector>
-
-#include <rclcpp/rclcpp.hpp>
-
-#include <geometry_msgs/msg/point.hpp>
-#include <sensor_msgs/msg/point_cloud2.hpp>
-#include <std_msgs/msg/header.hpp>
-
-#include <pcl/point_types.h>
 #include <pcl/io/pcd_io.h>
-#include <pcl/filters/voxel_grid.h>
+#include <pcl/point_types.h>
 #include <pcl_conversions/pcl_conversions.h>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <uav_navigation_msgs/msg/voxel_map.hpp>
+#include <uav_navigation_msgs/srv/check_collision.hpp>
+#include <voxel_grid_core/coordinates.hpp>
 
-#include <nav2_msgs/msg/voxel_grid.hpp>
-#include "uav_navigation_msgs/srv/check_collision.hpp"
+namespace vg = voxel_grid_core;
+using Block = uav_navigation_msgs::msg::VoxelBlock;
+using Key = std::tuple<int32_t, int32_t, int32_t>;
 
-class Mapper : public rclcpp::Node
+class StaticMapper : public rclcpp::Node
 {
-private:
-
-  // --------------------------------------------------------------------------
-  // Map representation
-  // --------------------------------------------------------------------------
-
-  pcl::PointCloud<pcl::PointXYZ>::Ptr _cloud;
-
-  pcl::PointCloud<pcl::PointXYZ>::Ptr _downsampled_cloud;
-
-  nav2_msgs::msg::VoxelGrid _voxel_grid;
-
-
-  // --------------------------------------------------------------------------
-  // Parameters
-  // --------------------------------------------------------------------------
-
-  std::string _map_path;
-
-  double _voxel_resolution;
-  double _inflation_radius;
-
-
-  // --------------------------------------------------------------------------
-  // ROS interfaces
-  // --------------------------------------------------------------------------
-
-  rclcpp::Publisher<nav2_msgs::msg::VoxelGrid>::SharedPtr
-  _voxel_grid_pub_;
-
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr
-    _map_cloud_pub_;
-
-  rclcpp::Service<uav_navigation_msgs::srv::CheckCollision>::SharedPtr
-    _collision_service_;
-
-
-  // --------------------------------------------------------------------------
-  // Map creation
-  // --------------------------------------------------------------------------
-
-  bool load_map();
-
-  void build_voxel_grid();
-
-  void inflate_voxel_grid();
-
-  void publish_map();
-
-  void publish_downsampled_cloud();
-
-
-  // --------------------------------------------------------------------------
-  // Voxel utilities
-  // --------------------------------------------------------------------------
-
-  std::size_t voxel_index(
-    int x,
-    int y,
-    int z) const;
-
-  bool world_to_voxel(
-    const geometry_msgs::msg::Point & point,
-    int & x,
-    int & y,
-    int & z) const;
-
-  bool is_inside(
-    int x,
-    int y,
-    int z) const;
-
-  uint8_t voxel_cost(
-    int x,
-    int y,
-    int z) const;
-
-
-  // --------------------------------------------------------------------------
-  // Service
-  // --------------------------------------------------------------------------
-
-  void check_collision(
-    const std::shared_ptr<
-      uav_navigation_msgs::srv::CheckCollision::Request> request,
-    std::shared_ptr<
-      uav_navigation_msgs::srv::CheckCollision::Response> response);
-
-
 public:
-
-  Mapper();
-};
-
-Mapper::Mapper()
-: Node("mapper_node"),
-  _cloud(std::make_shared<pcl::PointCloud<pcl::PointXYZ>>()),
-  _downsampled_cloud(
-    std::make_shared<pcl::PointCloud<pcl::PointXYZ>>())
-{
-  // --------------------------------------------------------------------------
-  // Parameters
-  // --------------------------------------------------------------------------
-
-  this->declare_parameter(
-    "map_path",
-    "/home/user/LRS-URK/maps/map.pcd");
-
-  this->declare_parameter(
-    "voxel_resolution",
-    0.20);
-
-  this->declare_parameter(
-    "inflation_radius",
-    0.60);
-
-
-  _map_path =
-    this->get_parameter("map_path").as_string();
-
-  _voxel_resolution =
-    this->get_parameter("voxel_resolution").as_double();
-
-  _inflation_radius =
-    this->get_parameter("inflation_radius").as_double();
-
-
-  // --------------------------------------------------------------------------
-  // QoS
-  //
-  // Reliable:
-  //     We don't want to silently lose the map.
-  //
-  // Transient local:
-  //     The publisher keeps the last map for late subscribers.
-  //
-  // Depth 1:
-  //     We only care about the latest map.
-  // --------------------------------------------------------------------------
-
-  auto map_qos = rclcpp::QoS(rclcpp::KeepLast(1));
-  map_qos.reliable();
-  map_qos.transient_local();
-
-  _voxel_grid_pub_ =
-    this->create_publisher<nav2_msgs::msg::VoxelGrid>(
-      "/voxel_grid",
-      map_qos);
-
-
-  _map_cloud_pub_ =
-    this->create_publisher<sensor_msgs::msg::PointCloud2>(
-      "/map_cloud",
-      map_qos);
-
-
-  // --------------------------------------------------------------------------
-  // Collision service
-  // --------------------------------------------------------------------------
-
-  _collision_service_ =
-    this->create_service<uav_navigation_msgs::srv::CheckCollision>(
-      "/check_collision",
-      std::bind(
-        &Mapper::check_collision,
-        this,
-        std::placeholders::_1,
-        std::placeholders::_2));
-
-
-  // --------------------------------------------------------------------------
-  // Load and process map
-  // --------------------------------------------------------------------------
-
-  RCLCPP_INFO(
-    this->get_logger(),
-    "Loading map from: %s",
-    _map_path.c_str());
-
-  if (!load_map())
+  StaticMapper() : Node("static_mapper")
   {
-    RCLCPP_ERROR(
-      this->get_logger(),
-      "Failed to load map.");
-
-    return;
-  }
-
-  RCLCPP_INFO(
-    this->get_logger(),
-    "Loaded %zu points.",
-    _cloud->size());
-
-
-  build_voxel_grid();
-
-  inflate_voxel_grid();
-
-  publish_map();
-
-  publish_downsampled_cloud();
-
-
-  RCLCPP_INFO(
-    this->get_logger(),
-    "Map initialization complete.");
-}
-
-bool Mapper::load_map()
-{
-  if (pcl::io::loadPCDFile<pcl::PointXYZ>(_map_path, *_cloud) == -1)
-  {
-    PCL_ERROR("Couldn't read file %s\n", _map_path.c_str());
-    return false;
-  }
-
-  RCLCPP_INFO(
-    this->get_logger(),
-    "Loaded %zu data points from the map .pcd",
-    _cloud->size());
-
-  return true;
-}
-
-void Mapper::build_voxel_grid()
-{
-  pcl::VoxelGrid<pcl::PointXYZ> filter;
-
-  filter.setInputCloud(_cloud);
-
-  filter.setLeafSize(
-    static_cast<float>(_voxel_resolution),
-    static_cast<float>(_voxel_resolution),
-    static_cast<float>(_voxel_resolution));
-
-  filter.filter(*_downsampled_cloud);
-
-
-  if (_downsampled_cloud->empty())
-  {
-    RCLCPP_ERROR(
-      this->get_logger(),
-      "Downsampled point cloud is empty.");
-
-    return;
-  }
-
-
-  // --------------------------------------------------------------------------
-  // Find map bounds
-  // --------------------------------------------------------------------------
-
-  float min_x = std::numeric_limits<float>::max();
-  float min_y = std::numeric_limits<float>::max();
-  float min_z = std::numeric_limits<float>::max();
-
-  float max_x = std::numeric_limits<float>::lowest();
-  float max_y = std::numeric_limits<float>::lowest();
-  float max_z = std::numeric_limits<float>::lowest();
-
-
-  for (const auto & point : *_downsampled_cloud)
-  {
-    min_x = std::min(min_x, point.x);
-    min_y = std::min(min_y, point.y);
-    min_z = std::min(min_z, point.z);
-
-    max_x = std::max(max_x, point.x);
-    max_y = std::max(max_y, point.y);
-    max_z = std::max(max_z, point.z);
-  }
-
-
-  // --------------------------------------------------------------------------
-  // Align origin to voxel boundaries
-  // --------------------------------------------------------------------------
-
-  min_x =
-    std::floor(min_x / _voxel_resolution)
-    * _voxel_resolution;
-
-  min_y =
-    std::floor(min_y / _voxel_resolution)
-    * _voxel_resolution;
-
-  min_z =
-    std::floor(min_z / _voxel_resolution)
-    * _voxel_resolution;
-
-
-  max_x =
-    std::ceil(max_x / _voxel_resolution)
-    * _voxel_resolution;
-
-  max_y =
-    std::ceil(max_y / _voxel_resolution)
-    * _voxel_resolution;
-
-  max_z =
-    std::ceil(max_z / _voxel_resolution)
-    * _voxel_resolution;
-
-
-  // --------------------------------------------------------------------------
-  // Number of voxels
-  // --------------------------------------------------------------------------
-
-  const uint32_t size_x =
-    static_cast<uint32_t>(
-      std::ceil(
-        (max_x - min_x) / _voxel_resolution));
-
-  const uint32_t size_y =
-    static_cast<uint32_t>(
-      std::ceil(
-        (max_y - min_y) / _voxel_resolution));
-
-  const uint32_t size_z =
-    static_cast<uint32_t>(
-      std::ceil(
-        (max_z - min_z) / _voxel_resolution));
-
-
-  // --------------------------------------------------------------------------
-  // Construct message
-  // --------------------------------------------------------------------------
-
-  _voxel_grid.header.stamp = this->now();
-  _voxel_grid.header.frame_id = "map";
-
-  _voxel_grid.origin.x = min_x;
-  _voxel_grid.origin.y = min_y;
-  _voxel_grid.origin.z = min_z;
-
-  _voxel_grid.resolutions.x = _voxel_resolution;
-  _voxel_grid.resolutions.y = _voxel_resolution;
-  _voxel_grid.resolutions.z = _voxel_resolution;
-
-  _voxel_grid.size_x = size_x;
-  _voxel_grid.size_y = size_y;
-  _voxel_grid.size_z = size_z;
-
-  _voxel_grid.data.assign(
-    static_cast<std::size_t>(size_x) *
-    size_y *
-    size_z,
-    255);
-
-  // --------------------------------------------------------------------------
-  // Mark occupied voxels
-  // --------------------------------------------------------------------------
-
-  for (const auto & point : *_downsampled_cloud)
-  {
-    const int x =
-      static_cast<int>(
-        std::floor(
-          (point.x - min_x)
-          / _voxel_resolution));
-
-    const int y =
-      static_cast<int>(
-        std::floor(
-          (point.y - min_y)
-          / _voxel_resolution));
-
-    const int z =
-      static_cast<int>(
-        std::floor(
-          (point.z - min_z)
-          / _voxel_resolution));
-
-
-    if (!is_inside(x, y, z))
-      continue;
-
-
-    const auto index =
-      voxel_index(x, y, z);
-
-
-    _voxel_grid.data[index] = 254;
-  }
-
-
-  RCLCPP_INFO(
-    this->get_logger(),
-    "Voxel grid: %u x %u x %u = %zu voxels",
-    size_x,
-    size_y,
-    size_z,
-    total_voxels);
-}
-
-std::size_t Mapper::voxel_index(
-  int x,
-  int y,
-  int z) const
-{
-  return
-    static_cast<std::size_t>(x)
-    + static_cast<std::size_t>(_voxel_grid.size_x)
-      * (
-        static_cast<std::size_t>(y)
-        + static_cast<std::size_t>(_voxel_grid.size_y)
-          * static_cast<std::size_t>(z)
-      );
-}
-
-bool Mapper::is_inside(
-  int x,
-  int y,
-  int z) const
-{
-  return
-    x >= 0 &&
-    y >= 0 &&
-    z >= 0 &&
-    x < static_cast<int>(_voxel_grid.size_x) &&
-    y < static_cast<int>(_voxel_grid.size_y) &&
-    z < static_cast<int>(_voxel_grid.size_z);
-}
-
-// TODO: Do the inflation like this: construct an "inflation element" - this would mean the the cost values of neighbour around the singular obstacle element. Then we loop through every obstacle element, and inflate its neighbor using the inflation element. During this phase we can only overwrite the cost of an element with a larger value than already set. The inflation element depends on costmap settings - drone radius, inflation radius, ... 
-void Mapper::inflate_voxel_grid()
-{
-  const int radius_voxels =
-    static_cast<int>(
-      std::ceil(
-        _inflation_radius /
-        _voxel_resolution));
-
-
-  // Keep the original occupied map.
-  const auto original =
-    _voxel_grid.data;
-
-
-  for (int z = 0;
-       z < static_cast<int>(_voxel_grid.size_z);
-       ++z)
-  {
-    for (int y = 0;
-         y < static_cast<int>(_voxel_grid.size_y);
-         ++y)
+    const auto path = declare_parameter<std::string>("map_file", "");
+    const auto frame = declare_parameter<std::string>("frame_id", "map");
+    const double resolution = declare_parameter<double>("resolution", 0.2);
+    const auto origin = declare_parameter<std::vector<double>>("origin", {0., 0., 0.});
+    const auto minimum = declare_parameter<std::vector<double>>("known_free_min", std::vector<double>{});
+    const auto maximum = declare_parameter<std::vector<double>>("known_free_max", std::vector<double>{});
+    const double frequency = declare_parameter<double>("publish_frequency", 0.2);
+    const auto limit = declare_parameter<int64_t>("max_blocks", 100000);
+    if (path.empty() || frame.empty() || origin.size() != 3 ||
+      !std::isfinite(frequency) || frequency <= 0 || limit <= 0 ||
+      !std::isfinite(static_cast<float>(resolution)) || static_cast<float>(resolution) <= 0)
     {
-      for (int x = 0;
-           x < static_cast<int>(_voxel_grid.size_x);
-           ++x)
-      {
-        const auto current_index =
-          voxel_index(x, y, z);
-
-
-        // Don't modify occupied voxels.
-        if (original[current_index] == 254)
-          continue;
-
-
-        double nearest_distance =
-          std::numeric_limits<double>::max();
-
-
-        bool found_obstacle = false;
-
-
-        for (int dz = -radius_voxels;
-             dz <= radius_voxels;
-             ++dz)
-        {
-          for (int dy = -radius_voxels;
-               dy <= radius_voxels;
-               ++dy)
-          {
-            for (int dx = -radius_voxels;
-                 dx <= radius_voxels;
-                 ++dx)
-            {
-              const double distance =
-                std::sqrt(
-                  static_cast<double>(dx * dx)
-                  + static_cast<double>(dy * dy)
-                  + static_cast<double>(dz * dz));
-
-
-              if (distance > radius_voxels)
-                continue;
-
-
-              const int nx = x + dx;
-              const int ny = y + dy;
-              const int nz = z + dz;
-
-
-              if (!is_inside(nx, ny, nz))
-                continue;
-
-
-              if (original[voxel_index(nx, ny, nz)] == 254)
-              {
-                found_obstacle = true;
-
-                nearest_distance =
-                  std::min(
-                    nearest_distance,
-                    distance);
-              }
+      throw std::invalid_argument("Invalid map_file, frame, origin, resolution, frequency or block limit");
+    }
+    // Use the exact float32 geometry sent to consumers.
+    geometry_ = std::make_unique<vg::Geometry>(static_cast<float>(resolution),
+      vg::Point{origin[0], origin[1], origin[2]});
+    map_.resolution = geometry_->resolution();
+    map_.origin.x = origin[0]; map_.origin.y = origin[1]; map_.origin.z = origin[2];
+    map_.header.frame_id = frame;
+    map_.map_id = static_cast<uint64_t>(
+      std::chrono::system_clock::now().time_since_epoch().count());
+    map_.sequence = 0;
+    max_blocks_ = static_cast<size_t>(limit);
+    if (!minimum.empty() || !maximum.empty()) {
+      if (minimum.size() != 3 || maximum.size() != 3) {
+        throw std::invalid_argument("Both known-free bounds require three coordinates");
+      }
+      for (size_t i = 0; i < 3; ++i) {
+        if (!std::isfinite(minimum[i]) || !std::isfinite(maximum[i]) || minimum[i] >= maximum[i]) {
+          throw std::invalid_argument("Known-free bounds must be finite and increasing");
+        }
+      }
+      const auto low = geometry_->world_to_voxel({minimum[0], minimum[1], minimum[2]});
+      const auto high = geometry_->world_to_voxel({maximum[0], maximum[1], maximum[2]});
+      const auto first_block = vg::block_index(low);
+      const auto last_block = vg::block_index(high);
+      const long double requested_blocks =
+        (static_cast<long double>(last_block.x) - first_block.x + 1) *
+        (static_cast<long double>(last_block.y) - first_block.y + 1) *
+        (static_cast<long double>(last_block.z) - first_block.z + 1);
+      if (requested_blocks > max_blocks_) {
+        throw std::invalid_argument("Known-free domain exceeds max_blocks");
+      }
+      // Only voxel centers in the half-open configured domain become known free.
+      for (int64_t z = low.z; z <= high.z; ++z) {
+        for (int64_t y = low.y; y <= high.y; ++y) {
+          for (int64_t x = low.x; x <= high.x; ++x) {
+            const vg::Index index{static_cast<int32_t>(x), static_cast<int32_t>(y), static_cast<int32_t>(z)};
+            const auto center = geometry_->voxel_center(index);
+            if (center.x >= minimum[0] && center.x < maximum[0] &&
+              center.y >= minimum[1] && center.y < maximum[1] &&
+              center.z >= minimum[2] && center.z < maximum[2]) {
+              set(index, Block::FREE);
             }
           }
         }
-
-
-        if (!found_obstacle)
-          continue;
-
-
-        const double metric_distance =
-          nearest_distance * _voxel_resolution;
-
-
-        if (metric_distance <= _voxel_resolution)
-        {
-          _voxel_grid.data[current_index] = 253;
-        }
-        else
-        {
-          const double normalized =
-            1.0 -
-            metric_distance / _inflation_radius;
-
-
-          const uint8_t cost =
-            static_cast<uint8_t>(
-              std::clamp(
-                normalized * 252.0,
-                1.0,
-                252.0));
-
-
-          _voxel_grid.data[current_index] = cost;
-        }
       }
     }
+    pcl::PointCloud<pcl::PointXYZ> input;
+    if (pcl::io::loadPCDFile<pcl::PointXYZ>(path, input) < 0) {
+      throw std::runtime_error("Could not load PCD: " + path);
+    }
+    vg::Point lower{INFINITY, INFINITY, INFINITY}, upper{-INFINITY, -INFINITY, -INFINITY};
+    size_t valid = 0;
+    for (const auto & point : input) {
+      if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) {continue;}
+      set(geometry_->world_to_voxel({point.x, point.y, point.z}), Block::LETHAL);
+      lower.x = std::min(lower.x, double(point.x)); upper.x = std::max(upper.x, double(point.x));
+      lower.y = std::min(lower.y, double(point.y)); upper.y = std::max(upper.y, double(point.y));
+      lower.z = std::min(lower.z, double(point.z)); upper.z = std::max(upper.z, double(point.z));
+      ++valid;
+    }
+    if (valid == 0) {throw std::runtime_error("PCD contains no finite points");}
+    pcl::PointCloud<pcl::PointXYZ> occupied;
+    size_t free_count = 0;
+    for (const auto & entry : blocks_) {
+      const auto & block = entry.second;
+      for (size_t i = 0; i < vg::block_volume; ++i) {
+        if (block.occupancy[i] == Block::FREE) {++free_count;}
+        if (block.occupancy[i] != Block::LETHAL) {continue;}
+        auto center = geometry_->voxel_center({block.x * 8 + static_cast<int>(i % 8),
+          block.y * 8 + static_cast<int>((i / 8) % 8), block.z * 8 + static_cast<int>(i / 64)});
+        occupied.push_back(pcl::PointXYZ(center.x, center.y, center.z));
+      }
+      map_.blocks.push_back(block);
+    }
+    pcl::toROSMsg(occupied, cloud_);
+    cloud_.header.frame_id = frame;
+    auto qos = rclcpp::QoS(1).reliable().transient_local();
+    publisher_ = create_publisher<uav_navigation_msgs::msg::VoxelMap>("map", qos);
+    cloud_publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>("map_cloud", qos);
+    service_ = create_service<uav_navigation_msgs::srv::CheckCollision>("query_occupancy",
+      [this](const std::shared_ptr<uav_navigation_msgs::srv::CheckCollision::Request> request,
+      std::shared_ptr<uav_navigation_msgs::srv::CheckCollision::Response> response) {
+        response->cost = Block::UNKNOWN;
+        try {
+          const auto index = geometry_->world_to_voxel({request->point.x, request->point.y, request->point.z});
+          const auto block = vg::block_index(index);
+          const auto found = blocks_.find({block.x, block.y, block.z});
+          if (found != blocks_.end()) {response->cost = found->second.occupancy[vg::local_index(index)];}
+        } catch (const std::exception &) {}
+        response->collision = response->cost != Block::FREE;
+      });
+    RCLCPP_INFO(get_logger(), "PCD: %zu finite / %zu points; bounds [%g,%g,%g] to [%g,%g,%g]; %zu blocks, %zu occupied, %zu free voxels",
+      valid, input.size(), lower.x, lower.y, lower.z, upper.x, upper.y, upper.z,
+      blocks_.size(), occupied.size(), free_count);
+    publish();
+    timer_ = create_wall_timer(std::chrono::duration<double>(1.0 / frequency), [this]() {publish();});
   }
-}
 
-bool Mapper::world_to_voxel(
-  const geometry_msgs::msg::Point & point,
-  int & x,
-  int & y,
-  int & z) const
-{
-  const double ox =
-    _voxel_grid.origin.position.x;
-
-  const double oy =
-    _voxel_grid.origin.position.y;
-
-  const double oz =
-    _voxel_grid.origin.position.z;
-
-
-  x = static_cast<int>(
-    std::floor(
-      (point.x - ox)
-      / _voxel_grid.resolution));
-
-  y = static_cast<int>(
-    std::floor(
-      (point.y - oy)
-      / _voxel_grid.resolution));
-
-  z = static_cast<int>(
-    std::floor(
-      (point.z - oz)
-      / _voxel_grid.resolution));
-
-
-  return is_inside(x, y, z);
-}
-
-void Mapper::check_collision(
-  const std::shared_ptr<
-    uav_navigation_msgs::srv::CheckCollision::Request> request,
-  std::shared_ptr<
-    uav_navigation_msgs::srv::CheckCollision::Response> response)
-{
-  int x;
-  int y;
-  int z;
-
-
-  if (!world_to_voxel(
-        request->point,
-        x,
-        y,
-        z))
+private:
+  void set(vg::Index index, uint8_t value)
   {
-    // Outside the known map is unknown.
-    response->cost = 255;
-    response->unknown = true;
-
-    // Conservative navigation policy:
-    // unknown space is considered unsafe.
-    response->collision = true;
-
-    return;
+    const auto coordinate = vg::block_index(index);
+    const Key key{coordinate.x, coordinate.y, coordinate.z};
+    auto found = blocks_.find(key);
+    if (found == blocks_.end()) {
+      if (blocks_.size() >= max_blocks_) {throw std::runtime_error("Map exceeds max_blocks");}
+      Block block;
+      block.x = coordinate.x; block.y = coordinate.y; block.z = coordinate.z;
+      block.occupancy.fill(Block::UNKNOWN);
+      found = blocks_.emplace(key, block).first;
+    }
+    found->second.occupancy[vg::local_index(index)] = value;
   }
-
-
-  const uint8_t cost =
-    voxel_cost(x, y, z);
-
-
-  response->cost = cost;
-
-  response->unknown =
-    cost == 255;
-
-
-  response->collision =
-    cost >= 253;
-}
-
-uint8_t Mapper::voxel_cost(int x, int y, int z) const
-{
-  if (!is_inside(x, y, z))
-    return 255;
-
-  return static_cast<uint8_t>(
-    _voxel_grid.data[voxel_index(x, y, z)] & 0xFFu);
-}
-
-void Mapper::set_voxel_cost(
-  int x, int y, int z, uint8_t cost)
-{
-  if (!is_inside(x, y, z))
-    return;
-
-  _voxel_grid.data[voxel_index(x, y, z)] =
-    static_cast<uint32_t>(cost);
-}
-
-void Mapper::publish_map()
-{
-  _voxel_grid.header.stamp = this->now();
-
-  _voxel_grid_pub_->publish(_voxel_grid);
-
-  RCLCPP_INFO(
-    this->get_logger(),
-    "Published voxel grid.");
-}
-
-void Mapper::publish_downsampled_cloud()
-{
-  sensor_msgs::msg::PointCloud2 msg;
-
-  pcl::toROSMsg(
-    *_downsampled_cloud,
-    msg);
-
-
-  msg.header.stamp = this->now();
-  msg.header.frame_id = "map";
-
-
-  _map_cloud_pub_->publish(msg);
-
-
-  RCLCPP_INFO(
-    this->get_logger(),
-    "Published downsampled map cloud with %zu points.",
-    _downsampled_cloud->size());
-}
+  void publish()
+  {
+    map_.header.stamp = now(); cloud_.header.stamp = map_.header.stamp;
+    publisher_->publish(map_); cloud_publisher_->publish(cloud_);
+  }
+  std::unique_ptr<vg::Geometry> geometry_;
+  std::map<Key, Block> blocks_;
+  size_t max_blocks_;
+  uav_navigation_msgs::msg::VoxelMap map_;
+  sensor_msgs::msg::PointCloud2 cloud_;
+  rclcpp::Publisher<uav_navigation_msgs::msg::VoxelMap>::SharedPtr publisher_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_publisher_;
+  rclcpp::Service<uav_navigation_msgs::srv::CheckCollision>::SharedPtr service_;
+  rclcpp::TimerBase::SharedPtr timer_;
+};
 
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
-
-  auto node = std::make_shared<Mapper>();
-  rclcpp::spin(node);
-
+  int result = 0;
+  try {rclcpp::spin(std::make_shared<StaticMapper>());}
+  catch (const std::exception & error) {
+    RCLCPP_FATAL(rclcpp::get_logger("static_mapper"), "%s", error.what()); result = 1;
+  }
   rclcpp::shutdown();
-  return 0;
+  return result;
 }
