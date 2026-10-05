@@ -16,12 +16,16 @@ with a runnable demonstration and validation before the next stage begins.
    space. Demonstrate occupied/free/unknown queries on the hangar map.
 3. **Voxel costmap (implemented).** Inherit geometry, apply configurable vehicle radius + position
    tolerance + margin and a cached 3D inflation stencil. Preserve unknown status
-   according to an explicit policy, publish snapshots and replacement updates,
+   according to an explicit policy, publish retained full snapshots on changes,
    and move collision checks here. Check distances, block-edge inflation, obstacle
    removal and stale/gapped updates. Start with full rebuilds; optimize afterward.
-4. **3D A* and simplification (A1.1, next).** Bounded search, Euclidean admissible heuristic
-   with weight 1, configurable connectivity, collision-checked diagonal edges,
-   start/goal validation and explicit failure reporting. Publish nav_msgs/Path.
+4. **3D A* and simplification (A1.1, next).** Follow README_planner.md: request-driven
+   ComputePath3D action, latest full /costmap snapshot, Euclidean admissible heuristic
+   with weight 1, 26-connectivity, collision-checked diagonal edges,
+   start/goal validation and explicit failure reporting. Return nav_msgs/Path in
+   the action result and optionally publish /plan. Allocate separate search state
+   only for discovered voxels and reset it after each request. No periodic planning,
+   automatic replanning, or validation of previously returned paths.
    Simplify with conservative voxel traversal and recheck all segments. Demonstrate
    altitude-changing routes and unreachable goals; record
    search time and point counts before/after for at least two routes.
@@ -50,8 +54,10 @@ with a runnable demonstration and validation before the next stage begins.
 - Snapshots fully replace state. Updates have map_id and monotonically increasing
   sequence; consumers reject mismatched geometry epochs and sequence gaps and wait
   for a fresh snapshot. Providers must periodically republish snapshots for recovery.
-- Snapshot QoS: reliable, transient-local, depth 1. Update QoS: reliable, volatile;
-  depth and snapshot frequency will be configured during provider implementation.
+- Snapshot QoS: reliable, transient-local, depth 1. The costmap publishes on input
+  changes, with no periodic timer or outgoing incremental updates. The planner
+  consumes complete /costmap snapshots only. Incoming /map_updates remain supported
+  by the costmap; update messages remain available for future extensions.
 - Existing CheckCollision.srv is retained for compatibility; its semantics and
   owning node will be documented during the costmap stage.
 
@@ -96,3 +102,12 @@ chosen by the user for the static map; defaults preserve unsampled space as unkn
   unknown policy fail at startup. Coordinate tests remain passing.
 - Test bounds and clearance values are not validated flight settings. User
   selection of known-free bounds, vehicle margin and shelf evaluation remains.
+
+
+## Assignment transport simplification
+
+The costmap publishes a full retained snapshot after initialization, accepted map
+changes, or invalidation. It does not publish periodically or emit /costmap_updates.
+The static mapper may still repeat /map; identical snapshots do not cause a costmap
+publication. README_planner.md governs the next stage: receiving costmaps updates
+input only, and ComputePath3D requests are the sole trigger for planning.

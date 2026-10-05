@@ -14,7 +14,6 @@
 #include <uav_navigation_msgs/msg/voxel_map.hpp>
 #include <uav_navigation_msgs/msg/voxel_map_update.hpp>
 #include <uav_navigation_msgs/msg/voxel_costmap.hpp>
-#include <uav_navigation_msgs/msg/voxel_costmap_update.hpp>
 #include <uav_navigation_msgs/srv/check_collision.hpp>
 #include <voxel_grid_core/coordinates.hpp>
 
@@ -25,7 +24,6 @@ using Blocks = std::map<Key, Block>;
 using Map = uav_navigation_msgs::msg::VoxelMap;
 using Update = uav_navigation_msgs::msg::VoxelMapUpdate;
 using Costmap = uav_navigation_msgs::msg::VoxelCostmap;
-using CostUpdate = uav_navigation_msgs::msg::VoxelCostmapUpdate;
 struct Offset {int x, y, z; uint8_t cost;};
 
 class VoxelCostmap : public rclcpp::Node
@@ -38,20 +36,18 @@ public:
     const double margin = declare_parameter("safety_margin", 0.1);
     inflation_ = declare_parameter("inflation_radius", 0.8);
     scaling_ = declare_parameter("cost_scaling_factor", 3.0);
-    const double frequency = declare_parameter("publish_frequency", 0.2);
     stencil_limit_ = declare_parameter<int64_t>("max_stencil_cells", 1000000);
     const auto policy = declare_parameter<std::string>("unknown_policy", "blocked");
     for (auto value : {radius, tolerance, margin, inflation_, scaling_}) {
       if (!std::isfinite(value) || value < 0) {throw std::invalid_argument("Clearance parameters must be finite and nonnegative");}
     }
     clearance_ = radius + tolerance + margin;
-    if (!std::isfinite(clearance_) || inflation_ < clearance_ || !std::isfinite(frequency) ||
-      frequency <= 0 || stencil_limit_ <= 0 || policy != "blocked") {
-      throw std::invalid_argument("Require inflation_radius >= clearance, positive frequency/limit, unknown_policy=blocked");
+    if (!std::isfinite(clearance_) || inflation_ < clearance_ ||
+      stencil_limit_ <= 0 || policy != "blocked") {
+      throw std::invalid_argument("Require inflation_radius >= clearance, positive stencil limit, unknown_policy=blocked");
     }
     auto qos = rclcpp::QoS(1).reliable().transient_local();
     publisher_ = create_publisher<Costmap>("costmap", qos);
-    updates_publisher_ = create_publisher<CostUpdate>("costmap_updates", rclcpp::QoS(10).reliable());
     cloud_publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>("costmap_cloud", qos);
     map_subscription_ = create_subscription<Map>("map", qos, [this](Map::ConstSharedPtr map) {snapshot(*map);});
     update_subscription_ = create_subscription<Update>("map_updates", rclcpp::QoS(100).reliable(),
@@ -68,8 +64,6 @@ public:
         }
         response->collision = response->cost >= Block::INSCRIBED;
       });
-    timer_ = create_wall_timer(std::chrono::duration<double>(1.0 / frequency),
-      [this]() {if (synchronized_) {publish();}});
   }
 
 private:
@@ -176,28 +170,12 @@ private:
     }
     try {
       const auto replacements = validate(update.blocks);
-      const auto before = costs_;
       for (const auto & entry : replacements) {
         if (unknown(entry.second)) {occupancy_.erase(entry.first);}
         else {occupancy_[entry.first] = entry.second;}
       }
       rebuild(); map_sequence_ = update.sequence; ++cost_sequence_;
-      CostUpdate output;
-      output.header.frame_id = frame_; output.header.stamp = now();
-      output.map_id = map_id_; output.sequence = cost_sequence_;
-      for (const auto & entry : costs_) {
-        auto prior = before.find(entry.first);
-        if (prior == before.end() || prior->second.occupancy != entry.second.occupancy) {
-          output.blocks.push_back(entry.second);
-        }
-      }
-      for (const auto & entry : before) {
-        if (!costs_.count(entry.first)) {
-          auto cleared = entry.second; cleared.occupancy.fill(Block::UNKNOWN);
-          output.blocks.push_back(cleared);
-        }
-      }
-      updates_publisher_->publish(output); publish();
+      publish();
     } catch (const std::exception & error) {invalidate(error.what());}
   }
   void rebuild()
@@ -270,12 +248,10 @@ private:
   Blocks occupancy_, costs_;
   sensor_msgs::msg::PointCloud2 cloud_;
   rclcpp::Publisher<Costmap>::SharedPtr publisher_;
-  rclcpp::Publisher<CostUpdate>::SharedPtr updates_publisher_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_publisher_;
   rclcpp::Subscription<Map>::SharedPtr map_subscription_;
   rclcpp::Subscription<Update>::SharedPtr update_subscription_;
   rclcpp::Service<uav_navigation_msgs::srv::CheckCollision>::SharedPtr service_;
-  rclcpp::TimerBase::SharedPtr timer_;
 };
 
 int main(int argc, char ** argv)
