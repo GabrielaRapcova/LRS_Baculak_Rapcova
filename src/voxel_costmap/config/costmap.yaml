@@ -8,5 +8,4 @@ voxel_costmap:
     inflation_radius: 0.8
     cost_scaling_factor: 3.0
     unknown_policy: blocked
-    publish_frequency: 0.2
     max_stencil_cells: 1000000

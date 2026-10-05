@@ -6,20 +6,19 @@ import time
 os.environ['ROS_DOMAIN_ID'] = '173'
 import rclpy
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
-from uav_navigation_msgs.msg import VoxelBlock, VoxelMap, VoxelMapUpdate, VoxelCostmap, VoxelCostmapUpdate
+from uav_navigation_msgs.msg import VoxelBlock, VoxelMap, VoxelMapUpdate, VoxelCostmap
 from uav_navigation_msgs.srv import CheckCollision
 
 process = subprocess.Popen(['ros2', 'run', 'voxel_costmap', 'voxel_costmap_node', '--ros-args',
     '-p', 'vehicle_radius:=1.0', '-p', 'position_tolerance:=0.0', '-p', 'safety_margin:=0.0',
-    '-p', 'inflation_radius:=2.0', '-p', 'publish_frequency:=0.01'], start_new_session=True)
+    '-p', 'inflation_radius:=2.0'], start_new_session=True)
 rclpy.init()
 node = rclpy.create_node('costmap_smoke_test')
 qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE)
 publisher = node.create_publisher(VoxelMap, '/map', qos)
 updates = node.create_publisher(VoxelMapUpdate, '/map_updates', 10)
-received, differences = [], []
+received = []
 subscription = node.create_subscription(VoxelCostmap, '/costmap', received.append, qos)
-update_subscription = node.create_subscription(VoxelCostmapUpdate, '/costmap_updates', differences.append, 10)
 client = node.create_client(CheckCollision, '/check_collision')
 
 def wait(condition):
@@ -65,6 +64,13 @@ try:
     publisher.publish(snapshot)
     wait(lambda: len(received) > 0)
     costmap = received[-1]
+    # Identical upstream republication must not emit another costmap.
+    count = len(received)
+    for _ in range(3):
+        publisher.publish(snapshot)
+        for _ in range(5):
+            rclpy.spin_once(node, timeout_sec=0.05)
+    assert len(received) == count, 'Duplicate map caused costmap republication'
     assert costmap.origin.x == 10.0 and costmap.resolution == 1.0 and costmap.map_id == 42
     assert at(costmap, 7, 3, 3) == 254
     assert at(costmap, 7, 3, 4) == 253  # vertical clearance
@@ -83,9 +89,7 @@ try:
     update.blocks = [block(0)]
     updates.publish(update)
     wait(lambda: received[-1].sequence == 1)
-    wait(lambda: len(differences) > 0)
     assert at(received[-1], 7, 3, 3) == 0 and at(received[-1], 9, 3, 3) == 0
-    assert len(differences[-1].blocks) == 2
     # Stale update ignored.
     update.blocks = [block(0, True)]
     updates.publish(update)
@@ -109,10 +113,8 @@ try:
     update.blocks = [cleared]
     updates.publish(update)
     wait(lambda: received[-1].sequence == 4)
-    wait(lambda: len(differences) >= 2)
     assert at(received[-1], 7, 3, 3) == 255
     assert at(received[-1], 9, 3, 3) == 0
-    assert any(b.x == 0 and all(v == 255 for v in b.occupancy) for b in differences[-1].blocks)
     # New epoch inherits new resolution and resets output sequencing.
     snapshot.map_id = 43
     snapshot.sequence = 0
@@ -142,7 +144,14 @@ try:
     late_subscription = node.create_subscription(VoxelCostmap, '/costmap', late.append, qos)
     wait(lambda: bool(late))
     assert late[-1].map_id == 43 and late[-1].blocks
-    print('PASS: 3D inflation, block edges, unknown policy, removal, deltas, stale/gapped updates, recovery, geometry reset')
+    assert node.count_publishers('/costmap_updates') == 0
+    # Wait longer than the previous default 5-second republication interval.
+    count = len(received)
+    deadline = time.monotonic() + 5.5
+    while time.monotonic() < deadline:
+        rclpy.spin_once(node, timeout_sec=0.05)
+    assert len(received) == count, 'Unchanged costmap was periodically republished'
+    print('PASS: 3D inflation, block edges, unknown policy, removal, snapshot transport, stale/gapped updates, recovery, geometry reset')
 finally:
     node.destroy_node()
     rclpy.shutdown()

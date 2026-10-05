@@ -85,9 +85,9 @@ the total radius from an obstacle and must be at least the blocked clearance.
 Only `unknown_policy: blocked` is currently supported. Unknown cells remain
 unknown and are not overwritten by inflation.
 
-- `/costmap`: reliable transient-local snapshot, periodically republished.
-- `/costmap_updates`: reliable complete-block replacements with independent
-  costmap sequence numbering, emitted after map updates.
+- `/costmap`: reliable transient-local full snapshot, published once after
+  initialization and again only when new map input is processed or invalidated.
+  There is no periodic republication and no `/costmap_updates` publisher.
 - `/costmap_cloud`: retained PointCloud2 containing nonzero known costs in an
   `intensity` field. Add it in RViz with transient-local durability, Boxes of size
   equal to map resolution, and Color Transformer `Intensity` (range 1–254).
@@ -109,7 +109,9 @@ candidate stencil cube to prevent excessive allocations.
 
 Duplicate/stale updates are ignored. Sequence gaps, frame/epoch mismatches and
 malformed input invalidate costs and publish an empty snapshot (all space unknown).
-Only a full map snapshot restores synchronization. Map geometry cannot change
+Only a full map snapshot restores synchronization. Full costmap snapshots are
+published after accepted map changes; repeated identical map snapshots are ignored.
+Late subscribers receive the retained costmap while the costmap node stays alive. Map geometry cannot change
 within one `map_id`. Startup parameters require a node restart to change.
 
 ```bash
