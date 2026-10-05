@@ -19,7 +19,7 @@ with a runnable demonstration and validation before the next stage begins.
    according to an explicit policy, publish retained full snapshots on changes,
    and move collision checks here. Check distances, block-edge inflation, obstacle
    removal and stale/gapped updates. Start with full rebuilds; optimize afterward.
-4. **3D A* and simplification (A1.1, next).** Follow README_planner.md: request-driven
+4. **3D A* and simplification (A1.1, implemented).** Follow README_planner.md: request-driven
    ComputePath3D action, latest full /costmap snapshot, Euclidean admissible heuristic
    with weight 1, 26-connectivity, collision-checked diagonal edges,
    start/goal validation and explicit failure reporting. Return nav_msgs/Path in
@@ -29,7 +29,7 @@ with a runnable demonstration and validation before the next stage begins.
    Simplify with conservative voxel traversal and recheck all segments. Demonstrate
    altitude-changing routes and unreachable goals; record
    search time and point counts before/after for at least two routes.
-5. **Composition and repeatable A1.1 demo.** Common/implementation YAML and one launch
+5. **Composition and repeatable A1.1 demo (next).** Common/implementation YAML and one launch
    for static_mapper → voxel_costmap → astar_planner; configurable map and requests,
    RViz setup, clean-checkout build/run instructions and evidence collection.
 6. **Indoor mission (A1.2).** Mission-file parsing, MAVROS handshake and state machine,
@@ -70,7 +70,8 @@ any decision about explicit volume filling are left to the user's testing.
 ## Current limitations
 
 The workspace builds the interfaces, spatial core, static mapper and voxel costmap.
-Planning and flight control are not implemented yet. Known-free bounds must be
+The request-driven planner is implemented; mission composition and flight control
+remain. A1.1 acceptance still requires evaluation on the intended hangar routes. Known-free bounds must be
 chosen by the user for the static map; defaults preserve unsampled space as unknown.
 
 ## Stage 2 validation
@@ -111,3 +112,20 @@ changes, or invalidation. It does not publish periodically or emit /costmap_upda
 The static mapper may still repeat /map; identical snapshots do not cause a costmap
 publication. README_planner.md governs the next stage: receiving costmaps updates
 input only, and ComputePath3D requests are the sole trigger for planning.
+
+
+## Stage 4 validation
+
+- Complete workspace build passed (existing PCL CMake policy warnings remain).
+- Eight planner-core tests and four coordinate tests passed, covering exact
+  endpoints, altitude-changing detours, unknown space, corner/plane contact,
+  disconnected maps, cancellation, repeated searches, negative indices and limits.
+- ROS action tests passed for missing maps, successful requests, frame/start
+  rejection, feedback, cancellation and no automatic planning on costmap changes.
+  Synthetic routes simplified from 8 to 2 points and 6 to 2 points.
+- Real mapper → costmap → action pipeline passed using resolution 0.2 m,
+  known-free bounds [0, 0, 0] to [15, 12, 6], clearance 0.5 m and inflation 0.8 m:
+  (13.6, 1.5, 1.0) → (8.65, 2.02, 1.0): 27 → 2 points, about 1.1 ms;
+  (8.65, 2.02, 1.0) → (4.84, 5.37, 2.0): 27 → 3 points, about 5.8 ms.
+  Timings are individual measurements on this machine. No simulator flight or
+  shelf-volume evaluation was performed.

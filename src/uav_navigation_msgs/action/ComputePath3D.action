@@ -1,0 +1,21 @@
+# Positions must be in the costmap frame; orientations are not used by global search.
+geometry_msgs/PoseStamped start
+geometry_msgs/PoseStamped goal
+---
+uint8 SUCCESS=0
+uint8 NO_MAP=1
+uint8 INVALID_START=2
+uint8 INVALID_GOAL=3
+uint8 NO_PATH=4
+uint8 SEARCH_LIMIT=5
+uint8 CANCELLED=6
+uint8 INTERNAL_ERROR=7
+nav_msgs/Path path
+uint8 status
+string message
+float64 planning_time
+uint32 expanded_nodes
+uint32 raw_point_count
+uint32 refined_point_count
+---
+uint32 expanded_nodes
