@@ -1,0 +1,8 @@
+astar_planner:
+  ros__parameters:
+    max_expansions: 200000
+    max_search_nodes: 500000
+    max_planning_time: 10.0
+    max_los_voxels: 100000
+    cost_weight: 1.0
+    publish_plan: true

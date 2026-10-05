@@ -119,3 +119,58 @@ python3 src/voxel_costmap/test/smoke_test.py
 ros2 service call /check_collision uav_navigation_msgs/srv/CheckCollision \
   "{point: {x: 1.0, y: 2.0, z: 1.0}}"
 ```
+
+
+## Request-driven 3D planner
+
+The planner follows [README_planner.md](README_planner.md). Start mapper and costmap,
+then in another sourced terminal:
+
+```bash
+ros2 launch astar_planner planner_launch.py
+ros2 action send_goal /compute_path_3d uav_navigation_msgs/action/ComputePath3D \
+  "{start: {header: {frame_id: map}, pose: {position: {x: 13.6, y: 1.5, z: 1.0}}}, goal: {header: {frame_id: map}, pose: {position: {x: 8.65, y: 2.02, z: 1.0}}}}" \
+  --feedback
+```
+
+Those example coordinates come from the assignment mission. Their usability
+must be checked against your current known-free domain and clearance settings.
+The action returns the refined `nav_msgs/Path`, status/message, duration in seconds,
+expanded node count and point counts before/after refinement. Both input frame IDs
+must equal the costmap frame; this planner performs no TF transforms. Positions
+are preserved exactly in a successful path; request orientations are ignored and
+output orientations are identity because the result is an XYZ geometric path.
+
+For visualization add a **Path** display in RViz, Topic `/plan`, Fixed Frame `map`,
+with transient-local durability. `/plan` is optional (`publish_plan: false` disables
+it); the action result is authoritative. Failed requests do not publish a new path,
+so an older visualization may remain visible. Costmap reception never triggers
+planning, invalidation or republication of a previous path. A mission node must
+request a new path and decide whether an earlier result is still suitable.
+
+Search uses 26-connected A* with an admissible Euclidean heuristic and symmetric
+edge costs: distance × (1 + cost_weight × mean endpoint cost / 252). Unknown and
+costs ≥253 are blocked. Diagonal edges check all touched neighbor cells. Search
+state is a vector of discovered nodes, index lookup and priority queue, discarded
+after each request. The costmap is an immutable snapshot captured for that search;
+updates during a request apply to subsequent requests.
+
+Greedy line-of-sight refinement removes intermediate points and rechecks every
+returned segment with conservative voxel traversal, including face/edge/corner
+contacts. It preserves collision freedom, but can increase soft-cost exposure
+relative to the discrete A* route; it is not trajectory optimization. Endpoints
+on voxel boundaries can be rejected if they touch an unknown or blocked neighbor.
+
+The node accepts one active request at a time and rejects concurrent requests.
+Search runs in a managed worker so costmap reception and cancellation remain
+responsive. Feedback reports expansions every 256 nodes. Configure time, expansion,
+discovered-node and segment-traversal limits in
+[astar.yaml](src/astar_planner/config/astar.yaml), or override `params_file` at launch.
+Cancellation, invalid start/goal, missing map, no path and limit exhaustion return
+explicit statuses with empty paths. Parameters are read at startup.
+
+```bash
+colcon test --packages-select astar_planner voxel_grid_core
+colcon test-result --verbose
+python3 src/astar_planner/test/smoke_test.py
+```
