@@ -58,5 +58,62 @@ occupied. Allocated blocks are limited by `max_blocks` (default 100000).
 
 Parameters are read at startup; restart to apply changes. This static provider
 publishes no incremental updates. Its sequence stays zero and map_id changes on
-restart. Inflation and planning are the next stages. Shelf-gap evaluation remains
+restart. Planning is the next stage. Shelf-gap evaluation remains
 in the user's testing reminder in the implementation plan.
+
+
+## Voxel costmap
+
+Start the mapper as above, then in another sourced terminal:
+
+```bash
+ros2 launch voxel_costmap costmap_launch.py
+```
+
+Override `params_file` with a YAML file to tune the vehicle dimensions. Defaults
+are initial development values: vehicle radius 0.3 m, position tolerance 0.1 m,
+safety margin 0.1 m, giving 0.5 m blocked clearance. Soft costs extend to 0.8 m.
+Distances are measured between voxel centers; voxel discretization and controller
+accuracy must be accounted for when choosing a margin. These defaults are not a
+validated flight configuration.
+
+The costmap inherits frame, origin and resolution from `/map`; it has no geometry
+parameters. Costs follow the overview: 0 free, 1–252 soft inflation, 253 blocked
+clearance, 254 physical obstacle, 255 unknown. Soft costs decrease exponentially
+with distance using `cost_scaling_factor` (inverse metres). `inflation_radius` is
+the total radius from an obstacle and must be at least the blocked clearance.
+Only `unknown_policy: blocked` is currently supported. Unknown cells remain
+unknown and are not overwritten by inflation.
+
+- `/costmap`: reliable transient-local snapshot, periodically republished.
+- `/costmap_updates`: reliable complete-block replacements with independent
+  costmap sequence numbering, emitted after map updates.
+- `/costmap_cloud`: retained PointCloud2 containing nonzero known costs in an
+  `intensity` field. Add it in RViz with transient-local durability, Boxes of size
+  equal to map resolution, and Color Transformer `Intensity` (range 1–254).
+- `/check_collision`: inherited map-frame coordinates, blocked for costs ≥253,
+  including unknown. Returns 255 and collision=true before a map arrives or while
+  waiting to recover synchronization. `/query_occupancy` still queries the raw map.
+
+**To see an inflation halo, configure known-free bounds on the mapper.** With the
+occupied-only default, neighbors remain unknown, so the cost cloud shows only
+physical obstacles. Choose bounds based on your static-map assumptions rather
+than treating the entire world as free.
+
+A cached 3D stencil is applied around occupied cells; overlapping inflation takes
+maximum cost. Costs are rebuilt from occupancy after each update, so removal also
+clears inflation in neighboring blocks. This first version favors correctness
+before incremental-performance optimization. The costmap package defaults to
+`RelWithDebInfo` when no build type is selected. `max_stencil_cells` limits the
+candidate stencil cube to prevent excessive allocations.
+
+Duplicate/stale updates are ignored. Sequence gaps, frame/epoch mismatches and
+malformed input invalidate costs and publish an empty snapshot (all space unknown).
+Only a full map snapshot restores synchronization. Map geometry cannot change
+within one `map_id`. Startup parameters require a node restart to change.
+
+```bash
+python3 src/voxel_costmap/test/smoke_test.py
+ros2 service call /check_collision uav_navigation_msgs/srv/CheckCollision \
+  "{point: {x: 1.0, y: 2.0, z: 1.0}}"
+```
