@@ -129,3 +129,13 @@ input only, and ComputePath3D requests are the sole trigger for planning.
   (8.65, 2.02, 1.0) → (4.84, 5.37, 2.0): 27 → 3 points, about 5.8 ms.
   Timings are individual measurements on this machine. No simulator flight or
   shelf-volume evaluation was performed.
+
+
+## Inflation semantics revision
+
+`inflation_radius` now denotes the width of the soft-cost zone beyond blocked
+clearance. The stencil's total reach is vehicle_radius + position_tolerance +
+safety_margin + inflation_radius. Zero width retains the blocked clearance and
+adds no soft zone. Earlier timing/route measurements above used the previous
+absolute outer-radius semantics and must be repeated for the revised configuration.
+User YAML tuning is retained: 0.9 m clearance + 0.8 m soft width = 1.7 m total reach.
