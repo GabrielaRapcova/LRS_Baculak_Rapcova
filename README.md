@@ -70,18 +70,23 @@ Start the mapper as above, then in another sourced terminal:
 ros2 launch voxel_costmap costmap_launch.py
 ```
 
-Override `params_file` with a YAML file to tune the vehicle dimensions. Defaults
-are initial development values: vehicle radius 0.3 m, position tolerance 0.1 m,
-safety margin 0.1 m, giving 0.5 m blocked clearance. Soft costs extend to 0.8 m.
+Override `params_file` with a YAML file to tune the vehicle dimensions. The current
+YAML has vehicle radius 0.3 m, position tolerance 0.1 m and safety margin 0.5 m,
+giving 0.9 m blocked clearance. A 0.8 m soft inflation zone extends beyond that
+clearance, giving a total reach of 1.7 m. The node fallback safety margin is 0.1 m
+when no YAML is supplied (0.5 m clearance and 1.3 m total reach).
 Distances are measured between voxel centers; voxel discretization and controller
-accuracy must be accounted for when choosing a margin. These defaults are not a
+accuracy must be accounted for when choosing a margin. These values are not a
 validated flight configuration.
 
 The costmap inherits frame, origin and resolution from `/map`; it has no geometry
 parameters. Costs follow the overview: 0 free, 1–252 soft inflation, 253 blocked
 clearance, 254 physical obstacle, 255 unknown. Soft costs decrease exponentially
 with distance using `cost_scaling_factor` (inverse metres). `inflation_radius` is
-the total radius from an obstacle and must be at least the blocked clearance.
+the width of the soft zone beyond blocked clearance, not the total radius.
+The total radius is vehicle_radius + position_tolerance + safety_margin +
+inflation_radius. A zero inflation_radius disables soft costs while retaining
+the blocked clearance. All radius/tolerance values must be finite and nonnegative.
 Only `unknown_policy: blocked` is currently supported. Unknown cells remain
 unknown and are not overwritten by inflation.
 
@@ -204,3 +209,35 @@ Use `--with-tools` to include released states, mirror and widget tooling.
 The WebUI is not installed by this script; its setup depends on the engine/UI
 versions selected for mission development. The script uses the Jazzy binary
 release rather than cloning the upstream development branch.
+
+
+### Latest FlexBE engine and WebUI from source
+
+```bash
+./scripts/install_flexbe_source.sh --dry-run
+./scripts/install_flexbe_source.sh
+```
+
+The source installer targets Ubuntu 24.04 / Jazzy and creates a separate
+`~/flexbe_ws` overlay. It fetches the engine's `ros2-devel` and WebUI's `main`
+branches, builds the engine, mirror, widget and WebUI, and installs desktop-client
+Python dependencies in a system-site-packages virtual environment. The existing
+apt FlexBE installation remains as an underlay. Use `--workspace /absolute/path`
+to choose a different overlay; `--engine-ref` and `--webui-ref` can pin revisions.
+Rerunning fetches the chosen refs again and refuses modified source checkouts.
+Fetched commits and Python package versions are recorded in the overlay.
+
+In each fresh terminal:
+
+```bash
+source ~/flexbe_ws/setup_flexbe.bash
+# Source navigation packages afterward when needed:
+source /home/user/LRS-URK/ros2_ws/install/local_setup.bash
+ros2 launch flexbe_webui flexbe_full.launch.py
+```
+
+For a browser instead of the Qt desktop client, run the onboard engine separately
+and launch `flexbe_ocs.launch.py headless:=true`; open `http://127.0.0.1:8000`.
+Always source the matching FlexBE overlay on both sides; the source 4.x messages
+must not be mixed with the apt 3.x engine. Build future mission packages with this
+source overlay active as their underlay.

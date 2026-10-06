@@ -9,9 +9,12 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from uav_navigation_msgs.msg import VoxelBlock, VoxelMap, VoxelMapUpdate, VoxelCostmap
 from uav_navigation_msgs.srv import CheckCollision
 
+inflation_width = float(os.environ.get('COSTMAP_TEST_INFLATION_WIDTH', '2.0'))
+assert inflation_width in (0.0, 2.0)
+
 process = subprocess.Popen(['ros2', 'run', 'voxel_costmap', 'voxel_costmap_node', '--ros-args',
     '-p', 'vehicle_radius:=1.0', '-p', 'position_tolerance:=0.0', '-p', 'safety_margin:=0.0',
-    '-p', 'inflation_radius:=2.0'], start_new_session=True)
+    '-p', f'inflation_radius:={inflation_width}'], start_new_session=True)
 rclpy.init()
 node = rclpy.create_node('costmap_smoke_test')
 qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE)
@@ -74,9 +77,15 @@ try:
     assert costmap.origin.x == 10.0 and costmap.resolution == 1.0 and costmap.map_id == 42
     assert at(costmap, 7, 3, 3) == 254
     assert at(costmap, 7, 3, 4) == 253  # vertical clearance
-    assert at(costmap, 8, 4, 3) in range(1, 253)  # across block edge, diagonal
-    assert at(costmap, 9, 3, 3) in range(1, 253)  # soft cost at outer radius
-    assert at(costmap, 10, 3, 3) == 0
+    if inflation_width:
+        assert at(costmap, 8, 4, 3) in range(1, 253)  # block edge, diagonal
+        assert at(costmap, 9, 3, 3) in range(1, 253)  # inside the soft zone
+        assert at(costmap, 10, 3, 3) in range(1, 253)  # 1 m clearance + 2 m width
+        assert at(costmap, 11, 3, 3) == 0  # beyond the combined radius
+    else:
+        assert at(costmap, 8, 4, 3) == 0
+        assert at(costmap, 9, 3, 3) == 0
+        assert all(v in (0, 253, 254, 255) for b in costmap.blocks for v in b.occupancy)
     assert at(costmap, 8, 3, 3) == 255  # preserved unknown
     assert query((17.5, 3.5, 4.5)).collision
     assert query((19.5, 3.5, 3.5)).collision is False
