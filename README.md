@@ -174,3 +174,33 @@ colcon test --packages-select astar_planner voxel_grid_core
 colcon test-result --verbose
 python3 src/astar_planner/test/smoke_test.py
 ```
+
+## Some interesting points for global planner:
+
+1.262; 6.6042; 4.8463 - over first regal
+4.428; 6.7152; 4.8495 - over second regal
+7.5038; 6.7619; 4.8526 - over third regal
+10.518; 6.3189; 4.8556 - 4th hole in roof
+13.655; 6.3526; 4.8587 - 5th hole in the roof
+4.3806; 9.1802; 2.2504 - left to first regal
+5.7076; 4.8771; 2.0405 - between regals
+
+# TODO:
+-[ ] check the A* heuristic
+-[ ] 
+
+## FlexBE installation for A1.2
+
+On Ubuntu 24.04 with ROS 2 Jazzy and its apt repository already configured:
+
+```bash
+./scripts/install_flexbe.sh --dry-run
+./scripts/install_flexbe.sh
+```
+
+The script installs the released `flexbe_core` and `flexbe_onboard` packages,
+updates apt package indexes, and verifies the Python state-machine imports.
+Use `--with-tools` to include released states, mirror and widget tooling.
+The WebUI is not installed by this script; its setup depends on the engine/UI
+versions selected for mission development. The script uses the Jazzy binary
+release rather than cloning the upstream development branch.
