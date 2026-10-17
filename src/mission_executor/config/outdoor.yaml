@@ -18,6 +18,8 @@ outdoor_mission_node:
     gps_ready_duration: 3.0
     telemetry_timeout: 4.0 #2.0   <-- debugging gazebo low fps
     reference_sample_window: 0.5
+    # Wall seconds without ROS clock progress before telemetry is invalidated.
+    clock_stall_timeout: 10.0
     transfer_speed: 1.0
     position_tolerance: 0.25
     altitude_tolerance: 0.2

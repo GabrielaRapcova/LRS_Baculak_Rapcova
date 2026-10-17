@@ -166,6 +166,13 @@ heading alignment and geographic/local consistency remain to be checked.
 
 ## A1.3 takeoff/return flight-check stage
 
+Timing update: telemetry receipt ages, reference sample separation, readiness and
+settling dwell, and flight-phase durations now use ROS time. Service deadlines
+and stream-request retries retain steady time. A wall-time clock-stall watchdog
+invalidates readiness; backward resets discard timestamps and release active
+mission control. The fake-clock test passes at 0.2 real-time factor, including
+pauses, stale data and reset recovery. All 16 fake-vehicle flight scenarios pass.
+
 Added an explicitly enabled C++ state sequence for GUIDED, arm, home-relative
 5 m takeoff, settling, interpolated return, LAND and ground-confirmed disarm.
 Default launch stays telemetry-only. Flight mode uses asynchronous service calls

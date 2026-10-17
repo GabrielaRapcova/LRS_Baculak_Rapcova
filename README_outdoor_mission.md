@@ -302,6 +302,23 @@ This command automatically enters GUIDED and arms after the readiness gate. It i
 not a diagnostic-only run. For a simulation with a working ROS `/clock`, add
 `use_sim_time:=true`; clocks and telemetry must continue throughout the run.
 
+Telemetry receipt ages, GPS/pose pairing, readiness/settling dwell and flight-phase
+durations use ROS time. In simulation, supply Gazebo's bridged `/clock` and set
+`use_sim_time:=true` on MAVROS as well as this node. Without simulation time, the
+same checks use normal system time. Service-response deadlines, stream-request
+retries and command-confirmation phases retain steady wall time.
+`clock_stall_timeout` (10 wall seconds) invalidates readiness if ROS time stops
+advancing; active navigation then aborts. Backward clock resets discard telemetry
+timestamps and readiness dwell; an active mission releases control and requires
+a node restart. Wall timers continue checking these conditions during a pause.
+The controller still uses the configured telemetry timeout for heartbeat messages.
+
+Exercise slow time, pauses and reset recovery without a simulator:
+
+```bash
+python3 src/mission_executor/test/outdoor_clock_test.py
+```
+
 Abort from another sourced terminal:
 
 ```bash
