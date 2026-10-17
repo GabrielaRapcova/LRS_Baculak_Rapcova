@@ -28,16 +28,16 @@ struct TrajectorySample
     double yaw;
 };
 
-bool is_finite(Point3 point);
-bool is_valid(GeodeticPosition position);
-double wrap_angle(double angle);
-double unwrap_angle(double previous, double next);
-double heading_to_yaw(double heading_degrees);
-double poi_yaw(Point3 position, Point3 poi, double previous_yaw, double min_distance);
-std::array<Point3, 5> square_corners(Point3 poi, double side, double flight_height);
-TrajectorySample figure_eight(Point3 centre, double amplitude, double omega, double elapsed);
-double figure_eight_peak_speed(double amplitude, double omega);
-double mission_horizontal_bound(Point3 poi, Point3 launch, double side, double amplitude);
+bool isFinitePoint(Point3 point);
+bool isValidGeodeticPosition(GeodeticPosition position);
+double wrapAngleToPi(double angle);
+double unwrapAngle(double previous, double next);
+double convertHeadingDegreesToEnuYaw(double heading_degrees);
+double calculatePoiFacingYaw(Point3 position, Point3 poi, double previous_yaw, double min_distance);
+std::array<Point3, 5> calculateSquareCornerPositions(Point3 poi, double side, double flight_height);
+TrajectorySample calculateFigureEightSample(Point3 centre, double amplitude, double omega, double elapsed);
+double calculateFigureEightPeakSpeed(double amplitude, double omega);
+double calculateMissionHorizontalDistanceBound(Point3 poi, Point3 launch, double side, double amplitude);
 
 // Mission ENU is anchored at the geodetic origin. local_anchor is that same
 // point in MAVROS local coordinates; yaw_offset rotates ENU axes into local axes.
@@ -45,10 +45,10 @@ class OutdoorReference
 {
 public:
     OutdoorReference(GeodeticPosition origin, Point3 local_anchor, double yaw_offset);
-    Point3 to_enu(GeodeticPosition position) const;
-    GeodeticPosition to_geodetic(Point3 enu) const;
-    Point3 to_local(Point3 enu) const;
-    Point3 from_local(Point3 local) const;
+    Point3 convertGeodeticToMissionEnu(GeodeticPosition position) const;
+    GeodeticPosition convertMissionEnuToGeodetic(Point3 enu) const;
+    Point3 convertMissionEnuToLocal(Point3 enu) const;
+    Point3 convertLocalToMissionEnu(Point3 local) const;
 
 private:
     GeographicLib::LocalCartesian geographic_;

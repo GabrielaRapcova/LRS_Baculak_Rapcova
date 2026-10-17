@@ -51,7 +51,7 @@ enum class OutdoorState
   FAILED
 };
 
-const char * stateName(OutdoorState state);
+const char * getMissionStateName(OutdoorState state);
 
 /**
  * @brief Execute the outdoor mission through MAVROS.
@@ -68,9 +68,9 @@ public:
 private:
   void declareParameters();
   /// Create telemetry subscriptions, diagnostic publishers and stream client.
-  void configureTelemetry();
+  void configureTelemetryInterfaces();
   /// Create flight interfaces only when flight is explicitly enabled.
-  void configureFlightControl();
+  void configureFlightInterfaces();
   /// Keep wall timers active so paused ROS time can still be detected.
   void configureTimers();
   void stateCallback(mavros_msgs::msg::State::ConstSharedPtr msg);
@@ -86,38 +86,38 @@ private:
     std::shared_ptr<std_srvs::srv::Trigger::Request>,
     std::shared_ptr<std_srvs::srv::Trigger::Response> response);
   /// Run readiness or mission progression without blocking the executor.
-  void controlLoop();
+  void updateMission();
   /// Detect clock stalls and discard telemetry from an earlier ROS timeline.
-  void updateClock();
+  void checkRosClock();
   void requestLandedStateStream();
   void validateParameters();
   /// Check a telemetry receipt time against the ROS-time freshness limit.
-  bool isFresh(rclcpp::Time received) const;
-  Point3 localPosition() const;
-  GeodeticPosition gpsPosition() const;
+  bool isWithinTimeout(rclcpp::Time received) const;
+  Point3 getLocalPosition() const;
+  GeodeticPosition getGpsFixPosition() const;
   /// Check the navigation telemetry required both before and during flight.
-  std::string telemetryProblem() const;
-  std::string readinessProblem() const;
-  void captureReference();
-  void updateReadiness();
-  bool isTerminal() const;
-  double localYaw() const;
+  std::string getTelemetryProblemMessage() const;
+  std::string getReadinessProblemMessage() const;
+  void captureMissionReference();
+  void updateMissionReadiness();
+  bool isMissionInTerminalState() const;
+  double getLocalYaw() const;
   /// Enter a phase and invalidate responses belonging to the previous phase.
-  void changePhase(OutdoorState next, const std::string & reason);
+  void changeMissionPhase(OutdoorState next, const std::string & reason);
   /// Request landing while control is owned, or release control otherwise.
-  void beginAbort(const std::string & reason);
-  void requestMode(const std::string & mode);
-  void requestArm(bool arm);
+  void requestMissionAbort(const std::string & reason);
+  void requestFlightMode(const std::string & mode);
+  void requestArmingState(bool arm);
   void requestTakeoff();
-  std::string flightNavigationProblem() const;
-  bool settledAt(Point3 destination);
-  Point3 squareDestination() const;
-  Point3 centreEnu() const;
+  std::string getFlightNavigationProblemMessage() const;
+  bool isSettledAtPosition(Point3 destination);
+  Point3 getCurrentSquareCornerPosition() const;
+  Point3 getFigureEightCentreEnuPosition() const;
   /// Check flight authority and health, then advance the current mission phase.
-  void updateFlight();
+  void updateFlightStateMachine();
   /// Publish one ENU position/yaw target after checking control ownership.
-  void publishSetpoint();
-  static void addValue(
+  void publishFlightSetpoint();
+  static void addDiagnosticValue(
     diagnostic_msgs::msg::DiagnosticStatus & status,
     const std::string & key, const std::string & value);
   /// Report reference, telemetry and heading consistency without commanding flight.

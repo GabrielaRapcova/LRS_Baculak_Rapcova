@@ -12,7 +12,7 @@ TEST(OutdoorGeometry, GeographicRoundTrips)
     OutdoorReference reference({48.15, 17.07, 150.0}, {10.0, 20.0, 3.0}, 0.0);
     for (Point3 point : {Point3{0.0, 0.0, 0.0}, Point3{5.0, 5.0, 5.0},
             Point3{-50.0, 30.0, -2.0}}) {
-        auto recovered = reference.to_enu(reference.to_geodetic(point));
+        auto recovered = reference.convertGeodeticToMissionEnu(reference.convertMissionEnuToGeodetic(point));
         EXPECT_NEAR(recovered.x, point.x, 1e-7);
         EXPECT_NEAR(recovered.y, point.y, 1e-7);
         EXPECT_NEAR(recovered.z, point.z, 1e-7);
@@ -22,11 +22,11 @@ TEST(OutdoorGeometry, GeographicRoundTrips)
 TEST(OutdoorGeometry, TranslatedRotatedLocalFrame)
 {
     OutdoorReference reference({48.15, 17.07, 150.0}, {10.0, 20.0, 3.0}, pi / 2.0);
-    auto local = reference.to_local({2.0, 3.0, 5.0});
+    auto local = reference.convertMissionEnuToLocal({2.0, 3.0, 5.0});
     EXPECT_NEAR(local.x, 7.0, 1e-12);
     EXPECT_NEAR(local.y, 22.0, 1e-12);
     EXPECT_DOUBLE_EQ(local.z, 8.0);
-    auto enu = reference.from_local(local);
+    auto enu = reference.convertLocalToMissionEnu(local);
     EXPECT_NEAR(enu.x, 2.0, 1e-12);
     EXPECT_NEAR(enu.y, 3.0, 1e-12);
     EXPECT_DOUBLE_EQ(enu.z, 5.0);
@@ -34,19 +34,19 @@ TEST(OutdoorGeometry, TranslatedRotatedLocalFrame)
 
 TEST(OutdoorGeometry, HeadingAndWraparound)
 {
-    EXPECT_NEAR(heading_to_yaw(0.0), pi / 2.0, 1e-12);
-    EXPECT_NEAR(heading_to_yaw(90.0), 0.0, 1e-12);
-    EXPECT_NEAR(heading_to_yaw(180.0), -pi / 2.0, 1e-12);
-    EXPECT_NEAR(heading_to_yaw(270.0), pi, 1e-12);
-    EXPECT_NEAR(unwrap_angle(179.0 * pi / 180.0, -179.0 * pi / 180.0),
+    EXPECT_NEAR(convertHeadingDegreesToEnuYaw(0.0), pi / 2.0, 1e-12);
+    EXPECT_NEAR(convertHeadingDegreesToEnuYaw(90.0), 0.0, 1e-12);
+    EXPECT_NEAR(convertHeadingDegreesToEnuYaw(180.0), -pi / 2.0, 1e-12);
+    EXPECT_NEAR(convertHeadingDegreesToEnuYaw(270.0), pi, 1e-12);
+    EXPECT_NEAR(unwrapAngle(179.0 * pi / 180.0, -179.0 * pi / 180.0),
         181.0 * pi / 180.0, 1e-12);
-    EXPECT_DOUBLE_EQ(poi_yaw({2.5, 2.5, 5.0}, {2.5, 2.5, 0.0}, 1.2, 0.2), 1.2);
-    EXPECT_NEAR(poi_yaw({3.5, 2.5, 5.0}, {2.5, 2.5, 0.0}, 0.0, 0.2), pi, 1e-12);
+    EXPECT_DOUBLE_EQ(calculatePoiFacingYaw({2.5, 2.5, 5.0}, {2.5, 2.5, 0.0}, 1.2, 0.2), 1.2);
+    EXPECT_NEAR(calculatePoiFacingYaw({3.5, 2.5, 5.0}, {2.5, 2.5, 0.0}, 0.0, 0.2), pi, 1e-12);
 }
 
 TEST(OutdoorGeometry, AgreedSquareAndEnvelope)
 {
-    auto corners = square_corners({2.5, 2.5, 0.0}, 5.0, 8.0);
+    auto corners = calculateSquareCornerPositions({2.5, 2.5, 0.0}, 5.0, 8.0);
     EXPECT_DOUBLE_EQ(corners[0].x, 0.0);
     EXPECT_DOUBLE_EQ(corners[0].y, 5.0);
     EXPECT_DOUBLE_EQ(corners[1].x, 5.0);
@@ -55,28 +55,28 @@ TEST(OutdoorGeometry, AgreedSquareAndEnvelope)
     EXPECT_DOUBLE_EQ(corners[3].y, 0.0);
     EXPECT_DOUBLE_EQ(corners[4].x, corners[0].x);
     EXPECT_DOUBLE_EQ(corners[4].z, 8.0);
-    EXPECT_NEAR(mission_horizontal_bound({2.5, 2.5, 0.0}, {0.0, 0.0, 0.0}, 5.0, 3.0),
+    EXPECT_NEAR(calculateMissionHorizontalDistanceBound({2.5, 2.5, 0.0}, {0.0, 0.0, 0.0}, 5.0, 3.0),
         std::sqrt(50.0), 1e-12);
-    EXPECT_GT(mission_horizontal_bound({2.5, 2.5, 0.0}, {-10.0, 0.0, 0.0}, 5.0, 3.0), 10.0);
+    EXPECT_GT(calculateMissionHorizontalDistanceBound({2.5, 2.5, 0.0}, {-10.0, 0.0, 0.0}, 5.0, 3.0), 10.0);
 }
 
 TEST(OutdoorGeometry, FullFigureEightAndAnalyticVelocity)
 {
     double omega = 0.2;
-    auto start = figure_eight({2.5, 2.5, 8.0}, 3.0, omega, 0.0);
-    auto end = figure_eight({2.5, 2.5, 8.0}, 3.0, omega, 2.0 * pi / omega);
+    auto start = calculateFigureEightSample({2.5, 2.5, 8.0}, 3.0, omega, 0.0);
+    auto end = calculateFigureEightSample({2.5, 2.5, 8.0}, 3.0, omega, 2.0 * pi / omega);
     EXPECT_NEAR(start.yaw, pi / 4.0, 1e-12);
     EXPECT_NEAR(end.position.x, start.position.x, 1e-12);
     EXPECT_NEAR(end.position.y, start.position.y, 1e-12);
     EXPECT_DOUBLE_EQ(end.position.z, 8.0);
-    EXPECT_NEAR(figure_eight_peak_speed(3.0, omega), 0.6 * std::sqrt(2.0), 1e-12);
+    EXPECT_NEAR(calculateFigureEightPeakSpeed(3.0, omega), 0.6 * std::sqrt(2.0), 1e-12);
     for (double time = 0.1; time < 31.0; time += 0.1) {
-        auto sample = figure_eight({2.5, 2.5, 8.0}, 3.0, omega, time);
-        auto before = figure_eight({2.5, 2.5, 8.0}, 3.0, omega, time - 1e-5);
-        auto after = figure_eight({2.5, 2.5, 8.0}, 3.0, omega, time + 1e-5);
+        auto sample = calculateFigureEightSample({2.5, 2.5, 8.0}, 3.0, omega, time);
+        auto before = calculateFigureEightSample({2.5, 2.5, 8.0}, 3.0, omega, time - 1e-5);
+        auto after = calculateFigureEightSample({2.5, 2.5, 8.0}, 3.0, omega, time + 1e-5);
         EXPECT_NEAR((after.position.x - before.position.x) / 2e-5, sample.velocity.x, 1e-8);
         EXPECT_NEAR((after.position.y - before.position.y) / 2e-5, sample.velocity.y, 1e-8);
-        EXPECT_LE(std::hypot(sample.velocity.x, sample.velocity.y), figure_eight_peak_speed(3.0, omega));
+        EXPECT_LE(std::hypot(sample.velocity.x, sample.velocity.y), calculateFigureEightPeakSpeed(3.0, omega));
     }
 }
 
@@ -84,9 +84,9 @@ TEST(OutdoorGeometry, RejectsInvalidInputs)
 {
     double nan = std::numeric_limits<double>::quiet_NaN();
     EXPECT_THROW((OutdoorReference({91.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, 0.0)), std::invalid_argument);
-    EXPECT_THROW(wrap_angle(nan), std::invalid_argument);
-    EXPECT_THROW(square_corners({0.0, 0.0, 0.0}, -5.0, 5.0), std::invalid_argument);
-    EXPECT_THROW(figure_eight({0.0, 0.0, 0.0}, 3.0, 0.0, 1.0), std::invalid_argument);
-    EXPECT_THROW(figure_eight({0.0, 0.0, 0.0}, 3.0, 0.2, -1.0), std::invalid_argument);
+    EXPECT_THROW(wrapAngleToPi(nan), std::invalid_argument);
+    EXPECT_THROW(calculateSquareCornerPositions({0.0, 0.0, 0.0}, -5.0, 5.0), std::invalid_argument);
+    EXPECT_THROW(calculateFigureEightSample({0.0, 0.0, 0.0}, 3.0, 0.0, 1.0), std::invalid_argument);
+    EXPECT_THROW(calculateFigureEightSample({0.0, 0.0, 0.0}, 3.0, 0.2, -1.0), std::invalid_argument);
 }
 }  // namespace mission_executor
