@@ -12,7 +12,6 @@
 namespace mission_executor
 {
 
-// Odstránenie medzier zo začiatku a konca textu
 static std::string trim(const std::string & text)
 {
     const auto first = text.find_first_not_of(" \t\r\n");
@@ -26,7 +25,6 @@ static std::string trim(const std::string & text)
     return text.substr(first, last - first + 1);
 }
 
-// Rozdelenie CSV riadku podľa čiarky
 static std::vector<std::string> split_csv(const std::string & line)
 {
     std::vector<std::string> fields;
@@ -37,7 +35,6 @@ static std::vector<std::string> split_csv(const std::string & line)
         fields.push_back(trim(field));
     }
 
-    // Zachovanie prázdneho posledného stĺpca
     if (!line.empty() && line.back() == ',') {
         fields.push_back("");
     }
@@ -45,7 +42,6 @@ static std::vector<std::string> split_csv(const std::string & line)
     return fields;
 }
 
-// Prevod textu na číslo s kontrolou platnosti
 static double parse_number(
     const std::string & text,
     std::size_t line_number)
@@ -69,7 +65,6 @@ static double parse_number(
     }
 }
 
-// Prevod textu na typ presnosti
 static Precision parse_precision(
     const std::string & text,
     std::size_t line_number)
@@ -88,7 +83,6 @@ static Precision parse_precision(
     );
 }
 
-// Prevod textu na typ úlohy
 static void parse_task(
     const std::string & text,
     MissionWaypoint & waypoint,
@@ -136,7 +130,6 @@ static void parse_task(
     );
 }
 
-// Hlavná funkcia na načítanie misie
 Mission MissionParser::load_from_csv(const std::string & file_path)
 {
     std::ifstream file(file_path);
@@ -159,15 +152,12 @@ Mission MissionParser::load_from_csv(const std::string & file_path)
 
         line = trim(line);
 
-        // Ignorovanie prázdnych riadkov a komentárov
         if (line.empty() || line[0] == '#') {
             continue;
         }
 
-        // Rozdelenie riadku na stĺpce
-        const auto fields = split_csv(line);
+         const auto fields = split_csv(line);
 
-        // Prvý platný riadok musí byť hlavička
         if (!header_found) {
 
             const std::vector<std::string> expected_header = {
@@ -185,7 +175,6 @@ Mission MissionParser::load_from_csv(const std::string & file_path)
             continue;
         }
 
-        // Každý waypoint musí obsahovať 5 stĺpcov
         if (fields.size() != 5) {
             throw std::runtime_error(
                 "Expected 5 columns on line " +
@@ -219,4 +208,4 @@ Mission MissionParser::load_from_csv(const std::string & file_path)
     return mission;
 }
 
-}  // namespace mission_executor
+}
