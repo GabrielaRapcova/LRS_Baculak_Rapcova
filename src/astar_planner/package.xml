@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>astar_planner</name><version>0.1.0</version>
+  <description>Request-driven 3D A* with conservative line-of-sight refinement.</description>
+  <maintainer email="michal.baculak@gmail.com">Michal Baculak</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend><depend>rclcpp_action</depend><depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend><depend>uav_navigation_msgs</depend><depend>voxel_grid_core</depend>
+  <exec_depend>launch_ros</exec_depend><exec_depend>ros2launch</exec_depend>
+  <test_depend>ament_cmake_gtest</test_depend><test_depend>rclpy</test_depend>
+  <test_depend>ros2run</test_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

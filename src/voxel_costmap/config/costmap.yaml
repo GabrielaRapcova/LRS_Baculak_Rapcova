@@ -1,11 +1,12 @@
-voxel_costmap:
+/**:
   ros__parameters:
     # Starting values only; tune and justify for the actual vehicle/controller.
     vehicle_radius: 0.3
     position_tolerance: 0.1
-    safety_margin: 0.1
-    # Total soft-cost radius, measured from occupied voxel centers.
-    inflation_radius: 0.8
+    safety_margin: 0.25
+    # Soft-cost zone width beyond vehicle_radius + position_tolerance + safety_margin.
+    # With the values below: 0.9 m blocked clearance + 0.8 m soft zone = 1.7 m total.
+    inflation_radius: 0.0
     cost_scaling_factor: 3.0
     unknown_policy: blocked
     max_stencil_cells: 1000000
