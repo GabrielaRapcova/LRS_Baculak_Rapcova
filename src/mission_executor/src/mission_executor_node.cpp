@@ -71,6 +71,7 @@ public:
         this->declare_parameter<bool>("enable_task_sequence_check", false);
         this->declare_parameter<bool>("enable_task_flight", false);
         this->declare_parameter<bool>("task_flight_confirmed", false);
+        this->declare_parameter<bool>("task_slow_sitl_telemetry", false);
         this->declare_parameter<double>("task_ground_wait_s", 3.0);
         this->declare_parameter<double>("task_max_direct_leg_m", 1.25);
 
@@ -97,6 +98,7 @@ public:
             this->get_parameter("enable_task_flight").as_bool();
         task_flight_confirmed_ =
             this->get_parameter("task_flight_confirmed").as_bool();
+        task_slow_sitl_telemetry_ = this->get_parameter("task_slow_sitl_telemetry").as_bool();
         task_ground_wait_s_ =
             this->get_parameter("task_ground_wait_s").as_double();
         task_max_direct_leg_m_ =
@@ -106,6 +108,16 @@ public:
             !std::isfinite(task_max_direct_leg_m_) ||
             task_max_direct_leg_m_ <= 0.0 || task_max_direct_leg_m_ > 1.5) {
             throw std::runtime_error("Invalid task wait or direct-leg safety limit.");
+        }
+        if (task_slow_sitl_telemetry_ && !task_flight_enabled_) {
+            throw std::runtime_error(
+                "task_slow_sitl_telemetry requires enable_task_flight=true.");
+        }
+        if (task_slow_sitl_telemetry_) {
+            RCLCPP_WARN(this->get_logger(),
+                "SLOW SITL telemetry mode enabled: relaxed arrival-data timing "
+                "for simulation ONLY. Keep the corridor free, stay ready to "
+                "intervene, and do not use on a real UAV.");
         }
         if (task_flight_enabled_ && !task_flight_confirmed_) {
             throw std::runtime_error(
@@ -434,6 +446,7 @@ private:
     bool task_sequence_check_ = false;
     bool task_flight_enabled_ = false;
     bool task_flight_confirmed_ = false;
+    bool task_slow_sitl_telemetry_ = false;
     double task_ground_wait_s_ = 3.0;
     double task_max_direct_leg_m_ = 1.25;
     std::atomic<bool> task_navigation_active_{false};
@@ -608,21 +621,27 @@ private:
     }
 
     static bool sample_rate_ok(
-        const std::deque<std::chrono::steady_clock::time_point> &samples)
+        const std::deque<std::chrono::steady_clock::time_point> &samples,
+        bool slow_sitl)
     {
+        // Fast profile: ~5+ Hz; slow Gazebo SITL profile: ~1+ Hz.
+        // Still require eight successive samples, not a single old sample.
         return samples.size() == 8 &&
-            samples.back() - samples.front() <= 1400ms;
+            samples.back() - samples.front() <= (slow_sitl ? 9s : 1400ms);
     }
 
     bool task_telemetry_ok(bool require_ground)
     {
         const auto now = std::chrono::steady_clock::now();
+        const auto state_timeout = task_slow_sitl_telemetry_ ? 6s : 2s;
+        const auto extended_timeout = task_slow_sitl_telemetry_ ? 4s : 2s;
+        const auto motion_timeout = task_slow_sitl_telemetry_ ? 2500ms : 500ms;
         {
             std::lock_guard<std::mutex> lock(mavros_mutex_);
             if (!mavros_state_received_ || !mavros_connected_ ||
-                now - last_mavros_state_time_ > 2s ||
+                now - last_mavros_state_time_ > state_timeout ||
                 !extended_state_received_ ||
-                now - last_extended_state_time_ > 2s ||
+                now - last_extended_state_time_ > extended_timeout ||
                 (require_ground && (
                     mavros_armed_ ||
                     landed_state_ !=
@@ -634,10 +653,10 @@ private:
         const auto &p = current_pose_.pose.position;
         const auto &v = current_velocity_.twist.linear;
         return pose_received_ && velocity_received_ &&
-            now - last_pose_time_ <= 500ms &&
-            now - last_velocity_time_ <= 500ms &&
-            sample_rate_ok(pose_samples_) &&
-            sample_rate_ok(velocity_samples_) &&
+            now - last_pose_time_ <= motion_timeout &&
+            now - last_velocity_time_ <= motion_timeout &&
+            sample_rate_ok(pose_samples_, task_slow_sitl_telemetry_) &&
+            sample_rate_ok(velocity_samples_, task_slow_sitl_telemetry_) &&
             current_pose_.header.frame_id == "map" &&
             finite_point(p) &&
             std::isfinite(v.x) && std::isfinite(v.y) &&
@@ -649,7 +668,8 @@ private:
         const auto now = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lock(mavros_mutex_);
         return extended_state_received_ &&
-            now - last_extended_state_time_ <= 2s &&
+            now - last_extended_state_time_ <=
+                (task_slow_sitl_telemetry_ ? 4s : 2s) &&
             landed_state_ ==
                 mavros_msgs::msg::ExtendedState::LANDED_STATE_IN_AIR;
     }
@@ -932,7 +952,7 @@ private:
         geometry_msgs::msg::TwistStamped velocity;
         if (!task_snapshot(pose, velocity)) {
             RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                "TAKEOFF waiting for >=5Hz pose/velocity and fresh MAVROS state.");
+                "TAKEOFF waiting for fresh pose/velocity and MAVROS state.");
             if ((task_takeoff_sent_ && now - task_operation_started_ > 8s) ||
                 (!task_takeoff_sent_ && now - task_operation_started_ > 20s)) {
                 change_state(MissionState::ERROR);
@@ -1034,7 +1054,7 @@ private:
             }
             if (!task_telemetry_ok(false)) {
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                    "LAND waiting for fresh >=5Hz telemetry.");
+                    "LAND waiting for fresh telemetry.");
                 return;
             }
             request_land_task();
@@ -1075,7 +1095,8 @@ private:
         {
             std::lock_guard<std::mutex> lock(mavros_mutex_);
             ext_fresh = extended_state_received_ &&
-                now - last_extended_state_time_ <= 2s;
+                now - last_extended_state_time_ <=
+                    (task_slow_sitl_telemetry_ ? 4s : 2s);
             ground = ext_fresh && landed_state_ ==
                 mavros_msgs::msg::ExtendedState::LANDED_STATE_ON_GROUND;
         }
@@ -2247,8 +2268,9 @@ private:
             {
                 if (task_flight_enabled_ && !task_telemetry_ok(true)) {
                     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(),
-                        3000, "A1.2.3 preflight blocked: need ON_GROUND, "
-                        "DISARMED, connected state and >=5Hz fresh pose/velocity.");
+                        3000, "A1.2 preflight blocked: need ON_GROUND, "
+                        "DISARMED, connected state and fresh pose/velocity "
+                        "matching selected telemetry profile.");
                     if (now - task_preflight_started_ > 30s) {
                         RCLCPP_ERROR(this->get_logger(),
                             "A1.2.3 preflight timeout. No arming attempted.");
@@ -2428,9 +2450,9 @@ private:
                     }
                     if (!task_telemetry_ok(false) || !task_airborne()) {
                         RCLCPP_ERROR(this->get_logger(),
-                            "A1.2.3 NAVIGATE: not confirmed IN_AIR or telemetry "
-                            "dropped below 5Hz "
-                            "or became stale. Setpoints stopped; ArduPilot "
+                            "A1.2 NAVIGATE: not confirmed IN_AIR or telemetry "
+                            "became stale/too sparse for configured profile. "
+                            "Setpoints stopped; ArduPilot "
                             "may retain last target. Manual intervention needed.");
                         change_state(MissionState::ERROR);
                         break;
