@@ -48,9 +48,10 @@ WAIT_READY -> CAPTURE_REFERENCE -> CHECK_MISSION -> SET_GUIDED -> ARM
 - **Return/landing:** return to captured launch XY at flight altitude, request LAND,
   stop flight setpoints, and confirm on-ground state before any explicit disarm.
 
-Use a `MultiThreadedExecutor`: separate callback groups for telemetry, the 10 Hz
-state machine/service responses, and the 30 Hz setpoint timer. Calls are asynchronous;
-locks only protect short state copies. No waiting on futures inside timers.
+Use a `SingleThreadedExecutor`: telemetry, the 10 Hz state machine, service
+responses and the 30 Hz setpoint timer run serially in the default callback group.
+Calls are asynchronous; callbacks must stay short and never wait on futures.
+No mutex is needed while all state access stays within these callbacks.
 Each active phase has a timeout; acknowledgements alone do not prove completion.
 
 ## 3. Coordinates and altitude
@@ -289,9 +290,9 @@ Capture requires a disarmed vehicle on ground and GPS/pose receive times within
 `reference_sample_window` (0.5 s). After capture, local/GPS updates do not move the
 origin or launch baseline; telemetry loss resets the readiness dwell, not the
 reference. Restart the node while disarmed to capture a new run. The flight mode
-uses GPS/local disagreement and home/frame changes to detect inconsistent references.
-Telemetry/state/service callbacks remain serialized; the independent setpoint callback
-group shares data through a mutex under a three-thread executor.
+checks home/frame changes; GPS/local disagreement is diagnostic only.
+All callbacks run serially on a single-threaded executor, without a mutex or
+separate setpoint callback group. Validate setpoint cadence under simulator load.
 
 The diagnostic node checks the proposed envelope with `envelope_margin` (initial
 0.5 m); an invalid horizontal envelope produces `INVALID_ENVELOPE`. Shape, heading,
@@ -362,14 +363,14 @@ ros2 service call /outdoor_mission/abort std_srvs/srv/Trigger "{}"
 The node checks each response and observed mode/armed/airborne/landed telemetry.
 Takeoff altitude is the current launch-relative-to-home reading plus 5 m; the local
 position target is captured launch Z plus 5 m. No position setpoints oppose the
-initial autopilot takeoff. Once airborne and takeoff accepted, a separate 30 Hz
+initial autopilot takeoff. Once airborne and takeoff accepted, a 30 Hz
 timer publishes position and yaw, including during settling. Return transfers use
 1 m/s interpolation; arrival requires the agreed position, altitude, speed and yaw
 conditions for 1 s. Only fresh on-ground confirmation permits disarming.
 
 The current heading is preserved for takeoff/hover. Mode override and connection
 loss stop the stream and enter RELEASE_CONTROL. Explicit abort, navigation-quality
-loss, reference disagreement, tracking/fence violation and phase failures request
+loss, home/frame changes, tracking/fence violation and phase failures request
 LAND while GUIDED control is still owned. A successful abort ends in ABORTED after
 ground/disarm; rejected landing or landing timeout ends in FAILED and needs operator
 recovery. No terminal state restarts automatically. Stale service responses cannot
@@ -377,7 +378,7 @@ advance a later phase.
 
 Current limits in YAML are simulation starting values: command 10 s, takeoff 45 s,
 settling/return 60 s, landing 60 s; maximum position-target error 2 m, GPS/local
-horizontal disagreement 3 m, and relative/local altitude disagreement 1 m. A home
+diagnostic horizontal disagreement 3 m, and diagnostic relative/local altitude disagreement 1 m. A home
 position change greater than 0.5 m after takeoff reference capture aborts the mission.
 The FCU home must be available before the takeoff service is called, even when the
 mission origin used fix fallback. This mode does not prove the alignment of a new
@@ -391,3 +392,7 @@ python3 src/mission_executor/test/outdoor_flight_test.py
 
 The user has accepted the square behavior in simulation. Full-sequence
 Gazebo/SITL acceptance, repeated runs and recordings remain to be performed.
+
+Current measurement assumptions, open questions and fault policy are tracked in
+[OUTDOOR_REVIEW.md](OUTDOOR_REVIEW.md). Compass freshness/validity gates preflight,
+not flight; GPS/local and altitude consistency are diagnostic-only comparisons.

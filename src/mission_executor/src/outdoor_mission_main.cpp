@@ -9,7 +9,7 @@ int main(int argc, char ** argv)
   int result = 0;
   try {
     auto node = std::make_shared<mission_executor::OutdoorMissionNode>();
-    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 3);
+    rclcpp::executors::SingleThreadedExecutor executor;
     executor.add_node(node);
     executor.spin();
   } catch (const std::exception & error) {
