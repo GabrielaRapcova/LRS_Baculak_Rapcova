@@ -2,16 +2,21 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp/executors/multi_threaded_executor.hpp"
+#include "rclcpp_action/rclcpp_action.hpp"
+#include "uav_navigation_msgs/action/compute_path3_d.hpp"
 
 #include "geometry_msgs/msg/pose_stamped.hpp"
+#include "nav_msgs/msg/path.hpp"
 #include "geometry_msgs/msg/twist_stamped.hpp"
 #include "mavros_msgs/msg/state.hpp"
 #include "mavros_msgs/msg/position_target.hpp"
@@ -30,6 +35,8 @@ namespace mission_executor
 
 class MissionExecutorNode : public rclcpp::Node
 {
+    using ComputePath3D = uav_navigation_msgs::action::ComputePath3D;
+    using PlannerGoalHandle = rclcpp_action::ClientGoalHandle<ComputePath3D>;
 public:
     MissionExecutorNode()
         : Node("mission_executor_node"),
@@ -44,6 +51,25 @@ public:
         this->declare_parameter<bool>("enable_navigation_test", false);
         this->declare_parameter<bool>("enable_navigation_flight", false);
         this->declare_parameter<bool>("enable_hard_soft_flight_test", false);
+        // Diagnostic-only: send one plan request without controlling the UAV.
+        this->declare_parameter<bool>("enable_planner_test", false);
+        this->declare_parameter<std::vector<double>>(
+            "planner_test_start", {13.0, 7.0, 1.0});
+        this->declare_parameter<std::vector<double>>(
+            "planner_test_goal", {12.0, 7.0, 1.0});
+        // Stage 2: diagnostic start XY from MAVROS and target from CSV.
+        // The rotation is provisional and MUST NOT be used for actual flight.
+        this->declare_parameter<bool>("planner_test_use_mavros_csv", false);
+        this->declare_parameter<int64_t>("planner_test_csv_index", 2);
+        this->declare_parameter<double>("planner_test_start_z_map", 1.0);
+        // Stage 3: read-only, live-pose path monitor. Never publishes MAVROS targets.
+        this->declare_parameter<bool>("planner_test_monitor_path", false);
+        this->declare_parameter<double>(
+            "planner_test_intermediate_tolerance_m", 0.50);
+        // Stage 4: A* -> NAVIGATE integration; READ-ONLY (no MAVROS commands).
+        this->declare_parameter<bool>("enable_planned_navigation_preview", false);
+        this->declare_parameter<double>("planner_preview_start_z_map", 1.0);
+        this->declare_parameter<double>("planner_preview_tolerance_m", 0.50);
 
         enable_arming_ = this->get_parameter("enable_arming").as_bool();
         enable_mavros_setpoints_ =
@@ -58,6 +84,69 @@ public:
             this->get_parameter("enable_navigation_flight").as_bool();
         enable_hard_soft_flight_test_ =
             this->get_parameter("enable_hard_soft_flight_test").as_bool();
+        enable_planner_test_ =
+            this->get_parameter("enable_planner_test").as_bool();
+        enable_planned_navigation_preview_ =
+            this->get_parameter("enable_planned_navigation_preview").as_bool();
+        planner_preview_start_z_map_ =
+            this->get_parameter("planner_preview_start_z_map").as_double();
+        planner_preview_tolerance_m_ =
+            this->get_parameter("planner_preview_tolerance_m").as_double();
+        if (!std::isfinite(planner_preview_start_z_map_) ||
+            planner_preview_start_z_map_ <= 0.0 ||
+            !std::isfinite(planner_preview_tolerance_m_) ||
+            planner_preview_tolerance_m_ <= 0.0 ||
+            planner_preview_tolerance_m_ > 1.0) {
+            throw std::runtime_error("Invalid planner preview height/tolerance.");
+        }
+        if (enable_planned_navigation_preview_ &&
+            (enable_planner_test_ || enable_arming_ || enable_mavros_setpoints_ ||
+             enable_navigation_test_ || enable_navigation_flight_ ||
+             enable_hard_soft_flight_test_ || debug_waypoint_setpoints_)) {
+            throw std::runtime_error(
+                "Planned NAVIGATE preview is READ-ONLY and mutually exclusive "
+                "with all planner test / flight / setpoint modes.");
+        }
+        planner_test_use_mavros_csv_ =
+            this->get_parameter("planner_test_use_mavros_csv").as_bool();
+        planner_test_monitor_path_ =
+            this->get_parameter("planner_test_monitor_path").as_bool();
+        planner_test_intermediate_tolerance_m_ = this->get_parameter(
+            "planner_test_intermediate_tolerance_m").as_double();
+        if (planner_test_monitor_path_ && !enable_planner_test_) {
+            throw std::runtime_error(
+                "planner_test_monitor_path requires enable_planner_test=true.");
+        }
+        if (!std::isfinite(planner_test_intermediate_tolerance_m_) ||
+            planner_test_intermediate_tolerance_m_ <= 0.0 ||
+            planner_test_intermediate_tolerance_m_ > 1.0) {
+            throw std::runtime_error(
+                "planner_test_intermediate_tolerance_m must be in (0, 1] metres.");
+        }
+        if (enable_planner_test_) {
+            if (enable_arming_ || enable_mavros_setpoints_ ||
+                enable_navigation_test_ || enable_navigation_flight_ ||
+                enable_hard_soft_flight_test_) {
+                throw std::runtime_error(
+                    "Planner diagnostic mode cannot arm, publish MAVROS "
+                    "setpoints, or enable navigation modes.");
+            }
+            const auto start = this->get_parameter("planner_test_start").as_double_array();
+            const auto goal = this->get_parameter("planner_test_goal").as_double_array();
+            if (start.size() != 3 || goal.size() != 3) {
+                throw std::runtime_error("Planner test points must have 3 coordinates.");
+            }
+            for (double value : start) {
+                if (!std::isfinite(value)) {
+                    throw std::runtime_error("Nonfinite planner_test_start coordinate.");
+                }
+            }
+            for (double value : goal) {
+                if (!std::isfinite(value)) {
+                    throw std::runtime_error("Nonfinite planner_test_goal coordinate.");
+                }
+            }
+        }
         if (enable_hard_soft_flight_test_ && !enable_navigation_flight_) {
             throw std::runtime_error(
                 "enable_hard_soft_flight_test requires enable_navigation_flight=true.");
@@ -108,6 +197,48 @@ public:
         }
         RCLCPP_INFO(this->get_logger(), "Mission loaded: %zu waypoints",
                     mission_.size());
+        if (enable_planned_navigation_preview_) {
+            for (std::size_t i = 0; i < mission_.size(); ++i) {
+                const auto &wp = mission_[i];
+                if (wp.task != TaskType::NONE || !std::isfinite(wp.x) ||
+                    !std::isfinite(wp.y) || !std::isfinite(wp.z)) {
+                    throw std::runtime_error(
+                        "Planned NAVIGATE preview supports only finite CSV "
+                        "waypoints without takeoff/land/yaw tasks. Complete "
+                        "A1.2 tasks before using those mission files.");
+                }
+            }
+            RCLCPP_WARN(this->get_logger(),
+                "A* NAVIGATE PREVIEW: plan each CSV waypoint, traverse path "
+                "logically using actual MAVROS telemetry, HARD/SOFT on CSV goal. "
+                "NO ARM, NO GUIDED REQUEST, NO MAVROS SETPOINTS. "
+                "XY transform UNVERIFIED; on-ground start Z projected to %.2fm.",
+                planner_preview_start_z_map_);
+        }
+        if (enable_planner_test_ && planner_test_use_mavros_csv_) {
+            const auto csv_index =
+                this->get_parameter("planner_test_csv_index").as_int();
+            if (csv_index < 0 ||
+                static_cast<std::size_t>(csv_index) >= mission_.size()) {
+                throw std::runtime_error(
+                    "planner_test_csv_index is outside the CSV waypoint range.");
+            }
+            planner_test_csv_index_ = static_cast<std::size_t>(csv_index);
+            planner_test_start_z_map_ =
+                this->get_parameter("planner_test_start_z_map").as_double();
+            if (!std::isfinite(planner_test_start_z_map_) ||
+                planner_test_start_z_map_ <= 0.0) {
+                throw std::runtime_error(
+                    "planner_test_start_z_map must be finite and positive.");
+            }
+            RCLCPP_WARN(this->get_logger(),
+                "DYNAMIC DIAGNOSTIC: MAVROS XY rotated into map using "
+                "(x_map=y_mavros, y_map=-x_mavros); this is an UNVERIFIED "
+                "frame assumption, NOT an approved flight transform. "
+                "Start Z is a planning-only projection (%.2f m), "
+                "not the UAV's measured altitude. CSV waypoint index=%zu.",
+                planner_test_start_z_map_, planner_test_csv_index_);
+        }
         if (enable_hard_soft_flight_test_) {
             validate_hard_soft_test_mission();
             RCLCPP_WARN(this->get_logger(),
@@ -164,17 +295,49 @@ public:
             this->create_publisher<mavros_msgs::msg::PositionTarget>(
                 "/mavros/setpoint_raw/local", 10);
 
-        state_timer_ = this->create_wall_timer(
-            100ms, std::bind(&MissionExecutorNode::state_machine_callback, this),
-            state_group_);
-        setpoint_timer_ = this->create_wall_timer(
-            50ms, std::bind(&MissionExecutorNode::publish_setpoint, this),
-            setpoint_group_);
+        if (enable_planner_test_) {
+            planner_client_ = rclcpp_action::create_client<ComputePath3D>(
+                this, "/compute_path_3d");
+            planner_test_timer_ = this->create_wall_timer(
+                1s, std::bind(&MissionExecutorNode::send_planner_test_goal, this));
+            if (planner_test_monitor_path_) {
+                // A path monitor only: consumes live MAVROS telemetry but sends
+                // no commands to the vehicle, even if it is armed in SITL.
+                planner_path_monitor_timer_ = this->create_wall_timer(
+                    500ms,
+                    std::bind(&MissionExecutorNode::monitor_planned_path, this),
+                    state_group_);
+                RCLCPP_WARN(this->get_logger(),
+                    "PATH MONITOR ENABLED: provisional map->MAVROS XY rotation, "
+                    "READ-ONLY. Telemetry determines progress; stationary UAV "
+                    "will NOT reach targets. No MAVROS commands are sent.");
+            }
+            RCLCPP_WARN(this->get_logger(),
+                "PLANNER DIAGNOSTIC ONLY: no state-machine execution, "
+                "no arming, no MAVROS setpoints, no flight.");
+        } else if (enable_planned_navigation_preview_) {
+            planner_client_ = rclcpp_action::create_client<ComputePath3D>(
+                this, "/compute_path_3d");
+            // Deliberately do NOT create a setpoint timer in preview mode.
+            state_timer_ = this->create_wall_timer(
+                100ms, std::bind(&MissionExecutorNode::state_machine_callback, this),
+                state_group_);
+        } else {
+            state_timer_ = this->create_wall_timer(
+                100ms, std::bind(&MissionExecutorNode::state_machine_callback, this),
+                state_group_);
+            setpoint_timer_ = this->create_wall_timer(
+                50ms, std::bind(&MissionExecutorNode::publish_setpoint, this),
+                setpoint_group_);
+        }
 
         RCLCPP_INFO(this->get_logger(),
                     "Callback groups initialized: state, setpoint, telemetry.");
         RCLCPP_INFO(this->get_logger(),
-                    "Debug setpoint publisher initialized at 20 Hz.");
+                    "%s",
+                    (enable_planner_test_ || enable_planned_navigation_preview_)
+                        ? "No periodic setpoint publisher timer in read-only mode."
+                        : "Debug setpoint publisher initialized at 20 Hz.");
         RCLCPP_INFO(this->get_logger(), "Real MAVROS setpoints: %s",
                     enable_navigation_flight_ ?
                         (enable_hard_soft_flight_test_ ?
@@ -197,7 +360,36 @@ private:
     bool enable_navigation_test_ = false;
     bool enable_navigation_flight_ = false;
     bool enable_hard_soft_flight_test_ = false;
+    bool enable_planner_test_ = false;
+    bool enable_planned_navigation_preview_ = false;
+    double planner_preview_start_z_map_ = 1.0;
+    double planner_preview_tolerance_m_ = 0.50;
+    bool planner_test_use_mavros_csv_ = false;
+    std::size_t planner_test_csv_index_ = 2;
+    double planner_test_start_z_map_ = 1.0;
+    bool planner_test_monitor_path_ = false;
+    double planner_test_intermediate_tolerance_m_ = 0.50;
+    rclcpp_action::Client<ComputePath3D>::SharedPtr planner_client_;
+    rclcpp::TimerBase::SharedPtr planner_test_timer_;
+    rclcpp::TimerBase::SharedPtr planner_path_monitor_timer_;
+    // Accessed by the action result callback and the periodic monitor.
+    std::mutex planner_path_mutex_;
+    nav_msgs::msg::Path planned_path_;
+    MissionWaypoint planned_final_waypoint_{};
+    std::size_t current_path_index_ = 0;
+    bool planned_path_monitor_active_ = false;
+    bool planned_path_reset_arrival_ = false;
     std::atomic<bool> flight_navigation_active_{false};
+
+    enum class PreviewPhase { NEED_PLAN, WAIT_RESULT, FOLLOW_PATH, FAILURE };
+    // Callback group for Action Client can run in parallel with state timer.
+    std::mutex preview_mutex_;
+    PreviewPhase preview_phase_ = PreviewPhase::NEED_PLAN;
+    nav_msgs::msg::Path preview_path_;
+    std::size_t preview_path_index_ = 0;
+    std::string preview_failure_;
+    std::chrono::steady_clock::time_point preview_request_time_{};
+    std::size_t preview_request_sequence_ = 0;
 
     std::mutex mavros_mutex_;
     bool mavros_connected_ = false;
@@ -256,6 +448,595 @@ private:
     bool arm_response_received_ = false;
     bool arm_request_accepted_ = false;
     std::chrono::steady_clock::time_point arm_request_time_{};
+
+    // NOTE: These are provisional XY conversions inferred from a single
+    // simulation configuration. There is not yet a calibrated transform between
+    // the PCD map and MAVROS's local position reference. Never use this helper
+    // for an actual MAVROS setpoint before independent frame calibration.
+    static geometry_msgs::msg::Point provisional_map_to_mavros(
+        const geometry_msgs::msg::Point &map_point)
+    {
+        geometry_msgs::msg::Point point;
+        point.x = -map_point.y;
+        point.y = map_point.x;
+        point.z = map_point.z;
+        return point;
+    }
+
+    static bool finite_point(const geometry_msgs::msg::Point &p)
+    {
+        return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z);
+    }
+
+    static double distance_between(
+        const geometry_msgs::msg::Point &a,
+        const geometry_msgs::msg::Point &b)
+    {
+        return std::hypot(std::hypot(a.x - b.x, a.y - b.y), a.z - b.z);
+    }
+
+    // Verify the planner result before it becomes a target sequence.
+    // The action result is the authoritative path, not the /plan display topic.
+    bool validate_planner_path(
+        const nav_msgs::msg::Path &path,
+        const std::vector<double> &requested_start,
+        const std::vector<double> &requested_goal) const
+    {
+        if (path.header.frame_id != "map" || path.poses.empty() ||
+            path.poses.size() > 10000) {
+            RCLCPP_ERROR(this->get_logger(),
+                "Planner result rejected: invalid frame/empty/oversized path.");
+            return false;
+        }
+        for (std::size_t i = 0; i < path.poses.size(); ++i) {
+            const auto &pose = path.poses[i];
+            if ((!pose.header.frame_id.empty() &&
+                 pose.header.frame_id != "map") ||
+                !finite_point(pose.pose.position)) {
+                RCLCPP_ERROR(this->get_logger(),
+                    "Planner result rejected: invalid point/frame at index %zu.", i);
+                return false;
+            }
+        }
+        geometry_msgs::msg::Point expected_start;
+        expected_start.x = requested_start.at(0);
+        expected_start.y = requested_start.at(1);
+        expected_start.z = requested_start.at(2);
+        geometry_msgs::msg::Point expected_goal;
+        expected_goal.x = requested_goal.at(0);
+        expected_goal.y = requested_goal.at(1);
+        expected_goal.z = requested_goal.at(2);
+        if (distance_between(path.poses.front().pose.position, expected_start) >
+                0.25 ||
+            distance_between(path.poses.back().pose.position, expected_goal) >
+                0.25) {
+            RCLCPP_ERROR(this->get_logger(),
+                "Planner result rejected: endpoints do not match request.");
+            return false;
+        }
+        return true;
+    }
+
+    // Diagnostic-only path progression. Intermediate points use a loose
+    // distance tolerance; the final CSV waypoint reuses the tested HARD/SOFT
+    // arrival logic. Crucially, this function NEVER publishes to MAVROS.
+    void monitor_planned_path()
+    {
+        geometry_msgs::msg::Point target_map;
+        MissionWaypoint final_waypoint{};
+        std::size_t index = 0;
+        std::size_t count = 0;
+        bool reset_arrival = false;
+        {
+            std::lock_guard<std::mutex> lock(planner_path_mutex_);
+            if (!planned_path_monitor_active_ ||
+                current_path_index_ >= planned_path_.poses.size()) {
+                return;
+            }
+            index = current_path_index_;
+            count = planned_path_.poses.size();
+            target_map = planned_path_.poses[index].pose.position;
+            final_waypoint = planned_final_waypoint_;
+            reset_arrival = planned_path_reset_arrival_;
+            planned_path_reset_arrival_ = false;
+        }
+        if (reset_arrival) {
+            position_controller_.reset_arrival();
+        }
+
+        geometry_msgs::msg::PoseStamped pose;
+        geometry_msgs::msg::TwistStamped velocity;
+        bool fresh = false;
+        {
+            std::lock_guard<std::mutex> lock(pose_mutex_);
+            const auto now = std::chrono::steady_clock::now();
+            fresh = pose_received_ && velocity_received_ &&
+                now - last_pose_time_ <= POSE_TIMEOUT &&
+                now - last_velocity_time_ <= VELOCITY_TIMEOUT;
+            if (fresh) {
+                pose = current_pose_;
+                velocity = current_velocity_;
+            }
+        }
+        if (!fresh || pose.header.frame_id != "map" ||
+            !finite_point(pose.pose.position) ||
+            !std::isfinite(velocity.twist.linear.x) ||
+            !std::isfinite(velocity.twist.linear.y) ||
+            !std::isfinite(velocity.twist.linear.z)) {
+            position_controller_.reset_arrival();
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "Path monitor paused: missing/stale or invalid MAVROS pose/velocity.");
+            return;
+        }
+
+        const auto target_mavros = provisional_map_to_mavros(target_map);
+        const double distance = distance_between(
+            pose.pose.position, target_mavros);
+        const bool final = index + 1 == count;
+        bool reached = false;
+        if (final) {
+            // Keep the exact CSV precision semantics (including HARD settle).
+            const auto arrival = position_controller_.update_arrival(
+                pose.pose.position, velocity.twist.linear, final_waypoint,
+                std::chrono::steady_clock::now());
+            reached = arrival.reached;
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "READ-ONLY final %zu/%zu [%s]: candidate MAVROS="
+                "(%.2f,%.2f,%.2f), distance=%.3fm, speed=%.3fm/s, "
+                "stable=%.2fs, reached=%s. UNVERIFIED FRAME; NO COMMANDS.",
+                index + 1, count,
+                final_waypoint.precision == Precision::HARD ? "HARD" : "SOFT",
+                target_mavros.x, target_mavros.y, target_mavros.z,
+                arrival.distance_m, arrival.speed_mps, arrival.stable_time_s,
+                reached ? "YES" : "NO");
+        } else {
+            // At intermediate path points do not require speed or settling.
+            position_controller_.reset_arrival();
+            reached = distance <= planner_test_intermediate_tolerance_m_;
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "READ-ONLY path point %zu/%zu: candidate MAVROS="
+                "(%.2f,%.2f,%.2f), distance=%.3fm, tolerance=%.2fm, "
+                "reached=%s. UNVERIFIED FRAME; NO COMMANDS.",
+                index + 1, count,
+                target_mavros.x, target_mavros.y, target_mavros.z,
+                distance, planner_test_intermediate_tolerance_m_,
+                reached ? "YES" : "NO");
+        }
+        if (!reached) {
+            return;
+        }
+
+        // Result callback might be concurrent. Do not advance a replaced path.
+        {
+            std::lock_guard<std::mutex> lock(planner_path_mutex_);
+            if (!planned_path_monitor_active_ || current_path_index_ != index) {
+                return;
+            }
+            if (final) {
+                planned_path_monitor_active_ = false;
+                RCLCPP_WARN(this->get_logger(),
+                    "READ-ONLY path monitor COMPLETE. No mission task executed "
+                    "and no setpoint sent to MAVROS.");
+            } else {
+                ++current_path_index_;
+                planned_path_reset_arrival_ = true;
+                RCLCPP_INFO(this->get_logger(),
+                    "READ-ONLY path progress: reached point %zu/%zu, "
+                    "next point %zu/%zu.", index + 1, count,
+                    current_path_index_ + 1, count);
+            }
+        }
+    }
+
+    // A1.1 -> A1.2 NAVIGATE bridge, read-only until coordinate calibration,
+    // proper telemetry rates and automated takeoff/landing are validated.
+    // The planner's result is stored; each intermediate point is distance-only,
+    // while the final CSV waypoint uses PositionController HARD/SOFT.
+    void preview_navigate()
+    {
+        if (current_waypoint_index_.load() >= mission_.size()) {
+            change_state(MissionState::DONE);
+            RCLCPP_WARN(this->get_logger(),
+                "A* NAVIGATE PREVIEW complete. No flight was commanded.");
+            return;
+        }
+
+        PreviewPhase phase;
+        std::string failure;
+        {
+            std::lock_guard<std::mutex> lock(preview_mutex_);
+            phase = preview_phase_;
+            failure = preview_failure_;
+        }
+        if (phase == PreviewPhase::FAILURE) {
+            RCLCPP_ERROR(this->get_logger(),
+                "A* NAVIGATE PREVIEW failed: %s", failure.c_str());
+            change_state(MissionState::ERROR);
+            return;
+        }
+        if (phase == PreviewPhase::WAIT_RESULT) {
+            bool expired = false;
+            {
+                std::lock_guard<std::mutex> lock(preview_mutex_);
+                expired = preview_phase_ == PreviewPhase::WAIT_RESULT &&
+                    std::chrono::steady_clock::now() - preview_request_time_ > 30s;
+                if (expired) {
+                    preview_phase_ = PreviewPhase::FAILURE;
+                    preview_failure_ = "Planner result timeout (30 s)";
+                }
+            }
+            return;
+        }
+        if (phase == PreviewPhase::NEED_PLAN) {
+            preview_request_plan();
+            return;
+        }
+
+        geometry_msgs::msg::Point map_target;
+        std::size_t path_idx = 0;
+        std::size_t path_count = 0;
+        {
+            std::lock_guard<std::mutex> lock(preview_mutex_);
+            if (preview_phase_ != PreviewPhase::FOLLOW_PATH ||
+                preview_path_index_ >= preview_path_.poses.size()) {
+                return;
+            }
+            path_idx = preview_path_index_;
+            path_count = preview_path_.poses.size();
+            map_target = preview_path_.poses[path_idx].pose.position;
+        }
+
+        geometry_msgs::msg::PoseStamped pose;
+        geometry_msgs::msg::TwistStamped velocity;
+        bool fresh = false;
+        {
+            std::lock_guard<std::mutex> lock(pose_mutex_);
+            const auto now = std::chrono::steady_clock::now();
+            fresh = pose_received_ && velocity_received_ &&
+                now - last_pose_time_ <= POSE_TIMEOUT &&
+                now - last_velocity_time_ <= VELOCITY_TIMEOUT;
+            if (fresh) {
+                pose = current_pose_;
+                velocity = current_velocity_;
+            }
+        }
+        if (!fresh || pose.header.frame_id != "map" ||
+            !finite_point(pose.pose.position) ||
+            !std::isfinite(velocity.twist.linear.x) ||
+            !std::isfinite(velocity.twist.linear.y) ||
+            !std::isfinite(velocity.twist.linear.z)) {
+            position_controller_.reset_arrival();
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "A* NAVIGATE PREVIEW paused: MAVROS pose/velocity invalid or stale.");
+            return;
+        }
+
+        const auto projected = provisional_map_to_mavros(map_target);
+        const auto wp_idx = current_waypoint_index_.load();
+        const auto &wp = mission_[wp_idx];
+        const bool final_point = (path_idx + 1 == path_count);
+        const double distance = distance_between(pose.pose.position, projected);
+        bool reached = false;
+        if (final_point) {
+            // Tested PositionController enforces HARD settling/velocity rules.
+            const auto arrival = position_controller_.update_arrival(
+                pose.pose.position, velocity.twist.linear, wp,
+                std::chrono::steady_clock::now());
+            reached = arrival.reached;
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "READ-ONLY NAVIGATE CSV[%zu/%zu] final [%s] "
+                "map=(%.2f,%.2f,%.2f), assumed MAVROS=(%.2f,%.2f,%.2f) "
+                "distance=%.3fm speed=%.3fm/s stable=%.2fs reached=%s",
+                wp_idx + 1, mission_.size(),
+                wp.precision == Precision::HARD ? "HARD" : "SOFT",
+                map_target.x, map_target.y, map_target.z,
+                projected.x, projected.y, projected.z,
+                arrival.distance_m, arrival.speed_mps, arrival.stable_time_s,
+                reached ? "YES" : "NO");
+        } else {
+            position_controller_.reset_arrival();
+            reached = distance <= planner_preview_tolerance_m_;
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "READ-ONLY NAVIGATE CSV[%zu/%zu] path[%zu/%zu] "
+                "assumed MAVROS=(%.2f,%.2f,%.2f) distance=%.3fm "
+                "tolerance=%.2fm reached=%s",
+                wp_idx + 1, mission_.size(), path_idx + 1, path_count,
+                projected.x, projected.y, projected.z, distance,
+                planner_preview_tolerance_m_, reached ? "YES" : "NO");
+        }
+        if (!reached) {
+            return;
+        }
+        position_controller_.reset_arrival();
+        if (!final_point) {
+            std::lock_guard<std::mutex> lock(preview_mutex_);
+            if (preview_phase_ == PreviewPhase::FOLLOW_PATH &&
+                preview_path_index_ == path_idx) {
+                ++preview_path_index_;
+                RCLCPP_INFO(this->get_logger(),
+                    "NAVIGATE path point %zu/%zu reached; next %zu/%zu.",
+                    path_idx + 1, path_count, preview_path_index_ + 1, path_count);
+            }
+            return;
+        }
+        RCLCPP_INFO(this->get_logger(),
+            "NAVIGATE CSV waypoint %zu/%zu reached [%s].",
+            wp_idx + 1, mission_.size(),
+            wp.precision == Precision::HARD ? "HARD" : "SOFT");
+        current_waypoint_index_.store(wp_idx + 1);
+        {
+            std::lock_guard<std::mutex> lock(preview_mutex_);
+            preview_path_.poses.clear();
+            preview_path_index_ = 0;
+            preview_phase_ = PreviewPhase::NEED_PLAN;
+        }
+        // The next state-machine tick plans from the new measured pose.
+    }
+
+    void preview_request_plan()
+    {
+        if (!planner_client_->action_server_is_ready()) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "NAVIGATE waiting for /compute_path_3d...");
+            return;
+        }
+        geometry_msgs::msg::PoseStamped pose;
+        {
+            std::lock_guard<std::mutex> lock(pose_mutex_);
+            if (!pose_received_ ||
+                std::chrono::steady_clock::now() - last_pose_time_ > POSE_TIMEOUT) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "NAVIGATE waiting for fresh MAVROS pose to plan.");
+                return;
+            }
+            pose = current_pose_;
+        }
+        if (pose.header.frame_id != "map" ||
+            !finite_point(pose.pose.position)) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "NAVIGATE invalid MAVROS pose frame/coordinates. No plan sent.");
+            return;
+        }
+        const auto &p = pose.pose.position;
+        const std::size_t wp_idx = current_waypoint_index_.load();
+        const auto &goal_wp = mission_[wp_idx];
+        const double start_z = p.z > 0.5 ? p.z : planner_preview_start_z_map_;
+        // WARNING: XY rotation is a hypothesis, not a calibrated TF transform.
+        const std::vector<double> start{p.y, -p.x, start_z};
+        const std::vector<double> goal{goal_wp.x, goal_wp.y, goal_wp.z};
+        if (p.z <= 0.5) {
+            RCLCPP_WARN(this->get_logger(),
+                "PREVIEW ONLY: measured MAVROS z=%.2f; virtual planner z=%.2f. "
+                "This is NOT the UAV's real position.", p.z, start_z);
+        }
+
+        ComputePath3D::Goal request;
+        request.start.header.frame_id = "map";
+        request.start.header.stamp = this->now();
+        request.start.pose.position.x = start[0];
+        request.start.pose.position.y = start[1];
+        request.start.pose.position.z = start[2];
+        request.start.pose.orientation.w = 1.0;
+        request.goal.header.frame_id = "map";
+        request.goal.header.stamp = this->now();
+        request.goal.pose.position.x = goal[0];
+        request.goal.pose.position.y = goal[1];
+        request.goal.pose.position.z = goal[2];
+        request.goal.pose.orientation.w = 1.0;
+
+        std::size_t sequence;
+        {
+            std::lock_guard<std::mutex> lock(preview_mutex_);
+            if (preview_phase_ != PreviewPhase::NEED_PLAN) return;
+            preview_phase_ = PreviewPhase::WAIT_RESULT;
+            preview_request_time_ = std::chrono::steady_clock::now();
+            sequence = ++preview_request_sequence_;
+        }
+        RCLCPP_INFO(this->get_logger(),
+            "NAVIGATE request #%zu CSV[%zu/%zu] map: "
+            "(%.2f,%.2f,%.2f)->(%.2f,%.2f,%.2f); NO FLIGHT.",
+            sequence, wp_idx + 1, mission_.size(),
+            start[0], start[1], start[2], goal[0], goal[1], goal[2]);
+
+        rclcpp_action::Client<ComputePath3D>::SendGoalOptions options;
+        options.goal_response_callback = [this, sequence](
+            const PlannerGoalHandle::SharedPtr &handle) {
+            if (handle) return;
+            std::lock_guard<std::mutex> lock(preview_mutex_);
+            if (sequence == preview_request_sequence_ &&
+                preview_phase_ == PreviewPhase::WAIT_RESULT) {
+                preview_phase_ = PreviewPhase::FAILURE;
+                preview_failure_ = "Planner rejected the goal";
+            }
+        };
+        options.result_callback = [this, sequence, start, goal](
+            const PlannerGoalHandle::WrappedResult &wrapped) {
+            std::lock_guard<std::mutex> lock(preview_mutex_);
+            if (sequence != preview_request_sequence_ ||
+                preview_phase_ != PreviewPhase::WAIT_RESULT) return;
+            if (!wrapped.result ||
+                wrapped.code != rclcpp_action::ResultCode::SUCCEEDED ||
+                wrapped.result->status != ComputePath3D::Result::SUCCESS ||
+                !validate_planner_path(wrapped.result->path, start, goal)) {
+                preview_phase_ = PreviewPhase::FAILURE;
+                preview_failure_ = "A* planning failed or invalid path";
+                if (wrapped.result) {
+                    RCLCPP_ERROR(this->get_logger(),
+                        "Planner status=%u message=%s",
+                        static_cast<unsigned>(wrapped.result->status),
+                        wrapped.result->message.c_str());
+                }
+                return;
+            }
+            preview_path_ = wrapped.result->path;
+            // Skip the first point only if it is the virtual/measured start.
+            preview_path_index_ = preview_path_.poses.size() > 1 ? 1 : 0;
+            preview_phase_ = PreviewPhase::FOLLOW_PATH;
+            RCLCPP_INFO(this->get_logger(),
+                "A1.1 -> A1.2 NAVIGATE: received %zu map points; "
+                "monitoring from point %zu (READ-ONLY).",
+                preview_path_.poses.size(), preview_path_index_ + 1);
+            for (std::size_t i = 0; i < preview_path_.poses.size(); ++i) {
+                const auto &map_p = preview_path_.poses[i].pose.position;
+                const auto mavros_p = provisional_map_to_mavros(map_p);
+                RCLCPP_INFO(this->get_logger(),
+                    "  Route[%zu] map=(%.2f,%.2f,%.2f) => "
+                    "provisional MAVROS=(%.2f,%.2f,%.2f)",
+                    i, map_p.x, map_p.y, map_p.z,
+                    mavros_p.x, mavros_p.y, mavros_p.z);
+            }
+        };
+        planner_client_->async_send_goal(request, options);
+    }
+
+    // Diagnostic only. The fixed-point test remains available by default.
+    // Stage 2 optionally derives the planning request from MAVROS XY and CSV.
+    // The observed 90-degree XY rotation is provisional; the altitude is a
+    // user-defined planning projection while the UAV is on the ground.
+    void send_planner_test_goal()
+    {
+        if (!planner_client_->action_server_is_ready()) {
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "Waiting for /compute_path_3d action server...");
+            return;
+        }
+        auto start = this->get_parameter("planner_test_start").as_double_array();
+        auto goal_point = this->get_parameter("planner_test_goal").as_double_array();
+        if (planner_test_use_mavros_csv_) {
+            geometry_msgs::msg::PoseStamped pose_snapshot;
+            {
+                std::lock_guard<std::mutex> lock(pose_mutex_);
+                if (!pose_received_ ||
+                    std::chrono::steady_clock::now() - last_pose_time_ >
+                        POSE_TIMEOUT) {
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(),
+                        5000, "Waiting for a fresh MAVROS pose; no plan sent.");
+                    return;
+                }
+                pose_snapshot = current_pose_;
+            }
+            if (pose_snapshot.header.frame_id != "map") {
+                RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(),
+                    5000, "Unexpected MAVROS frame '%s'; no plan sent.",
+                    pose_snapshot.header.frame_id.c_str());
+                return;
+            }
+            const auto &position = pose_snapshot.pose.position;
+            if (!std::isfinite(position.x) ||
+                !std::isfinite(position.y) ||
+                !std::isfinite(position.z)) {
+                RCLCPP_ERROR(this->get_logger(),
+                    "Nonfinite MAVROS position; no plan sent.");
+                return;
+            }
+            const auto &waypoint = mission_[planner_test_csv_index_];
+            // Provisional MAVROS-ENU -> CSV/map XY rotation, inferred from
+            // one SITL observation. We DO NOT publish this to the autopilot.
+            start = {position.y, -position.x, planner_test_start_z_map_};
+            goal_point = {waypoint.x, waypoint.y, waypoint.z};
+            RCLCPP_WARN(this->get_logger(),
+                "Read-only projection: MAVROS measured "
+                "(%.2f, %.2f, %.2f), map planning start "
+                "(%.2f, %.2f, %.2f), CSV[%zu] goal "
+                "(%.2f, %.2f, %.2f). Start Z is NOT actual UAV Z.",
+                position.x, position.y, position.z,
+                start[0], start[1], start[2], planner_test_csv_index_,
+                goal_point[0], goal_point[1], goal_point[2]);
+        }
+        planner_test_timer_->cancel();
+        // A static test goal has no mission task; default to SOFT arrival.
+        MissionWaypoint final_waypoint{
+            goal_point[0], goal_point[1], goal_point[2],
+            Precision::SOFT, TaskType::NONE};
+        if (planner_test_use_mavros_csv_) {
+            final_waypoint = mission_[planner_test_csv_index_];
+        }
+        ComputePath3D::Goal request;
+        request.start.header.frame_id = "map";
+        request.start.header.stamp = this->now();
+        request.start.pose.position.x = start[0];
+        request.start.pose.position.y = start[1];
+        request.start.pose.position.z = start[2];
+        request.start.pose.orientation.w = 1.0;
+        request.goal.header.frame_id = "map";
+        request.goal.header.stamp = this->now();
+        request.goal.pose.position.x = goal_point[0];
+        request.goal.pose.position.y = goal_point[1];
+        request.goal.pose.position.z = goal_point[2];
+        request.goal.pose.orientation.w = 1.0;
+
+        rclcpp_action::Client<ComputePath3D>::SendGoalOptions options;
+        options.goal_response_callback = [this](
+            const PlannerGoalHandle::SharedPtr & handle) {
+                if (!handle) {
+                    RCLCPP_ERROR(this->get_logger(), "Planner rejected the goal.");
+                } else {
+                    RCLCPP_INFO(this->get_logger(), "Planner accepted the goal.");
+                }
+            };
+        options.result_callback = [this, start, goal_point, final_waypoint](
+            const PlannerGoalHandle::WrappedResult & wrapped) {
+                if (!wrapped.result) {
+                    RCLCPP_ERROR(this->get_logger(), "Planner returned no result.");
+                    return;
+                }
+                const auto & result = *wrapped.result;
+                if (wrapped.code != rclcpp_action::ResultCode::SUCCEEDED ||
+                    result.status != ComputePath3D::Result::SUCCESS ||
+                    result.path.poses.empty()) {
+                    RCLCPP_ERROR(this->get_logger(),
+                        "Planning failed: action code=%d, status=%u, message=%s",
+                        static_cast<int>(wrapped.code),
+                        static_cast<unsigned>(result.status), result.message.c_str());
+                    return;
+                }
+                if (!validate_planner_path(result.path, start, goal_point)) {
+                    return;
+                }
+                RCLCPP_INFO(this->get_logger(),
+                    "A1.1 -> A1.2 SUCCESS: frame=%s, %zu points, %.4f seconds",
+                    result.path.header.frame_id.c_str(),
+                    result.path.poses.size(), result.planning_time);
+                for (std::size_t i = 0; i < result.path.poses.size(); ++i) {
+                    const auto & p = result.path.poses[i].pose.position;
+                    RCLCPP_INFO(this->get_logger(),
+                        "Path[%zu] map=(%.3f, %.3f, %.3f)", i, p.x, p.y, p.z);
+                    if (planner_test_monitor_path_) {
+                        const auto candidate = provisional_map_to_mavros(p);
+                        RCLCPP_WARN(this->get_logger(),
+                            "  READ-ONLY candidate[%zu] MAVROS=(%.3f,%.3f,%.3f) "
+                            "[%s] -- transform NOT calibrated, NOT published",
+                            i, candidate.x, candidate.y, candidate.z,
+                            (i + 1 == result.path.poses.size()) ?
+                                (final_waypoint.precision == Precision::HARD ?
+                                    "FINAL HARD" : "FINAL SOFT") :
+                                "INTERMEDIATE");
+                    }
+                }
+                if (planner_test_monitor_path_) {
+                    std::lock_guard<std::mutex> lock(planner_path_mutex_);
+                    planned_path_ = result.path;
+                    planned_final_waypoint_ = final_waypoint;
+                    // A* usually includes the exact start as its first point.
+                    // Do not treat that as a navigation target again.
+                    current_path_index_ = result.path.poses.size() > 1 ? 1 : 0;
+                    planned_path_reset_arrival_ = true;
+                    planned_path_monitor_active_ = true;
+                    RCLCPP_WARN(this->get_logger(),
+                        "READ-ONLY monitor armed at path point %zu/%zu. "
+                        "No movement is requested; stationary UAV cannot "
+                        "satisfy distant point arrival.",
+                        current_path_index_ + 1, planned_path_.poses.size());
+                }
+                RCLCPP_WARN(this->get_logger(),
+                    "Diagnostic completed. No target was sent to MAVROS.");
+            };
+        RCLCPP_INFO(this->get_logger(),
+            "Requesting A* path in map: (%.2f,%.2f,%.2f) -> (%.2f,%.2f,%.2f)",
+            start[0], start[1], start[2],
+            goal_point[0], goal_point[1], goal_point[2]);
+        planner_client_->async_send_goal(request, options);
+    }
 
     void validate_hard_soft_test_mission()
     {
@@ -693,7 +1474,13 @@ private:
         switch (current_state_) {
             case MissionState::IDLE:
             {
-                if (enable_navigation_test_) {
+                if (enable_planned_navigation_preview_) {
+                    RCLCPP_WARN(this->get_logger(),
+                        "NAVIGATE preview starting from CSV waypoint 1; "
+                        "A* result drives route monitor. NO COMMANDS.");
+                    position_controller_.reset_arrival();
+                    change_state(MissionState::NAVIGATE);
+                } else if (enable_navigation_test_) {
 
                     RCLCPP_INFO(this->get_logger(),
                         "A1.2.2 diagnostics: NAVIGATE with live pose/velocity, "
@@ -835,6 +1622,10 @@ private:
             }
             case MissionState::NAVIGATE:
             {
+                if (enable_planned_navigation_preview_) {
+                    preview_navigate();
+                    break;
+                }
                 if (enable_navigation_flight_ && (!armed || mode != "GUIDED")) {
                     RCLCPP_ERROR(this->get_logger(),
                         "Flight interrupted: disarmed or GUIDED lost. "
