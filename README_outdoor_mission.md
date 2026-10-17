@@ -1,7 +1,7 @@
 # A1.3 outdoor mission specification
 
-Status: geometry, telemetry diagnostics and the takeoff/return flight-check sequence
-are implemented. Square and figure-eight flight phases remain to be added. Requirements:
+Status: geometry, telemetry diagnostics, takeoff/return checks and the square
+mission are implemented. Centre alignment and figure-eight flight remain to be added. Requirements:
 [course A1.3](../assignments/assignment1/03_outdoor_gps_mission.md).
 Initial target: ROS 2 Jazzy, MAVROS and ArduPilot SITL in
 `../worlds/fei_lrs_outdoor.world`.
@@ -242,7 +242,7 @@ time as well. Flight remains disabled unless `enable_flight:=true` is supplied.
 `use_sim_time=false` and no clock bridge. It contains TODOs for MAVROS hardware
 transport, telemetry setup, frame alignment, limits and failsafe validation;
 real-flight setup has not been completed. Both entry points reuse the common
-`outdoor_launch.py` and accept `params_file` and `enable_flight` arguments.
+`outdoor_launch.py` and accept `params_file`, `enable_flight` and `execute_square`.
 
 ```bash
 source /opt/ros/jazzy/setup.bash
@@ -275,7 +275,10 @@ ros2 topic echo /outdoor_mission/diagnostics
 `REFERENCE_READY` means telemetry and the diagnostic reference are available,
 not that heading alignment or flight is approved. Compare
 `compass_yaw_enu_degrees`, `local_yaw_degrees` and `yaw_alignment_error_degrees`
-during ground rotation. Also compare GPS-derived ENU with local-derived ENU during
+during ground rotation using `ros2 topic echo /outdoor_mission/diagnostics` or
+rosbag recordings. Compass/local-yaw disagreement is diagnostic only; it does not
+block or abort flight. Commanded-versus-measured local yaw still determines corner
+settling. Also compare GPS-derived ENU with local-derived ENU during
 known ground translation. `local_yaw_offset_deg` is configured, never estimated
 silently. Home is subscribed with reliable transient-local QoS; absent/incompatible
 home telemetry falls back to the qualified-fix origin. Check actual publisher QoS.
@@ -299,25 +302,29 @@ colcon test --packages-select mission_executor --ctest-args -R test_outdoor_geom
 colcon test-result --test-result-base build/mission_executor/test_results --verbose
 ```
 
-## Takeoff/return flight check
+## Square flight stage
 
-This explicitly enabled mode runs only:
+With flight enabled, the current sequence is:
 
 ```text
 WAIT_READY -> SET_GUIDED -> ARM -> TAKEOFF -> STABILIZE
- -> RETURN_HOME -> LAND -> DISARM -> DONE
+ -> SQUARE (W1, W2, W3, W4, W1) -> RETURN_HOME -> LAND -> DISARM -> DONE
 ```
 
-It does not execute the square or figure-eight yet. In an already started outdoor
+The square uses bounded-speed position interpolation and continuously faces the POI
+from measured position. Every corner requires position, altitude, speed and yaw
+settling for the configured dwell. Each leg has its own `phase_timeout`.
+The centre/figure-eight stages are not executed yet. Set `execute_square:=false`
+to retain the takeoff/return-only check. In an already started outdoor
 SITL environment, after verifying the coordinate/heading diagnostics above:
 
 ```bash
-ros2 launch mission_executor outdoor_launch.py enable_flight:=true
+ros2 launch mission_executor outdoor_sim.launch.py enable_flight:=true
 ```
 
 This command automatically enters GUIDED and arms after the readiness gate. It is
-not a diagnostic-only run. For a simulation with a working ROS `/clock`, add
-`use_sim_time:=true`; clocks and telemetry must continue throughout the run.
+not a diagnostic-only run. The simulation launch starts the clock bridge and enables
+simulation time; clocks and telemetry must continue throughout the run.
 
 Telemetry receipt ages, GPS/pose pairing, readiness/settling dwell and flight-phase
 durations use ROS time. In simulation, supply Gazebo's bridged `/clock` and set
@@ -373,4 +380,4 @@ python3 src/mission_executor/test/outdoor_flight_test.py
 ```
 
 Actual Gazebo/SITL flight acceptance and recordings remain to be performed. Next:
-add square/centre/tangent/figure-eight states after this flight check is validated.
+validate the square in SITL, then add centre/tangent/figure-eight states.

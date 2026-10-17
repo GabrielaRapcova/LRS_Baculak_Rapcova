@@ -13,6 +13,7 @@ def generate_launch_description():
     """Keep flight disabled unless explicitly requested."""
     return LaunchDescription([
         DeclareLaunchArgument('enable_flight', default_value='false'),
+        DeclareLaunchArgument('execute_square', default_value='true'),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument(
             'params_file',
@@ -25,6 +26,8 @@ def generate_launch_description():
             parameters=[LaunchConfiguration('params_file'), {
                 'enable_flight': ParameterValue(
                     LaunchConfiguration('enable_flight'), value_type=bool),
+                'execute_square': ParameterValue(
+                    LaunchConfiguration('execute_square'), value_type=bool),
                 'use_sim_time': ParameterValue(
                     LaunchConfiguration('use_sim_time'), value_type=bool)}],
             output='screen'),

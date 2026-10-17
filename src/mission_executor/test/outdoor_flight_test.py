@@ -43,11 +43,13 @@ class FakeVehicle(Node):
         self.y = 20.0
         self.z = 3.0
         self.yaw = 0.0
+        self.heading_bias = 90.0 if scenario == 'heading_disagreement' else 0.0
         self.desired_z = 3.0
         self.target = None
         self.calls = []
         self.samples = []
         self.return_samples = []
+        self.square_samples = []
         self.states = []
         self.violations = []
         self.last_tick = time.monotonic()
@@ -127,6 +129,9 @@ class FakeVehicle(Node):
         self.target = message
         if self.states and self.states[-1] == 'RETURN_HOME':
             self.return_samples.append((time.monotonic(), message))
+        if self.states and self.states[-1] == 'SQUARE':
+            self.square_samples.append((
+                time.monotonic(), message, self.x, self.y, self.yaw))
 
     def tick(self):
         """Publish coherent telemetry and integrate a simple vertical model."""
@@ -179,13 +184,14 @@ class FakeVehicle(Node):
         self.velocity_pub.publish(velocity)
         fix = NavSatFix()
         fix.status.status = 0 if self.gps_valid else -1
-        fix.latitude = 48.15
+        fix.latitude = 48.15 + (self.y - 20.0) / 111190.0
         fix.longitude = 17.07 + (self.x - 10.0) / (
             111320.0 * math.cos(math.radians(48.15)))
         fix.altitude = 150.0 + self.z - 3.0
         self.fix_pub.publish(fix)
         self.heading_pub.publish(Float64(
-            data=(90.0 - self.yaw * 180.0 / math.pi) % 360.0))
+            data=(90.0 - self.yaw * 180.0 / math.pi +
+                  self.heading_bias) % 360.0))
         self.altitude_pub.publish(Float64(data=1.2 + self.z - 3.0))
         self.satellites_pub.publish(UInt32(data=12))
         if self.scenario != 'no_home':
@@ -209,6 +215,7 @@ def run_scenario(scenario):
         'ros2', 'run', 'mission_executor', 'outdoor_mission_node',
         '--ros-args',
         '-p', 'enable_flight:=true', '-p', 'gps_ready_duration:=0.2',
+        '-p', f'execute_square:={str(scenario.startswith("square")).lower()}',
         '-p', f'settle_duration:={settle_duration}',
         '-p', 'command_timeout:=1.5',
         '-p', 'takeoff_timeout:=2.5', '-p', 'phase_timeout:=6.0',
@@ -217,19 +224,23 @@ def run_scenario(scenario):
     abort_future = None
     event_triggered = False
     expected = 'ABORTED'
-    if scenario in ('complete', 'return_drift'):
+    if scenario in ('complete', 'return_drift', 'square',
+                    'heading_disagreement'):
         expected = 'DONE'
     if scenario in ('reject_land', 'landing_timeout'):
         expected = 'FAILED'
     if scenario in ('pilot_override', 'connection_loss'):
         expected = 'RELEASE_CONTROL'
-    deadline = time.monotonic() + 25.0
+    deadline = time.monotonic() + 80.0
     try:
         while time.monotonic() < deadline:
             rclpy.spin_once(vehicle, timeout_sec=0.01)
-            if ('STABILIZE' in vehicle.states and not event_triggered):
+            trigger_state = 'STABILIZE'
+            if scenario.startswith('square'):
+                trigger_state = 'SQUARE'
+            if (trigger_state in vehicle.states and not event_triggered):
                 event_triggered = True
-                if scenario == 'abort':
+                if scenario in ('abort', 'square_abort'):
                     assert vehicle.abort_client.service_is_ready()
                     abort_future = vehicle.abort_client.call_async(
                         Trigger.Request())
@@ -272,7 +283,8 @@ def run_scenario(scenario):
             assert vehicle.armed
         else:
             assert not vehicle.armed
-        if scenario in ('complete', 'return_drift'):
+        if scenario in ('complete', 'return_drift', 'square',
+                        'heading_disagreement'):
             assert vehicle.calls == ['GUIDED', 'ARM', 'TAKEOFF', 'LAND',
                                      'DISARM'], vehicle.calls
             assert len(vehicle.samples) >= 15
@@ -295,6 +307,36 @@ def run_scenario(scenario):
                 elapsed = following[0] - previous[0]
                 step = abs(following[1].position.x - previous[1].position.x)
                 assert step <= elapsed + 0.04, (step, elapsed)
+        if scenario == 'square':
+            assert vehicle.states.count('SQUARE') == 5, vehicle.states
+            corners = [(10.0, 25.0), (15.0, 25.0), (15.0, 20.0),
+                       (10.0, 20.0), (10.0, 25.0)]
+            corner_index = 0
+            hold_started = None
+            for stamp, message, x, y, yaw in vehicle.square_samples:
+                expected_yaw = math.atan2(22.5 - y, 12.5 - x)
+                error = math.atan2(math.sin(message.yaw - expected_yaw),
+                                   math.cos(message.yaw - expected_yaw))
+                assert abs(error) < 0.04, error
+                destination = corners[corner_index]
+                if math.hypot(x - destination[0], y - destination[1]) < 0.01:
+                    if hold_started is None:
+                        hold_started = stamp
+                    if stamp - hold_started >= 0.3:
+                        corner_index += 1
+                        hold_started = None
+                        if corner_index == len(corners):
+                            break
+                else:
+                    hold_started = None
+            assert corner_index == 5, corner_index
+            for previous, following in zip(
+                    vehicle.square_samples, vehicle.square_samples[1:]):
+                elapsed = following[0] - previous[0]
+                step = math.hypot(
+                    following[1].position.x - previous[1].position.x,
+                    following[1].position.y - previous[1].position.y)
+                assert step <= elapsed + 0.04, (step, elapsed)
         if abort_future is not None:
             assert abort_future.done() and abort_future.result().success
         print(f'PASS: {scenario}: {vehicle.calls}', flush=True)
@@ -313,7 +355,8 @@ def main():
         'connection_loss', 'bad_gps', 'stale_pose', 'home_change',
         'frame_change',
         'reject_arm', 'unconfirmed_mode', 'unconfirmed_arm',
-        'reject_takeoff', 'no_home', 'reject_land', 'landing_timeout']
+        'reject_takeoff', 'no_home', 'reject_land', 'landing_timeout',
+        'square', 'square_abort', 'heading_disagreement']
     try:
         for scenario in scenarios:
             run_scenario(scenario)
