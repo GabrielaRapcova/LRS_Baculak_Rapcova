@@ -1,7 +1,8 @@
 # A1.3 outdoor mission specification
 
-Status: geometry, telemetry diagnostics, takeoff/return checks and the square
-mission are implemented. Centre alignment and figure-eight flight remain to be added. Requirements:
+Status: the complete outdoor sequence is implemented: takeoff, square, centre
+alignment, one figure-eight lap, return and landing. Full-flight SITL acceptance
+and recordings remain. Requirements:
 [course A1.3](../assignments/assignment1/03_outdoor_gps_mission.md).
 Initial target: ROS 2 Jazzy, MAVROS and ArduPilot SITL in
 `../worlds/fei_lrs_outdoor.world`.
@@ -242,7 +243,8 @@ time as well. Flight remains disabled unless `enable_flight:=true` is supplied.
 `use_sim_time=false` and no clock bridge. It contains TODOs for MAVROS hardware
 transport, telemetry setup, frame alignment, limits and failsafe validation;
 real-flight setup has not been completed. Both entry points reuse the common
-`outdoor_launch.py` and accept `params_file`, `enable_flight` and `execute_square`.
+`outdoor_launch.py` and accept `params_file`, `enable_flight`, `execute_square`
+and `execute_figure_eight`.
 
 ```bash
 source /opt/ros/jazzy/setup.bash
@@ -302,20 +304,28 @@ colcon test --packages-select mission_executor --ctest-args -R test_outdoor_geom
 colcon test-result --test-result-base build/mission_executor/test_results --verbose
 ```
 
-## Square flight stage
+## Outdoor flight sequence
 
 With flight enabled, the current sequence is:
 
 ```text
 WAIT_READY -> SET_GUIDED -> ARM -> TAKEOFF -> STABILIZE
- -> SQUARE (W1, W2, W3, W4, W1) -> RETURN_HOME -> LAND -> DISARM -> DONE
+ -> SQUARE (W1, W2, W3, W4, W1) -> MOVE_TO_CENTER -> ALIGN_TANGENT
+ -> FIGURE_EIGHT -> SETTLE_CENTER -> RETURN_HOME -> LAND -> DISARM -> DONE
 ```
 
 The square uses bounded-speed position interpolation and continuously faces the POI
 from measured position. Every corner requires position, altitude, speed and yaw
 settling for the configured dwell. Each leg has its own `phase_timeout`.
-The centre/figure-eight stages are not executed yet. Set `execute_square:=false`
-to retain the takeoff/return-only check. In an already started outdoor
+After the square, the drone transfers above the POI, settles, then holds the
+centre while aligning to the initial tangent (45 degrees in mission ENU). Only
+after position, speed and heading settle does the figure-eight clock start.
+Targets are evaluated directly from elapsed ROS time for one lap; position and
+unwrapped tangent yaw are published continuously. At lap completion, the drone
+holds the centre and final tangent until settled, then returns to launch.
+
+Set `execute_figure_eight:=false` for the square-only flight, or
+`execute_square:=false` for takeoff/return only (also skips the figure-eight). In an already started outdoor
 SITL environment, after verifying the coordinate/heading diagnostics above:
 
 ```bash
@@ -379,5 +389,5 @@ Fake-vehicle integration tests (isolated ROS domain; no simulator/hardware):
 python3 src/mission_executor/test/outdoor_flight_test.py
 ```
 
-Actual Gazebo/SITL flight acceptance and recordings remain to be performed. Next:
-validate the square in SITL, then add centre/tangent/figure-eight states.
+The user has accepted the square behavior in simulation. Full-sequence
+Gazebo/SITL acceptance, repeated runs and recordings remain to be performed.
