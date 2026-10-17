@@ -89,7 +89,7 @@ private:
   void controlLoop();
   /// Detect clock stalls and discard telemetry from an earlier ROS timeline.
   void updateClock();
-  void updateLandedStateStream();
+  void requestLandedStateStream();
   void validateParameters();
   /// Check a telemetry receipt time against the ROS-time freshness limit.
   bool isFresh(rclcpp::Time received) const;
@@ -212,11 +212,10 @@ private:
   rclcpp::Time ready_since_{0, 0, RCL_ROS_TIME};
 
   // Clock and stream-request state.
-  bool interval_pending_ = false;
-  bool interval_configured_ = false;
-  int64_t interval_request_id_ = 0;
-  unsigned interval_generation_ = 0;
-  TimePoint interval_attempt_time_;
+  bool stream_requested_ = false;
+  bool stream_ready_ = false;
+  int64_t stream_request_id_ = 0;
+  TimePoint stream_request_time_;
   rclcpp::Time last_clock_time_{0, 0, RCL_ROS_TIME};
   TimePoint last_clock_advance_;
   bool clock_stalled_ = false;

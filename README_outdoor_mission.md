@@ -262,9 +262,12 @@ python3 src/mission_executor/test/outdoor_smoke_test.py --no-home
 ```
 
 On FCU connection, the node requests MAVLink `EXTENDED_SYS_STATE` (245) at 2 Hz
-through `mavros/set_message_interval`. It repeats the request after reconnection
-and retries rejected or unanswered requests every 5 seconds. Readiness still
-requires actual fresh landed-state messages, regardless of the service response.
+through `mavros/set_message_interval` once per node run. Both mission modes wait
+for a successful response, then require actual fresh landed-state messages. A
+rejection or no response within `command_timeout` wall seconds enters terminal
+FAILED; the node keeps reporting the reason. Restart to try again, including
+after an FCU restart. There are no retries or reconnection requests. Waiting for
+the FCU/service to become available does not start the response timeout.
 
 By default (`enable_flight:=false`) the node creates no flight command clients or
 setpoint publishers. Alongside the telemetry stream request, it
@@ -340,8 +343,7 @@ simulation time; clocks and telemetry must continue throughout the run.
 Telemetry receipt ages, GPS/pose pairing, readiness/settling dwell and flight-phase
 durations use ROS time. In simulation, supply Gazebo's bridged `/clock` and set
 `use_sim_time:=true` on MAVROS as well as this node. Without simulation time, the
-same checks use normal system time. Service-response deadlines, stream-request
-retries and command-confirmation phases retain steady wall time.
+same checks use normal system time. Service-response deadlines and command-confirmation phases retain steady wall time.
 `clock_stall_timeout` (10 wall seconds) invalidates readiness if ROS time stops
 advancing; active navigation then aborts. Backward clock resets discard telemetry
 timestamps and readiness dwell; an active mission releases control and requires
@@ -396,3 +398,9 @@ Gazebo/SITL acceptance, repeated runs and recordings remain to be performed.
 Current measurement assumptions, open questions and fault policy are tracked in
 [OUTDOOR_REVIEW.md](OUTDOOR_REVIEW.md). Compass freshness/validity gates preflight,
 not flight; GPS/local and altitude consistency are diagnostic-only comparisons.
+
+Startup stream setup tests (rejection, late response, missing service/data, both modes):
+
+```bash
+python3 src/mission_executor/test/outdoor_stream_test.py
+```

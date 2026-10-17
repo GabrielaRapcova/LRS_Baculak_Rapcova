@@ -17,12 +17,15 @@ Living list: append topics; mark resolved only when the decision/evidence is rec
 | 10 | Flight evidence | Open | Record two complete runs, abort/override, commanded vs actual track and yaw error. Measure noise before changing tolerances. |
 | 11 | Transient GPS faults | Open | Runtime GPS validity/satellite faults still act immediately. Review persistence against FCU estimator health rather than adding arbitrary delays. |
 | 12 | Executor and callback timing | Resolved: serial; timing open | Single-threaded executor, default callback group, no shared mutex. Services remain asynchronous. Diagnostics likely costs most per regular invocation; measure callback duration and setpoint jitter under load. |
+| 13 | Vehicle topic/service prefix | Deferred | Add a configurable MAVROS interface prefix: `/mavros` in simulation, `/droneXX` on the real vehicle. Apply consistently to telemetry, setpoints and services; expose in launch/YAML. Keep mission-owned topics separate. |
+| 14 | Landed-state stream setup | Resolved: one-shot | Wait for connected FCU/service; request 245 at 2 Hz once. Success + fresh data gates readiness. Rejection/response timeout → terminal FAILED in either mode; node stays alive; restart required. No retries/reconnection setup. |
 
 ## Current fault responses
 
 | Condition | Response |
 |---|---|
 | Invalid configuration | Exit at startup. |
+| Startup landed-state request rejected or response timed out | FAILED, no arming; restart required. |
 | Incomplete preflight data, poor GPS/satellites or invalid envelope | Wait; do not arm. |
 | Operator abort; stale/invalid GPS, satellites, pose, velocity or landed-state telemetry; invalid attitude/frame; clock stall/forward jump; changed home/frame; flight-bound or tracking-error violation; takeoff relative-altitude loss; unexpected disarm; navigation command rejection/timeout | If still owning connected GUIDED, stop mission setpoints and request LAND. Confirm ground/disarm → ABORTED. Otherwise abort while disarmed or release control. |
 | FCU disconnected/stale, pilot/autopilot mode override, unexpected arming before mission arming | Stop setpoints → RELEASE_CONTROL; do not reclaim control. |

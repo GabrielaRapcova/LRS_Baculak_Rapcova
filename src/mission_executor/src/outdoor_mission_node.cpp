@@ -64,6 +64,7 @@ OutdoorMissionNode::OutdoorMissionNode()
   configureTelemetry();
   configureFlightControl();
   configureTimers();
+  changePhase(OutdoorState::WAIT_READY, "Waiting for landed-state stream setup");
   const char * mode = "TELEMETRY ONLY";
   if (enable_flight_) {
     if (execute_square_) {
@@ -247,8 +248,24 @@ void OutdoorMissionNode::abortCallback(
 
 void OutdoorMissionNode::controlLoop()
 {
+  if (isTerminal()) {
+    return;
+  }
   updateClock();
-  updateLandedStateStream();
+  if (isTerminal()) {
+    return;
+  }
+  if (!stream_ready_) {
+    requestLandedStateStream();
+    if (stream_requested_ &&
+      std::chrono::duration<double>(SteadyClock::now() - stream_request_time_).count() >
+      command_timeout_)
+    {
+      interval_client_->remove_pending_request(stream_request_id_);
+      changePhase(OutdoorState::FAILED, "Landed-state stream request timed out; restart required");
+    }
+    return;
+  }
   if (enable_flight_) {
     updateFlight();
   } else {
@@ -286,57 +303,32 @@ void OutdoorMissionNode::updateClock()
     clock_stall_timeout_;
 }
 
-void OutdoorMissionNode::updateLandedStateStream()
+void OutdoorMissionNode::requestLandedStateStream()
 {
-  const bool connected = isFresh(state_time_) && state_.connected;
-  if (!connected) {
-    if (interval_pending_) {
-      interval_client_->remove_pending_request(interval_request_id_);
-    }
-    interval_pending_ = false;
-    interval_configured_ = false;
-    interval_attempt_time_ = TimePoint{};
-    ++interval_generation_;
-    return;
-  }
-  if (interval_configured_) {
-    return;
-  }
-  const auto current_time = SteadyClock::now();
-  if (interval_attempt_time_ != TimePoint{} &&
-    std::chrono::duration<double>(current_time - interval_attempt_time_).count() < 5.0)
+  if (stream_requested_ || !isFresh(state_time_) || !state_.connected ||
+    !interval_client_->service_is_ready())
   {
     return;
   }
-  if (interval_pending_) {
-    interval_client_->remove_pending_request(interval_request_id_);
-    interval_pending_ = false;
-    RCLCPP_WARN(get_logger(), "Landed-state stream request timed out; retrying");
-  }
-  if (!interval_client_->service_is_ready()) {
-    return;
-  }
+  stream_requested_ = true;
+  stream_request_time_ = SteadyClock::now();
   auto request = std::make_shared<mavros_msgs::srv::MessageInterval::Request>();
-  request->message_id = 245; // MAVLink EXTENDED_SYS_STATE.
+  request->message_id = 245;  // MAVLink EXTENDED_SYS_STATE.
   request->message_rate = 2.0;
-  interval_attempt_time_ = current_time;
-  interval_pending_ = true;
-  const auto generation = ++interval_generation_;
   auto result = interval_client_->async_send_request(
     request,
-    [this, generation](rclcpp::Client<mavros_msgs::srv::MessageInterval>::SharedFuture future) {
-      if (generation != interval_generation_) {
+    [this](rclcpp::Client<mavros_msgs::srv::MessageInterval>::SharedFuture future) {
+      if (isTerminal()) {
         return;
       }
-      interval_pending_ = false;
-      interval_configured_ = future.get()->success;
-      if (interval_configured_) {
-        RCLCPP_INFO(get_logger(), "Requested landed-state telemetry at 2 Hz");
-      } else {
-        RCLCPP_WARN(get_logger(), "Landed-state stream request rejected; retrying in 5 seconds");
+      if (!future.get()->success) {
+        changePhase(OutdoorState::FAILED, "Landed-state stream request rejected; restart required");
+        return;
       }
+      stream_ready_ = true;
+      RCLCPP_INFO(get_logger(), "Requested landed-state telemetry at 2 Hz");
     });
-  interval_request_id_ = result.request_id;
+  stream_request_id_ = result.request_id;
 }
 
 void OutdoorMissionNode::validateParameters()

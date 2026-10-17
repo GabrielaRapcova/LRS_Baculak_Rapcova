@@ -11,7 +11,7 @@ import time
 from geometry_msgs.msg import PoseStamped, TwistStamped
 
 from mavros_msgs.msg import ExtendedState, HomePosition, PositionTarget, State
-from mavros_msgs.srv import CommandBool, CommandTOL, SetMode
+from mavros_msgs.srv import CommandBool, CommandTOL, MessageInterval, SetMode
 
 import rclpy
 from rclpy.node import Node
@@ -55,10 +55,14 @@ class FakeVehicle(Node):
         self.states = []
         self.violations = []
         self.last_tick = time.monotonic()
+        self.suppress_landed = False
         self.suppress_local = False
         self.suppress_heading = False
         self.gps_bias = 0.0
         self.altitude_bias = 0.0
+        self.stream_service = self.create_service(
+            MessageInterval, '/mavros/set_message_interval',
+            self.accept_stream)
         self.mode_service = self.create_service(
             SetMode, '/mavros/set_mode', self.set_mode)
         self.arm_service = self.create_service(
@@ -93,6 +97,11 @@ class FakeVehicle(Node):
         self.home_pub = self.create_publisher(
             HomePosition, '/mavros/home_position/home', retained)
         self.timer = self.create_timer(0.02, self.tick)
+
+    def accept_stream(self, request, response):
+        """Accept the startup telemetry request."""
+        response.success = True
+        return response
 
     def set_mode(self, request, response):
         """Acknowledge mode requests; optionally leave telemetry unchanged."""
@@ -175,7 +184,8 @@ class FakeVehicle(Node):
         extended.landed_state = ExtendedState.LANDED_STATE_ON_GROUND
         if self.z > 3.01:
             extended.landed_state = ExtendedState.LANDED_STATE_IN_AIR
-        self.extended_pub.publish(extended)
+        if not self.suppress_landed:
+            self.extended_pub.publish(extended)
         pose = PoseStamped()
         pose.header.frame_id = self.local_frame
         pose.pose.position.x = self.x
