@@ -1,5 +1,6 @@
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -19,9 +20,11 @@
 #include "nav_msgs/msg/path.hpp"
 #include "geometry_msgs/msg/twist_stamped.hpp"
 #include "mavros_msgs/msg/state.hpp"
+#include "mavros_msgs/msg/extended_state.hpp"
 #include "mavros_msgs/msg/position_target.hpp"
 #include "mavros_msgs/srv/set_mode.hpp"
 #include "mavros_msgs/srv/command_bool.hpp"
+#include "mavros_msgs/srv/command_tol.hpp"
 
 #include "mission_executor/mission_parser.hpp"
 #include "mission_executor/mission_types.hpp"
@@ -51,25 +54,25 @@ public:
         this->declare_parameter<bool>("enable_navigation_test", false);
         this->declare_parameter<bool>("enable_navigation_flight", false);
         this->declare_parameter<bool>("enable_hard_soft_flight_test", false);
-        // Diagnostic-only: send one plan request without controlling the UAV.
         this->declare_parameter<bool>("enable_planner_test", false);
         this->declare_parameter<std::vector<double>>(
             "planner_test_start", {13.0, 7.0, 1.0});
         this->declare_parameter<std::vector<double>>(
             "planner_test_goal", {12.0, 7.0, 1.0});
-        // Stage 2: diagnostic start XY from MAVROS and target from CSV.
-        // The rotation is provisional and MUST NOT be used for actual flight.
         this->declare_parameter<bool>("planner_test_use_mavros_csv", false);
         this->declare_parameter<int64_t>("planner_test_csv_index", 2);
         this->declare_parameter<double>("planner_test_start_z_map", 1.0);
-        // Stage 3: read-only, live-pose path monitor. Never publishes MAVROS targets.
         this->declare_parameter<bool>("planner_test_monitor_path", false);
         this->declare_parameter<double>(
             "planner_test_intermediate_tolerance_m", 0.50);
-        // Stage 4: A* -> NAVIGATE integration; READ-ONLY (no MAVROS commands).
         this->declare_parameter<bool>("enable_planned_navigation_preview", false);
         this->declare_parameter<double>("planner_preview_start_z_map", 1.0);
         this->declare_parameter<double>("planner_preview_tolerance_m", 0.50);
+        this->declare_parameter<bool>("enable_task_sequence_check", false);
+        this->declare_parameter<bool>("enable_task_flight", false);
+        this->declare_parameter<bool>("task_flight_confirmed", false);
+        this->declare_parameter<double>("task_ground_wait_s", 3.0);
+        this->declare_parameter<double>("task_max_direct_leg_m", 1.25);
 
         enable_arming_ = this->get_parameter("enable_arming").as_bool();
         enable_mavros_setpoints_ =
@@ -88,6 +91,37 @@ public:
             this->get_parameter("enable_planner_test").as_bool();
         enable_planned_navigation_preview_ =
             this->get_parameter("enable_planned_navigation_preview").as_bool();
+        task_sequence_check_ =
+            this->get_parameter("enable_task_sequence_check").as_bool();
+        task_flight_enabled_ =
+            this->get_parameter("enable_task_flight").as_bool();
+        task_flight_confirmed_ =
+            this->get_parameter("task_flight_confirmed").as_bool();
+        task_ground_wait_s_ =
+            this->get_parameter("task_ground_wait_s").as_double();
+        task_max_direct_leg_m_ =
+            this->get_parameter("task_max_direct_leg_m").as_double();
+        if (!std::isfinite(task_ground_wait_s_) || task_ground_wait_s_ < 2.0 ||
+            task_ground_wait_s_ > 30.0 ||
+            !std::isfinite(task_max_direct_leg_m_) ||
+            task_max_direct_leg_m_ <= 0.0 || task_max_direct_leg_m_ > 1.5) {
+            throw std::runtime_error("Invalid task wait or direct-leg safety limit.");
+        }
+        if (task_flight_enabled_ && !task_flight_confirmed_) {
+            throw std::runtime_error(
+                "A1.2.3 flight DENIED. Need task_flight_confirmed=true, "
+                "verified coordinate frames, safe corridor and reliable telemetry.");
+        }
+        if ((task_flight_enabled_ || task_sequence_check_) &&
+            (enable_planner_test_ || enable_planned_navigation_preview_ ||
+             enable_arming_ || enable_mavros_setpoints_ ||
+             enable_navigation_test_ || enable_navigation_flight_ ||
+             enable_hard_soft_flight_test_ || debug_waypoint_setpoints_ ||
+             navigation_diagnostics_enabled_ ||
+             (task_flight_enabled_ && task_sequence_check_))) {
+            throw std::runtime_error(
+                "A1.2.3 task mode must be exclusive of all existing test/flight modes.");
+        }
         planner_preview_start_z_map_ =
             this->get_parameter("planner_preview_start_z_map").as_double();
         planner_preview_tolerance_m_ =
@@ -197,6 +231,25 @@ public:
         }
         RCLCPP_INFO(this->get_logger(), "Mission loaded: %zu waypoints",
                     mission_.size());
+        if (task_sequence_check_ || task_flight_enabled_) {
+            validate_task_mission();
+            RCLCPP_WARN(this->get_logger(),
+                "A1.2.3 task mode: %s. Takeoff/land/landtakeoff implemented "
+                "via MAVROS CommandTOL; yaw tasks unsupported in this stage. "
+                "Direct waypoint legs have NO A* collision avoidance.",
+                task_sequence_check_ ? "READ-ONLY SEQUENCE CHECK" :
+                    "SITL FLIGHT ENABLED AFTER EXPLICIT CONFIRMATION");
+            for (std::size_t i = 0; i < mission_.size(); ++i) {
+                const auto &w = mission_[i];
+                const char *task = w.task == TaskType::TAKEOFF ? "takeoff" :
+                    w.task == TaskType::LAND ? "land" :
+                    w.task == TaskType::LANDTAKEOFF ? "landtakeoff" : "none";
+                RCLCPP_INFO(this->get_logger(),
+                    "TASK PLAN CSV[%zu/%zu] (%.2f, %.2f, %.2f) [%s] %s",
+                    i + 1, mission_.size(), w.x, w.y, w.z,
+                    w.precision == Precision::HARD ? "HARD" : "SOFT", task);
+            }
+        }
         if (enable_planned_navigation_preview_) {
             for (std::size_t i = 0; i < mission_.size(); ++i) {
                 const auto &wp = mission_[i];
@@ -275,6 +328,12 @@ public:
                       std::placeholders::_1),
             pose_options);
 
+        extended_state_sub_ =
+            this->create_subscription<mavros_msgs::msg::ExtendedState>(
+                "/mavros/extended_state", 10,
+                std::bind(&MissionExecutorNode::extended_state_callback, this,
+                          std::placeholders::_1), state_options);
+
         velocity_sub_ =
             this->create_subscription<geometry_msgs::msg::TwistStamped>(
                 "/mavros/local_position/velocity_local",
@@ -287,6 +346,10 @@ public:
             "/mavros/set_mode", rclcpp::ServicesQoS(), state_group_);
         arming_client_ = this->create_client<mavros_msgs::srv::CommandBool>(
             "/mavros/cmd/arming", rclcpp::ServicesQoS(), state_group_);
+        takeoff_client_ = this->create_client<mavros_msgs::srv::CommandTOL>(
+            "/mavros/cmd/takeoff", rclcpp::ServicesQoS(), state_group_);
+        land_client_ = this->create_client<mavros_msgs::srv::CommandTOL>(
+            "/mavros/cmd/land", rclcpp::ServicesQoS(), state_group_);
 
         debug_setpoint_pub_ =
             this->create_publisher<mavros_msgs::msg::PositionTarget>(
@@ -295,14 +358,16 @@ public:
             this->create_publisher<mavros_msgs::msg::PositionTarget>(
                 "/mavros/setpoint_raw/local", 10);
 
-        if (enable_planner_test_) {
+        if (task_sequence_check_) {
+            RCLCPP_WARN(this->get_logger(),
+                "TASK SEQUENCE CHECK COMPLETE. No GUIDED/ARM/TAKEOFF/LAND requests, "
+                "no setpoints, no state-machine execution.");
+        } else if (enable_planner_test_) {
             planner_client_ = rclcpp_action::create_client<ComputePath3D>(
                 this, "/compute_path_3d");
             planner_test_timer_ = this->create_wall_timer(
                 1s, std::bind(&MissionExecutorNode::send_planner_test_goal, this));
             if (planner_test_monitor_path_) {
-                // A path monitor only: consumes live MAVROS telemetry but sends
-                // no commands to the vehicle, even if it is armed in SITL.
                 planner_path_monitor_timer_ = this->create_wall_timer(
                     500ms,
                     std::bind(&MissionExecutorNode::monitor_planned_path, this),
@@ -318,7 +383,6 @@ public:
         } else if (enable_planned_navigation_preview_) {
             planner_client_ = rclcpp_action::create_client<ComputePath3D>(
                 this, "/compute_path_3d");
-            // Deliberately do NOT create a setpoint timer in preview mode.
             state_timer_ = this->create_wall_timer(
                 100ms, std::bind(&MissionExecutorNode::state_machine_callback, this),
                 state_group_);
@@ -335,10 +399,12 @@ public:
                     "Callback groups initialized: state, setpoint, telemetry.");
         RCLCPP_INFO(this->get_logger(),
                     "%s",
-                    (enable_planner_test_ || enable_planned_navigation_preview_)
+                    (task_sequence_check_ || enable_planner_test_ ||
+                     enable_planned_navigation_preview_)
                         ? "No periodic setpoint publisher timer in read-only mode."
                         : "Debug setpoint publisher initialized at 20 Hz.");
         RCLCPP_INFO(this->get_logger(), "Real MAVROS setpoints: %s",
+                    task_flight_enabled_ ? "ENABLED (A1.2.3 guarded SITL only)" :
                     enable_navigation_flight_ ?
                         (enable_hard_soft_flight_test_ ?
                          "ENABLED (SITL, 4-WP HARD/SOFT TEST ONLY)" :
@@ -362,6 +428,32 @@ private:
     bool enable_hard_soft_flight_test_ = false;
     bool enable_planner_test_ = false;
     bool enable_planned_navigation_preview_ = false;
+    bool task_sequence_check_ = false;
+    bool task_flight_enabled_ = false;
+    bool task_flight_confirmed_ = false;
+    double task_ground_wait_s_ = 3.0;
+    double task_max_direct_leg_m_ = 1.25;
+    std::atomic<bool> task_navigation_active_{false};
+    bool task_landtakeoff_ = false;
+    bool task_takeoff_sent_ = false;
+    bool task_takeoff_response_received_ = false;
+    bool task_takeoff_accepted_ = false;
+    bool task_land_sent_ = false;
+    bool task_land_response_received_ = false;
+    bool task_land_accepted_ = false;
+    bool task_disarm_sent_ = false;
+    bool task_disarm_response_received_ = false;
+    bool task_disarm_accepted_ = false;
+    bool task_ground_confirmed_ = false;
+    bool task_land_telemetry_missing_ = false;
+    std::chrono::steady_clock::time_point task_land_telemetry_missing_since_{};
+    bool task_takeoff_seen_airborne_ = false;
+    bool task_stable_started_ = false;
+    double task_takeoff_target_z_ = 0.0;
+    std::chrono::steady_clock::time_point task_operation_started_{};
+    std::chrono::steady_clock::time_point task_stable_since_{};
+    std::chrono::steady_clock::time_point task_ground_wait_since_{};
+    std::chrono::steady_clock::time_point task_preflight_started_{};
     double planner_preview_start_z_map_ = 1.0;
     double planner_preview_tolerance_m_ = 0.50;
     bool planner_test_use_mavros_csv_ = false;
@@ -372,7 +464,6 @@ private:
     rclcpp_action::Client<ComputePath3D>::SharedPtr planner_client_;
     rclcpp::TimerBase::SharedPtr planner_test_timer_;
     rclcpp::TimerBase::SharedPtr planner_path_monitor_timer_;
-    // Accessed by the action result callback and the periodic monitor.
     std::mutex planner_path_mutex_;
     nav_msgs::msg::Path planned_path_;
     MissionWaypoint planned_final_waypoint_{};
@@ -382,7 +473,6 @@ private:
     std::atomic<bool> flight_navigation_active_{false};
 
     enum class PreviewPhase { NEED_PLAN, WAIT_RESULT, FOLLOW_PATH, FAILURE };
-    // Callback group for Action Client can run in parallel with state timer.
     std::mutex preview_mutex_;
     PreviewPhase preview_phase_ = PreviewPhase::NEED_PLAN;
     nav_msgs::msg::Path preview_path_;
@@ -398,6 +488,9 @@ private:
     bool arming_disabled_logged_ = false;
     std::string mavros_mode_;
     std::chrono::steady_clock::time_point last_mavros_state_time_{};
+    bool extended_state_received_ = false;
+    uint8_t landed_state_ = mavros_msgs::msg::ExtendedState::LANDED_STATE_UNDEFINED;
+    std::chrono::steady_clock::time_point last_extended_state_time_{};
 
     static constexpr auto MAVROS_TIMEOUT = 10s;
     static constexpr auto MODE_TIMEOUT = 10s;
@@ -409,11 +502,13 @@ private:
     geometry_msgs::msg::PoseStamped current_pose_;
     bool pose_received_ = false;
     std::chrono::steady_clock::time_point last_pose_time_{};
+    std::deque<std::chrono::steady_clock::time_point> pose_samples_;
 
 
     geometry_msgs::msg::TwistStamped current_velocity_;
     bool velocity_received_ = false;
     std::chrono::steady_clock::time_point last_velocity_time_{};
+    std::deque<std::chrono::steady_clock::time_point> velocity_samples_;
 
     bool hold_initialized_ = false;
     geometry_msgs::msg::Point hold_position_;
@@ -425,6 +520,8 @@ private:
 
     rclcpp::Subscription<mavros_msgs::msg::State>::SharedPtr
         mavros_state_sub_;
+    rclcpp::Subscription<mavros_msgs::msg::ExtendedState>::SharedPtr
+        extended_state_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr
         pose_sub_;
     rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr
@@ -439,6 +536,10 @@ private:
         set_mode_client_;
     rclcpp::Client<mavros_msgs::srv::CommandBool>::SharedPtr
         arming_client_;
+    rclcpp::Client<mavros_msgs::srv::CommandTOL>::SharedPtr
+        takeoff_client_;
+    rclcpp::Client<mavros_msgs::srv::CommandTOL>::SharedPtr
+        land_client_;
 
     bool mode_request_sent_ = false;
     bool mode_response_received_ = false;
@@ -449,10 +550,414 @@ private:
     bool arm_request_accepted_ = false;
     std::chrono::steady_clock::time_point arm_request_time_{};
 
-    // NOTE: These are provisional XY conversions inferred from a single
-    // simulation configuration. There is not yet a calibrated transform between
-    // the PCD map and MAVROS's local position reference. Never use this helper
-    // for an actual MAVROS setpoint before independent frame calibration.
+    void validate_task_mission() const
+    {
+        if (mission_.size() < 3 || mission_.front().task != TaskType::TAKEOFF ||
+            mission_.back().task != TaskType::LAND) {
+            throw std::runtime_error(
+                "A1.2.3 test CSV must begin with takeoff and end with land "
+                "and contain at least three waypoints.");
+        }
+        for (std::size_t i = 0; i < mission_.size(); ++i) {
+            const auto &w = mission_[i];
+            if (!std::isfinite(w.x) || !std::isfinite(w.y) ||
+                !std::isfinite(w.z) || w.z < 0.75 || w.z > 3.0) {
+                throw std::runtime_error(
+                    "A1.2.3 invalid waypoint coordinate or altitude; "
+                    "test altitudes must be within 0.75..3.0 m.");
+            }
+            if (w.task == TaskType::YAW ||
+                (w.task == TaskType::TAKEOFF && i != 0) ||
+                (w.task == TaskType::LAND && i + 1 != mission_.size()) ||
+                (w.task == TaskType::LANDTAKEOFF &&
+                    (i == 0 || i + 1 == mission_.size()))) {
+                throw std::runtime_error(
+                    "A1.2.3 mission has unsupported task placement or yaw task.");
+            }
+            if (i != 0) {
+                const auto &prev = mission_[i - 1];
+                if (std::hypot(w.x - prev.x, w.y - prev.y) >
+                    task_max_direct_leg_m_) {
+                    throw std::runtime_error(
+                        "A1.2.3 direct XY leg too long for this guarded SITL "
+                        "test; use a short inspected obstacle-free corridor.");
+                }
+            }
+        }
+    }
+
+    static void keep_recent_samples(
+        std::deque<std::chrono::steady_clock::time_point> &times,
+        std::chrono::steady_clock::time_point now)
+    {
+        times.push_back(now);
+        while (times.size() > 8) times.pop_front();
+    }
+
+    static bool sample_rate_ok(
+        const std::deque<std::chrono::steady_clock::time_point> &samples)
+    {
+        return samples.size() == 8 &&
+            samples.back() - samples.front() <= 1400ms;
+    }
+
+    bool task_telemetry_ok(bool require_ground)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lock(mavros_mutex_);
+            if (!mavros_state_received_ || !mavros_connected_ ||
+                now - last_mavros_state_time_ > 2s ||
+                !extended_state_received_ ||
+                now - last_extended_state_time_ > 2s ||
+                (require_ground && (
+                    mavros_armed_ ||
+                    landed_state_ !=
+                        mavros_msgs::msg::ExtendedState::LANDED_STATE_ON_GROUND))) {
+                return false;
+            }
+        }
+        std::lock_guard<std::mutex> lock(pose_mutex_);
+        const auto &p = current_pose_.pose.position;
+        const auto &v = current_velocity_.twist.linear;
+        return pose_received_ && velocity_received_ &&
+            now - last_pose_time_ <= 500ms &&
+            now - last_velocity_time_ <= 500ms &&
+            sample_rate_ok(pose_samples_) &&
+            sample_rate_ok(velocity_samples_) &&
+            current_pose_.header.frame_id == "map" &&
+            finite_point(p) &&
+            std::isfinite(v.x) && std::isfinite(v.y) &&
+            std::isfinite(v.z);
+    }
+
+    bool task_airborne()
+    {
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(mavros_mutex_);
+        return extended_state_received_ &&
+            now - last_extended_state_time_ <= 2s &&
+            landed_state_ ==
+                mavros_msgs::msg::ExtendedState::LANDED_STATE_IN_AIR;
+    }
+
+    bool task_snapshot(
+        geometry_msgs::msg::PoseStamped &pose,
+        geometry_msgs::msg::TwistStamped &velocity)
+    {
+        if (!task_telemetry_ok(false)) return false;
+        std::lock_guard<std::mutex> lock(pose_mutex_);
+        pose = current_pose_;
+        velocity = current_velocity_;
+        return true;
+    }
+
+    bool task_stable_for(
+        bool condition, std::chrono::steady_clock::time_point now,
+        std::chrono::steady_clock::duration duration)
+    {
+        if (!condition) {
+            task_stable_started_ = false;
+            return false;
+        }
+        if (!task_stable_started_) {
+            task_stable_started_ = true;
+            task_stable_since_ = now;
+        }
+        return now - task_stable_since_ >= duration;
+    }
+
+    void request_takeoff_task(double altitude_above_ground)
+    {
+        if (!takeoff_client_->service_is_ready()) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "Waiting for /mavros/cmd/takeoff...");
+            return;
+        }
+        auto request = std::make_shared<mavros_msgs::srv::CommandTOL::Request>();
+        request->altitude = altitude_above_ground;
+        task_takeoff_sent_ = true;
+        task_takeoff_response_received_ = false;
+        task_takeoff_accepted_ = false;
+        task_operation_started_ = std::chrono::steady_clock::now();
+        RCLCPP_WARN(this->get_logger(),
+            "SITL TAKEOFF command, relative climb %.2fm. "
+            "Waiting for actual airborne state and Z feedback.",
+            altitude_above_ground);
+        takeoff_client_->async_send_request(request,
+            [this](rclcpp::Client<mavros_msgs::srv::CommandTOL>::SharedFuture future) {
+                try {
+                    task_takeoff_accepted_ = future.get()->success;
+                } catch (const std::exception &e) {
+                    RCLCPP_ERROR(this->get_logger(), "TAKEOFF call: %s", e.what());
+                    task_takeoff_accepted_ = false;
+                }
+                task_takeoff_response_received_ = true;
+            });
+    }
+
+    void request_land_task()
+    {
+        if (!land_client_->service_is_ready()) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "Waiting for /mavros/cmd/land...");
+            return;
+        }
+        auto request = std::make_shared<mavros_msgs::srv::CommandTOL::Request>();
+        task_land_sent_ = true;
+        task_land_response_received_ = false;
+        task_land_accepted_ = false;
+        task_operation_started_ = std::chrono::steady_clock::now();
+        RCLCPP_WARN(this->get_logger(),
+            "SITL LAND command at current waypoint; stop position setpoints.");
+        land_client_->async_send_request(request,
+            [this](rclcpp::Client<mavros_msgs::srv::CommandTOL>::SharedFuture future) {
+                try {
+                    task_land_accepted_ = future.get()->success;
+                } catch (const std::exception &e) {
+                    RCLCPP_ERROR(this->get_logger(), "LAND call: %s", e.what());
+                    task_land_accepted_ = false;
+                }
+                task_land_response_received_ = true;
+            });
+    }
+
+    void request_disarm_task()
+    {
+        if (!arming_client_->service_is_ready()) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "Waiting for /mavros/cmd/arming to disarm...");
+            return;
+        }
+        auto request = std::make_shared<mavros_msgs::srv::CommandBool::Request>();
+        request->value = false;
+        task_disarm_sent_ = true;
+        task_disarm_response_received_ = false;
+        task_disarm_accepted_ = false;
+        RCLCPP_INFO(this->get_logger(),
+            "Ground confirmed, requesting disarm if not already disarmed.");
+        arming_client_->async_send_request(request,
+            [this](rclcpp::Client<mavros_msgs::srv::CommandBool>::SharedFuture future) {
+                try {
+                    task_disarm_accepted_ = future.get()->success;
+                } catch (const std::exception &e) {
+                    RCLCPP_ERROR(this->get_logger(), "DISARM call: %s", e.what());
+                    task_disarm_accepted_ = false;
+                }
+                task_disarm_response_received_ = true;
+            });
+    }
+
+    void task_takeoff_tick(
+        bool armed, const std::string &mode,
+        std::chrono::steady_clock::time_point now)
+    {
+        if (!armed || mode != "GUIDED") {
+            RCLCPP_ERROR(this->get_logger(),
+                "TAKEOFF interrupted: arm/GUIDED confirmation lost.");
+            change_state(MissionState::ERROR);
+            return;
+        }
+        geometry_msgs::msg::PoseStamped pose;
+        geometry_msgs::msg::TwistStamped velocity;
+        if (!task_snapshot(pose, velocity)) {
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "TAKEOFF waiting for >=5Hz pose/velocity and fresh MAVROS state.");
+            if ((task_takeoff_sent_ && now - task_operation_started_ > 8s) ||
+                (!task_takeoff_sent_ && now - task_operation_started_ > 20s)) {
+                change_state(MissionState::ERROR);
+            }
+            return;
+        }
+        const std::size_t idx = current_waypoint_index_.load();
+        if (idx >= mission_.size()) {
+            change_state(MissionState::ERROR);
+            return;
+        }
+        const auto goal = position_controller_.gazebo_to_enu(mission_[idx]);
+        const auto &p = pose.pose.position;
+        const double xy_error = std::hypot(p.x - goal.x, p.y - goal.y);
+        if (!task_takeoff_sent_) {
+            if (now - task_operation_started_ > 20s) {
+                RCLCPP_ERROR(this->get_logger(),
+                    "TAKEOFF preparation timeout; no command sent.");
+                change_state(MissionState::ERROR);
+                return;
+            }
+            bool on_ground = false;
+            {
+                std::lock_guard<std::mutex> lock(mavros_mutex_);
+                on_ground = landed_state_ ==
+                    mavros_msgs::msg::ExtendedState::LANDED_STATE_ON_GROUND;
+            }
+            if (!on_ground) {
+                RCLCPP_ERROR(this->get_logger(),
+                    "TAKEOFF blocked: vehicle no longer reports ON_GROUND.");
+                change_state(MissionState::ERROR);
+                return;
+            }
+            if (xy_error > 0.45) {
+                RCLCPP_ERROR(this->get_logger(),
+                    "TAKEOFF blocked: current XY is %.2fm from the takeoff "
+                    "waypoint. No lateral flight allowed during takeoff.", xy_error);
+                change_state(MissionState::ERROR);
+                return;
+            }
+            if (task_snapshot(pose, velocity) &&
+                mission_[idx].z - p.z >= 0.75 &&
+                mission_[idx].z - p.z <= 3.0) {
+                task_takeoff_target_z_ = goal.z;
+                request_takeoff_task(goal.z - p.z);
+            } else {
+                RCLCPP_ERROR(this->get_logger(),
+                    "TAKEOFF invalid requested climb/ground Z.");
+                change_state(MissionState::ERROR);
+            }
+            return;
+        }
+        if (task_takeoff_response_received_ && !task_takeoff_accepted_) {
+            RCLCPP_ERROR(this->get_logger(), "Autopilot rejected TAKEOFF request.");
+            change_state(MissionState::ERROR);
+            return;
+        }
+        if (now - task_operation_started_ > 50s) {
+            RCLCPP_ERROR(this->get_logger(), "TAKEOFF timed out.");
+            change_state(MissionState::ERROR);
+            return;
+        }
+        bool airborne = false;
+        {
+            std::lock_guard<std::mutex> lock(mavros_mutex_);
+            airborne = landed_state_ ==
+                mavros_msgs::msg::ExtendedState::LANDED_STATE_IN_AIR;
+        }
+        task_takeoff_seen_airborne_ = task_takeoff_seen_airborne_ || airborne;
+        const double speed = std::hypot(std::hypot(velocity.twist.linear.x,
+            velocity.twist.linear.y), velocity.twist.linear.z);
+        const bool ready = task_takeoff_response_received_ &&
+            task_takeoff_accepted_ && task_takeoff_seen_airborne_ && airborne &&
+            std::fabs(p.z - task_takeoff_target_z_) <= 0.20 &&
+            speed <= 0.25 && xy_error <= 0.45;
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+            "TAKEOFF monitor: measured Z=%.2f target=%.2f airborne=%s "
+            "speed=%.2f stable=%s", p.z, task_takeoff_target_z_,
+            airborne ? "YES" : "NO", speed, ready ? "YES" : "NO");
+        if (task_stable_for(ready, now, 1s)) {
+            RCLCPP_INFO(this->get_logger(),
+                "TAKEOFF verified: airborne and target height stable. "
+                "WP%zu complete.", idx + 1);
+            current_waypoint_index_.store(idx + 1);
+            position_controller_.reset_arrival();
+            change_state(MissionState::NAVIGATE);
+        }
+    }
+
+    void task_land_tick(
+        bool armed, std::chrono::steady_clock::time_point now)
+    {
+        if (!task_land_sent_) {
+            if (now - task_operation_started_ > 20s) {
+                RCLCPP_ERROR(this->get_logger(),
+                    "LAND preparation timeout; no command sent.");
+                change_state(MissionState::ERROR);
+                return;
+            }
+            if (!task_telemetry_ok(false)) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                    "LAND waiting for fresh >=5Hz telemetry.");
+                return;
+            }
+            request_land_task();
+            return;
+        }
+
+        if (!task_telemetry_ok(false)) {
+            if (!task_land_telemetry_missing_) {
+                task_land_telemetry_missing_ = true;
+                task_land_telemetry_missing_since_ = now;
+                RCLCPP_WARN(this->get_logger(),
+                    "LAND: lost fresh telemetry; autonomous landing may continue.");
+            }
+            if (now - task_land_telemetry_missing_since_ > 3s) {
+                RCLCPP_ERROR(this->get_logger(),
+                    "LAND telemetry stale for >3s: ERROR. Do not issue another "
+                    "takeoff; inspect vehicle and intervene manually if needed. "
+                    "Autopilot may still be landing.");
+                change_state(MissionState::ERROR);
+            }
+            return;
+        }
+        task_land_telemetry_missing_ = false;
+        if (task_land_response_received_ && !task_land_accepted_) {
+            RCLCPP_ERROR(this->get_logger(), "Autopilot rejected LAND request.");
+            change_state(MissionState::ERROR);
+            return;
+        }
+        if (now - task_operation_started_ > 90s) {
+            RCLCPP_ERROR(this->get_logger(),
+                "LAND timeout. Autopilot might still be landing; inspect SITL.");
+            change_state(MissionState::ERROR);
+            return;
+        }
+        if (!task_land_response_received_ || !task_land_accepted_) return;
+        bool ground = false;
+        bool ext_fresh = false;
+        {
+            std::lock_guard<std::mutex> lock(mavros_mutex_);
+            ext_fresh = extended_state_received_ &&
+                now - last_extended_state_time_ <= 2s;
+            ground = ext_fresh && landed_state_ ==
+                mavros_msgs::msg::ExtendedState::LANDED_STATE_ON_GROUND;
+        }
+        if (!ground) {
+            task_stable_started_ = false;
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "LAND in progress: waiting for ON_GROUND extended state.");
+            return;
+        }
+        geometry_msgs::msg::PoseStamped pose;
+        geometry_msgs::msg::TwistStamped vel;
+        if (!task_snapshot(pose, vel)) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "LAND ground reported, waiting for fresh telemetry before disarm.");
+            return;
+        }
+        if (std::fabs(vel.twist.linear.z) > 0.20) {
+            task_stable_started_ = false;
+            return;
+        }
+        if (armed) {
+            if (!task_disarm_sent_) request_disarm_task();
+            if (task_disarm_response_received_ && !task_disarm_accepted_) {
+                RCLCPP_ERROR(this->get_logger(), "Autopilot rejected DISARM.");
+                change_state(MissionState::ERROR);
+            }
+            return;
+        }
+        if (!task_ground_confirmed_) {
+            if (!task_stable_for(true, now, 1s)) return;
+            task_ground_confirmed_ = true;
+            task_ground_wait_since_ = now;
+            RCLCPP_INFO(this->get_logger(),
+                "LAND verified: ON_GROUND and DISARMED. Waiting %.1fs.",
+                task_landtakeoff_ ? task_ground_wait_s_ : 0.0);
+        }
+        if (!task_landtakeoff_) {
+            current_waypoint_index_.store(mission_.size());
+            change_state(MissionState::DONE);
+            return;
+        }
+        if (now - task_ground_wait_since_ <
+            std::chrono::duration<double>(task_ground_wait_s_)) return;
+        // Keep current LANDTAKEOFF waypoint index; resume after second TAKEOFF.
+        task_landtakeoff_ = false;
+        RCLCPP_WARN(this->get_logger(),
+            "LANDTAKEOFF: ground wait complete, re-enter GUIDED then ARM "
+            "before attempting a new takeoff from waypoint %zu.",
+            current_waypoint_index_.load() + 1);
+        change_state(MissionState::SET_MODE);
+    }
+
     static geometry_msgs::msg::Point provisional_map_to_mavros(
         const geometry_msgs::msg::Point &map_point)
     {
@@ -475,8 +980,6 @@ private:
         return std::hypot(std::hypot(a.x - b.x, a.y - b.y), a.z - b.z);
     }
 
-    // Verify the planner result before it becomes a target sequence.
-    // The action result is the authoritative path, not the /plan display topic.
     bool validate_planner_path(
         const nav_msgs::msg::Path &path,
         const std::vector<double> &requested_start,
@@ -517,9 +1020,6 @@ private:
         return true;
     }
 
-    // Diagnostic-only path progression. Intermediate points use a loose
-    // distance tolerance; the final CSV waypoint reuses the tested HARD/SOFT
-    // arrival logic. Crucially, this function NEVER publishes to MAVROS.
     void monitor_planned_path()
     {
         geometry_msgs::msg::Point target_map;
@@ -575,7 +1075,6 @@ private:
         const bool final = index + 1 == count;
         bool reached = false;
         if (final) {
-            // Keep the exact CSV precision semantics (including HARD settle).
             const auto arrival = position_controller_.update_arrival(
                 pose.pose.position, velocity.twist.linear, final_waypoint,
                 std::chrono::steady_clock::now());
@@ -590,7 +1089,6 @@ private:
                 arrival.distance_m, arrival.speed_mps, arrival.stable_time_s,
                 reached ? "YES" : "NO");
         } else {
-            // At intermediate path points do not require speed or settling.
             position_controller_.reset_arrival();
             reached = distance <= planner_test_intermediate_tolerance_m_;
             RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
@@ -606,7 +1104,6 @@ private:
             return;
         }
 
-        // Result callback might be concurrent. Do not advance a replaced path.
         {
             std::lock_guard<std::mutex> lock(planner_path_mutex_);
             if (!planned_path_monitor_active_ || current_path_index_ != index) {
@@ -628,10 +1125,6 @@ private:
         }
     }
 
-    // A1.1 -> A1.2 NAVIGATE bridge, read-only until coordinate calibration,
-    // proper telemetry rates and automated takeoff/landing are validated.
-    // The planner's result is stored; each intermediate point is distance-only,
-    // while the final CSV waypoint uses PositionController HARD/SOFT.
     void preview_navigate()
     {
         if (current_waypoint_index_.load() >= mission_.size()) {
@@ -718,7 +1211,6 @@ private:
         const double distance = distance_between(pose.pose.position, projected);
         bool reached = false;
         if (final_point) {
-            // Tested PositionController enforces HARD settling/velocity rules.
             const auto arrival = position_controller_.update_arrival(
                 pose.pose.position, velocity.twist.linear, wp,
                 std::chrono::steady_clock::now());
@@ -770,7 +1262,6 @@ private:
             preview_path_index_ = 0;
             preview_phase_ = PreviewPhase::NEED_PLAN;
         }
-        // The next state-machine tick plans from the new measured pose.
     }
 
     void preview_request_plan()
@@ -801,7 +1292,6 @@ private:
         const std::size_t wp_idx = current_waypoint_index_.load();
         const auto &goal_wp = mission_[wp_idx];
         const double start_z = p.z > 0.5 ? p.z : planner_preview_start_z_map_;
-        // WARNING: XY rotation is a hypothesis, not a calibrated TF transform.
         const std::vector<double> start{p.y, -p.x, start_z};
         const std::vector<double> goal{goal_wp.x, goal_wp.y, goal_wp.z};
         if (p.z <= 0.5) {
@@ -869,7 +1359,6 @@ private:
                 return;
             }
             preview_path_ = wrapped.result->path;
-            // Skip the first point only if it is the virtual/measured start.
             preview_path_index_ = preview_path_.poses.size() > 1 ? 1 : 0;
             preview_phase_ = PreviewPhase::FOLLOW_PATH;
             RCLCPP_INFO(this->get_logger(),
@@ -889,10 +1378,6 @@ private:
         planner_client_->async_send_goal(request, options);
     }
 
-    // Diagnostic only. The fixed-point test remains available by default.
-    // Stage 2 optionally derives the planning request from MAVROS XY and CSV.
-    // The observed 90-degree XY rotation is provisional; the altitude is a
-    // user-defined planning projection while the UAV is on the ground.
     void send_planner_test_goal()
     {
         if (!planner_client_->action_server_is_ready()) {
@@ -930,8 +1415,6 @@ private:
                 return;
             }
             const auto &waypoint = mission_[planner_test_csv_index_];
-            // Provisional MAVROS-ENU -> CSV/map XY rotation, inferred from
-            // one SITL observation. We DO NOT publish this to the autopilot.
             start = {position.y, -position.x, planner_test_start_z_map_};
             goal_point = {waypoint.x, waypoint.y, waypoint.z};
             RCLCPP_WARN(this->get_logger(),
@@ -944,7 +1427,6 @@ private:
                 goal_point[0], goal_point[1], goal_point[2]);
         }
         planner_test_timer_->cancel();
-        // A static test goal has no mission task; default to SOFT arrival.
         MissionWaypoint final_waypoint{
             goal_point[0], goal_point[1], goal_point[2],
             Precision::SOFT, TaskType::NONE};
@@ -1082,6 +1564,15 @@ private:
         last_mavros_state_time_ = std::chrono::steady_clock::now();
     }
 
+    void extended_state_callback(
+        const mavros_msgs::msg::ExtendedState::SharedPtr msg)
+    {
+        std::lock_guard<std::mutex> lock(mavros_mutex_);
+        extended_state_received_ = true;
+        landed_state_ = msg->landed_state;
+        last_extended_state_time_ = std::chrono::steady_clock::now();
+    }
+
     void pose_callback(
         const geometry_msgs::msg::PoseStamped::SharedPtr msg)
     {
@@ -1090,6 +1581,7 @@ private:
             current_pose_ = *msg;
             pose_received_ = true;
             last_pose_time_ = std::chrono::steady_clock::now();
+            keep_recent_samples(pose_samples_, last_pose_time_);
         }
         RCLCPP_INFO_THROTTLE(
             this->get_logger(), *this->get_clock(), 5000,
@@ -1106,6 +1598,7 @@ private:
             current_velocity_ = *msg;
             velocity_received_ = true;
             last_velocity_time_ = std::chrono::steady_clock::now();
+            keep_recent_samples(velocity_samples_, last_velocity_time_);
         }
         const auto &v = msg->twist.linear;
         RCLCPP_INFO_THROTTLE(
@@ -1116,7 +1609,7 @@ private:
 
     bool process_current_waypoint()
     {
-        if (!navigation_diagnostics_enabled_) {
+        if (!navigation_diagnostics_enabled_ && !task_flight_enabled_) {
             return false;
         }
         const std::size_t index = current_waypoint_index_.load();
@@ -1155,7 +1648,12 @@ private:
             return false;
         }
 
-        const MissionWaypoint &waypoint = mission_[index];
+        MissionWaypoint waypoint = mission_[index];
+         if (task_flight_enabled_ &&
+            (waypoint.task == TaskType::LAND ||
+             waypoint.task == TaskType::LANDTAKEOFF)) {
+            waypoint.precision = Precision::HARD;
+        }
         const auto target = position_controller_.gazebo_to_enu(waypoint);
         const auto &position = pose_snapshot.pose.position;
         const auto &velocity = velocity_snapshot.twist.linear;
@@ -1194,6 +1692,40 @@ private:
                     state_to_string(current_state_),
                     state_to_string(new_state));
         current_state_ = new_state;
+        if (task_flight_enabled_) {
+            task_navigation_active_.store(new_state == MissionState::NAVIGATE);
+            if (new_state == MissionState::SET_MODE) {
+                mode_request_sent_ = false;
+                mode_response_received_ = false;
+                mode_request_accepted_ = false;
+                task_preflight_started_ = std::chrono::steady_clock::now();
+            }
+            if (new_state == MissionState::ARM) {
+                arm_request_sent_ = false;
+                arm_response_received_ = false;
+                arm_request_accepted_ = false;
+            }
+            if (new_state == MissionState::TAKEOFF) {
+                task_operation_started_ = std::chrono::steady_clock::now();
+                task_takeoff_sent_ = false;
+                task_takeoff_response_received_ = false;
+                task_takeoff_accepted_ = false;
+                task_takeoff_seen_airborne_ = false;
+                task_stable_started_ = false;
+            }
+            if (new_state == MissionState::LAND) {
+                task_operation_started_ = std::chrono::steady_clock::now();
+                task_land_sent_ = false;
+                task_land_response_received_ = false;
+                task_land_accepted_ = false;
+                task_disarm_sent_ = false;
+                task_disarm_response_received_ = false;
+                task_disarm_accepted_ = false;
+                task_ground_confirmed_ = false;
+                task_land_telemetry_missing_ = false;
+                task_stable_started_ = false;
+            }
+        }
         if (new_state == MissionState::ERROR) {
             flight_navigation_active_.store(false);
         }
@@ -1235,7 +1767,8 @@ private:
         }
         debug_setpoint_pub_->publish(debug_msg);
 
-        if (!enable_mavros_setpoints_ && !enable_navigation_flight_) {
+        if (!enable_mavros_setpoints_ && !enable_navigation_flight_ &&
+            !task_flight_enabled_) {
             return;
         }
         bool connected = false;
@@ -1250,6 +1783,20 @@ private:
             state_fresh = mavros_state_received_ &&
                 (std::chrono::steady_clock::now() - last_mavros_state_time_
                  <= MAVROS_TIMEOUT);
+        }
+        if (task_flight_enabled_) {
+            if (!task_navigation_active_.load() || !connected ||
+                !state_fresh || !armed || mode != "GUIDED" ||
+                !task_telemetry_ok(false) || !task_airborne()) return;
+            const auto goal_idx = current_waypoint_index_.load();
+            if (goal_idx == 0 || goal_idx >= mission_.size()) return;
+            auto target = create_position_target();
+            target.position =
+                position_controller_.gazebo_to_enu(mission_[goal_idx]);
+            target.type_mask |=
+                mavros_msgs::msg::PositionTarget::IGNORE_YAW;
+            mavros_setpoint_pub_->publish(target);
+            return;
         }
         if (enable_navigation_flight_) {
             if (!flight_navigation_active_.load() ||
@@ -1506,6 +2053,17 @@ private:
             }
             case MissionState::SET_MODE:
             {
+                if (task_flight_enabled_ && !task_telemetry_ok(true)) {
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(),
+                        3000, "A1.2.3 preflight blocked: need ON_GROUND, "
+                        "DISARMED, connected state and >=5Hz fresh pose/velocity.");
+                    if (now - task_preflight_started_ > 30s) {
+                        RCLCPP_ERROR(this->get_logger(),
+                            "A1.2.3 preflight timeout. No arming attempted.");
+                        change_state(MissionState::ERROR);
+                    }
+                    break;
+                }
                 if (mode == "GUIDED") {
                     RCLCPP_INFO(this->get_logger(), "GUIDED mode confirmed.");
                     change_state(MissionState::ARM);
@@ -1530,6 +2088,53 @@ private:
             }
             case MissionState::ARM:
             {
+                if (task_flight_enabled_) {
+                    if (mode != "GUIDED") {
+                        RCLCPP_ERROR(this->get_logger(),
+                            "A1.2.3 GUIDED lost before arming.");
+                        change_state(MissionState::ERROR);
+                        break;
+                    }
+                    if (armed) {
+                        RCLCPP_INFO(this->get_logger(),
+                            "A1.2.3 ARM confirmed, entering TAKEOFF.");
+                        change_state(MissionState::TAKEOFF);
+                        break;
+                    }
+                    if (!task_telemetry_ok(true)) {
+                        RCLCPP_WARN_THROTTLE(this->get_logger(),
+                            *this->get_clock(), 2000,
+                            "A1.2.3 ARM waiting for healthy ground telemetry.");
+                        break;
+                    }
+                    if (!arm_request_sent_) {
+                        geometry_msgs::msg::PoseStamped check_pose;
+                        geometry_msgs::msg::TwistStamped check_velocity;
+                        if (!task_snapshot(check_pose, check_velocity)) break;
+                        const auto index = current_waypoint_index_.load();
+                        const auto target =
+                            position_controller_.gazebo_to_enu(mission_[index]);
+                        const auto &p = check_pose.pose.position;
+                        if (std::hypot(p.x - target.x, p.y - target.y) > 0.45) {
+                            RCLCPP_ERROR(this->get_logger(),
+                                "A1.2.3 ARM refused: not above planned takeoff XY.");
+                            change_state(MissionState::ERROR);
+                            break;
+                        }
+                        request_arm();
+                    }
+                    if (arm_response_received_ && !arm_request_accepted_) {
+                        RCLCPP_ERROR(this->get_logger(),
+                            "A1.2.3 ARM request rejected.");
+                        change_state(MissionState::ERROR);
+                    } else if (arm_request_sent_ &&
+                        now - arm_request_time_ > ARM_TIMEOUT) {
+                        RCLCPP_ERROR(this->get_logger(),
+                            "A1.2.3 ARM acknowledgement timeout.");
+                        change_state(MissionState::ERROR);
+                    }
+                    break;
+                }
 
                 if (navigation_diagnostics_enabled_ && !enable_navigation_flight_) {
                     process_current_waypoint();
@@ -1617,11 +2222,58 @@ private:
             }
             case MissionState::TAKEOFF:
             {
-
+                if (task_flight_enabled_) task_takeoff_tick(armed, mode, now);
                 break;
             }
             case MissionState::NAVIGATE:
             {
+                if (task_flight_enabled_) {
+                    if (!armed || mode != "GUIDED") {
+                        RCLCPP_ERROR(this->get_logger(),
+                            "A1.2.3 NAVIGATE: arm/GUIDED lost.");
+                        change_state(MissionState::ERROR);
+                        break;
+                    }
+                    if (!task_telemetry_ok(false) || !task_airborne()) {
+                        RCLCPP_ERROR(this->get_logger(),
+                            "A1.2.3 NAVIGATE: not confirmed IN_AIR or telemetry "
+                            "dropped below 5Hz "
+                            "or became stale. Setpoints stopped; ArduPilot "
+                            "may retain last target. Manual intervention needed.");
+                        change_state(MissionState::ERROR);
+                        break;
+                    }
+                    const auto i = current_waypoint_index_.load();
+                    if (i >= mission_.size()) {
+                        change_state(MissionState::DONE);
+                        break;
+                    }
+                    if (process_current_waypoint()) {
+                        position_controller_.reset_arrival();
+                        const auto task = mission_[i].task;
+                        if (task == TaskType::LAND ||
+                            task == TaskType::LANDTAKEOFF) {
+                            task_landtakeoff_ = task == TaskType::LANDTAKEOFF;
+                            RCLCPP_INFO(this->get_logger(),
+                                "WP%zu reached: entering TASK (%s).", i + 1,
+                                task_landtakeoff_ ? "LANDTAKEOFF" : "LAND");
+                            change_state(MissionState::TASK);
+                        } else if (task == TaskType::NONE) {
+                            current_waypoint_index_.store(i + 1);
+                            if (i + 1 < mission_.size()) {
+                                RCLCPP_INFO(this->get_logger(),
+                                    "WP%zu reached: advance to WP%zu.", i + 1, i + 2);
+                            } else {
+                                change_state(MissionState::DONE);
+                            }
+                        } else {
+                            RCLCPP_ERROR(this->get_logger(),
+                                "Unexpected task type during NAVIGATE.");
+                            change_state(MissionState::ERROR);
+                        }
+                    }
+                    break;
+                }
                 if (enable_planned_navigation_preview_) {
                     preview_navigate();
                     break;
@@ -1695,11 +2347,23 @@ private:
             }
             case MissionState::TASK:
             {
+                if (task_flight_enabled_) {
+                    const auto idx = current_waypoint_index_.load();
+                    if (idx >= mission_.size() ||
+                        (mission_[idx].task != TaskType::LAND &&
+                         mission_[idx].task != TaskType::LANDTAKEOFF)) {
+                        RCLCPP_ERROR(this->get_logger(),
+                            "TASK: unexpected task or invalid index.");
+                        change_state(MissionState::ERROR);
+                    } else {
+                        change_state(MissionState::LAND);
+                    }
+                }
                 break;
             }
             case MissionState::LAND:
             {
-
+                if (task_flight_enabled_) task_land_tick(armed, now);
                 break;
             }
             case MissionState::DONE:
@@ -1708,14 +2372,13 @@ private:
             }
             case MissionState::ERROR:
             {
-                // Bezpecny reakcia na chybu pred skutocnym letom.
                 break;
             }
         }
     }
 };
 
-}  // namespace mission_executor
+}  
 
 int main(int argc, char **argv)
 {
