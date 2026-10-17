@@ -10,6 +10,8 @@ find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(mavros_msgs REQUIRED)
+find_package(rclcpp_action REQUIRED)
+find_package(uav_navigation_msgs REQUIRED)
 
 add_executable(mission_executor_node
   src/mission_executor_node.cpp
@@ -26,6 +28,8 @@ ament_target_dependencies(mission_executor_node
   rclcpp
   geometry_msgs
   mavros_msgs
+  rclcpp_action
+  uav_navigation_msgs
 )
 
 install(TARGETS
