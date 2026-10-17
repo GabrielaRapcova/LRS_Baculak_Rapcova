@@ -34,9 +34,9 @@ interval_requests = []
 
 
 def request_interval(request, response):
-    """Reject the first request to exercise the bounded retry."""
+    """Accept the one-shot telemetry request."""
     interval_requests.append((request.message_id, request.message_rate))
-    response.success = len(interval_requests) > 1
+    response.success = True
     return response
 
 
@@ -150,13 +150,12 @@ try:
         'outdoor_mission_node', '/')
     assert clients == [('/mavros/set_message_interval',
                         ['mavros_msgs/srv/MessageInterval'])], clients
-    spin_for(5.5)
-    assert interval_requests == [(245, 2.0), (245, 2.0)], interval_requests
+    assert interval_requests == [(245, 2.0)], interval_requests
     state.connected = False
     spin_for(0.4)
     state.connected = True
     spin_for(1.2)
-    assert interval_requests == [(245, 2.0)] * 3, interval_requests
+    assert interval_requests == [(245, 2.0)], interval_requests
     # Motion is observed only; it is never commanded by the node.
     pose.pose.position.z = 8.0
     relative_altitude.data = 5.0

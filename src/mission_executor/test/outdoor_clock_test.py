@@ -8,6 +8,7 @@ import time
 from geometry_msgs.msg import PoseStamped, TwistStamped
 
 from mavros_msgs.msg import ExtendedState, State
+from mavros_msgs.srv import MessageInterval
 
 import rclpy
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -21,6 +22,16 @@ from std_msgs.msg import Float64, String, UInt32
 os.environ['ROS_DOMAIN_ID'] = '184'
 rclpy.init()
 node = rclpy.create_node('outdoor_clock_test')
+
+
+def accept_stream(request, response):
+    """Accept stream configuration without changing the fake telemetry."""
+    response.success = True
+    return response
+
+
+stream_service = node.create_service(
+    MessageInterval, '/mavros/set_message_interval', accept_stream)
 clock_pub = node.create_publisher(Clock, '/clock', 10)
 state = State(connected=True)
 extended = ExtendedState(landed_state=ExtendedState.LANDED_STATE_ON_GROUND)
