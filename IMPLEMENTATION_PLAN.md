@@ -35,7 +35,8 @@ with a runnable demonstration and validation before the next stage begins.
 6. **Indoor mission (A1.2).** Mission-file parsing, MAVROS handshake and state machine,
    continuous setpoints independent of planning, pass-through path points, hard/soft
    mission goals, yaw tasks, landing/relaunch and abort. Validate in simulation.
-7. **Outdoor mission (A1.3).** Home-relative GPS coordinates, verified ENU/NED heading,
+7. **Outdoor mission (A1.3, specification prepared).** Follow README_outdoor_mission.md.
+   Home-relative GPS coordinates, verified ENU/NED heading,
    POI tracking, continuous figure-eight with tangent yaw, return/land and abort.
    Validate transitions and record commanded versus actual flight.
 8. **Documentation and defence (A1.4).** Keep design decisions and measured evidence
@@ -139,3 +140,45 @@ safety_margin + inflation_radius. Zero width retains the blocked clearance and
 adds no soft zone. Earlier timing/route measurements above used the previous
 absolute outer-radius semantics and must be repeated for the revised configuration.
 User YAML tuning is retained: 0.9 m clearance + 0.8 m soft width = 1.7 m total reach.
+
+
+## A1.3 first implementation stage
+
+Added the ROS-independent outdoor geometry module and telemetry-only
+`outdoor_mission_node` in `mission_executor`. The node checks GPS/satellite freshness,
+captures FCU home or a qualified-fix fallback, freezes launch/reference values and
+reports geodetic/ENU coordinates, heading alignment and launch-relative heights.
+It checks the flight envelope but creates no flight publishers or flight command clients.
+It now requests landed-state telemetry at 2 Hz through MAVROS on connection,
+with bounded retries and a new request after reconnection.
+Next: verify diagnostics against actual SITL telemetry before enabling flight stages.
+
+Validation: the mission package builds; six geometry tests pass, including WGS84
+round trips within 1e-7 m, frame rotation/translation, heading wrap, the agreed
+square/envelope and analytic figure-eight derivatives. Fake-telemetry tests pass
+for FCU-home and fix-fallback capture, GPS/satellite gating, invalid attitude,
+stale-stream recovery, heading/altitude reporting and frozen references. Tests
+also verify that the node exposes only the telemetry configuration client and no
+flight-setpoint publishers, including stream-request rejection and reconnection.
+Invalid geometry/rate/satellite/timeout parameters fail at startup. Actual SITL
+heading alignment and geographic/local consistency remain to be checked.
+
+
+## A1.3 takeoff/return flight-check stage
+
+Added an explicitly enabled C++ state sequence for GUIDED, arm, home-relative
+5 m takeoff, settling, interpolated return, LAND and ground-confirmed disarm.
+Default launch stays telemetry-only. Flight mode uses asynchronous service calls
+with both response and telemetry confirmation, and a separate 30 Hz setpoint group.
+Explicit abort requests LAND while control is owned; pilot override and connection
+loss release control. Navigation/reference/clock/tracking failures stop normal
+progression. Landing rejection/timeout reports FAILED without an in-air disarm.
+Square and figure-eight flight phases are not implemented yet.
+
+The mission package builds. Sixteen fake-vehicle scenarios passed: normal completion,
+return with lateral disturbance, explicit abort, pilot override, connection loss,
+bad GPS, stale pose, home/frame changes, rejected arming/takeoff, unconfirmed mode/arm,
+missing home, rejected LAND and landing timeout. The normal path checks setpoint
+cadence, position/yaw fields, launch/home altitude offset and command order.
+Tests run in an isolated ROS domain and do not command Gazebo or hardware.
+Actual outdoor SITL flight validation and recordings remain before the next phases.
