@@ -10,7 +10,7 @@ namespace
 {
 constexpr double pi = 3.14159265358979323846;
 
-void require_positive(double value)
+void validatePositiveValue(double value)
 {
     if (!std::isfinite(value) || value <= 0.0) {
         throw std::invalid_argument("Geometry dimensions and rates must be finite and positive");
@@ -18,19 +18,19 @@ void require_positive(double value)
 }
 }  // namespace
 
-bool is_finite(Point3 point)
+bool isFinitePoint(Point3 point)
 {
     return std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z);
 }
 
-bool is_valid(GeodeticPosition position)
+bool isValidGeodeticPosition(GeodeticPosition position)
 {
     return std::isfinite(position.latitude) && std::abs(position.latitude) <= 90.0 &&
            std::isfinite(position.longitude) && std::abs(position.longitude) <= 180.0 &&
            std::isfinite(position.altitude_ellipsoid);
 }
 
-double wrap_angle(double angle)
+double wrapAngleToPi(double angle)
 {
     if (!std::isfinite(angle)) {
         throw std::invalid_argument("Angle must be finite");
@@ -42,20 +42,20 @@ double wrap_angle(double angle)
     return wrapped;
 }
 
-double unwrap_angle(double previous, double next)
+double unwrapAngle(double previous, double next)
 {
-    return previous + wrap_angle(next - previous);
+    return previous + wrapAngleToPi(next - previous);
 }
 
-double heading_to_yaw(double heading_degrees)
+double convertHeadingDegreesToEnuYaw(double heading_degrees)
 {
-    return wrap_angle(pi / 2.0 - heading_degrees * pi / 180.0);
+    return wrapAngleToPi(pi / 2.0 - heading_degrees * pi / 180.0);
 }
 
-double poi_yaw(Point3 position, Point3 poi, double previous_yaw, double min_distance)
+double calculatePoiFacingYaw(Point3 position, Point3 poi, double previous_yaw, double min_distance)
 {
-    require_positive(min_distance);
-    if (!is_finite(position) || !is_finite(poi) || !std::isfinite(previous_yaw)) {
+    validatePositiveValue(min_distance);
+    if (!isFinitePoint(position) || !isFinitePoint(poi) || !std::isfinite(previous_yaw)) {
         throw std::invalid_argument("POI bearing requires finite inputs");
     }
     double east = poi.x - position.x;
@@ -63,13 +63,13 @@ double poi_yaw(Point3 position, Point3 poi, double previous_yaw, double min_dist
     if (std::hypot(east, north) < min_distance) {
         return previous_yaw;
     }
-    return unwrap_angle(previous_yaw, std::atan2(north, east));
+    return unwrapAngle(previous_yaw, std::atan2(north, east));
 }
 
-std::array<Point3, 5> square_corners(Point3 poi, double side, double flight_height)
+std::array<Point3, 5> calculateSquareCornerPositions(Point3 poi, double side, double flight_height)
 {
-    require_positive(side);
-    if (!is_finite(poi) || !std::isfinite(flight_height)) {
+    validatePositiveValue(side);
+    if (!isFinitePoint(poi) || !std::isfinite(flight_height)) {
         throw std::invalid_argument("Square position must be finite");
     }
     double half = side / 2.0;
@@ -80,11 +80,11 @@ std::array<Point3, 5> square_corners(Point3 poi, double side, double flight_heig
              {poi.x - half, poi.y + half, flight_height}}};
 }
 
-TrajectorySample figure_eight(Point3 centre, double amplitude, double omega, double elapsed)
+TrajectorySample calculateFigureEightSample(Point3 centre, double amplitude, double omega, double elapsed)
 {
-    require_positive(amplitude);
-    require_positive(omega);
-    if (!is_finite(centre) || !std::isfinite(elapsed) || elapsed < 0.0) {
+    validatePositiveValue(amplitude);
+    validatePositiveValue(omega);
+    if (!isFinitePoint(centre) || !std::isfinite(elapsed) || elapsed < 0.0) {
         throw std::invalid_argument("Trajectory requires a finite centre and nonnegative time");
     }
     double phase = omega * elapsed;
@@ -104,20 +104,20 @@ TrajectorySample figure_eight(Point3 centre, double amplitude, double omega, dou
     return sample;
 }
 
-double figure_eight_peak_speed(double amplitude, double omega)
+double calculateFigureEightPeakSpeed(double amplitude, double omega)
 {
-    require_positive(amplitude);
-    require_positive(omega);
+    validatePositiveValue(amplitude);
+    validatePositiveValue(omega);
     return amplitude * omega * std::sqrt(2.0);
 }
 
-double mission_horizontal_bound(Point3 poi, Point3 launch, double side, double amplitude)
+double calculateMissionHorizontalDistanceBound(Point3 poi, Point3 launch, double side, double amplitude)
 {
-    require_positive(amplitude);
-    if (!is_finite(launch)) {
+    validatePositiveValue(amplitude);
+    if (!isFinitePoint(launch)) {
         throw std::invalid_argument("Launch position must be finite");
     }
-    auto corners = square_corners(poi, side, launch.z);
+    auto corners = calculateSquareCornerPositions(poi, side, launch.z);
     double bound = std::hypot(
         std::abs(poi.x - launch.x) + amplitude,
         std::abs(poi.y - launch.y) + amplitude / 2.0);
@@ -132,15 +132,15 @@ OutdoorReference::OutdoorReference(
     GeodeticPosition origin, Point3 local_anchor, double yaw_offset)
     : local_anchor_(local_anchor), yaw_offset_(yaw_offset)
 {
-    if (!is_valid(origin) || !is_finite(local_anchor) || !std::isfinite(yaw_offset)) {
+    if (!isValidGeodeticPosition(origin) || !isFinitePoint(local_anchor) || !std::isfinite(yaw_offset)) {
         throw std::invalid_argument("Reference must contain finite valid coordinates");
     }
     geographic_.Reset(origin.latitude, origin.longitude, origin.altitude_ellipsoid);
 }
 
-Point3 OutdoorReference::to_enu(GeodeticPosition position) const
+Point3 OutdoorReference::convertGeodeticToMissionEnu(GeodeticPosition position) const
 {
-    if (!is_valid(position)) {
+    if (!isValidGeodeticPosition(position)) {
         throw std::invalid_argument("Invalid geodetic position");
     }
     Point3 result;
@@ -149,9 +149,9 @@ Point3 OutdoorReference::to_enu(GeodeticPosition position) const
     return result;
 }
 
-GeodeticPosition OutdoorReference::to_geodetic(Point3 enu) const
+GeodeticPosition OutdoorReference::convertMissionEnuToGeodetic(Point3 enu) const
 {
-    if (!is_finite(enu)) {
+    if (!isFinitePoint(enu)) {
         throw std::invalid_argument("ENU position must be finite");
     }
     GeodeticPosition result;
@@ -160,9 +160,9 @@ GeodeticPosition OutdoorReference::to_geodetic(Point3 enu) const
     return result;
 }
 
-Point3 OutdoorReference::to_local(Point3 enu) const
+Point3 OutdoorReference::convertMissionEnuToLocal(Point3 enu) const
 {
-    if (!is_finite(enu)) {
+    if (!isFinitePoint(enu)) {
         throw std::invalid_argument("ENU position must be finite");
     }
     double cosine = std::cos(yaw_offset_);
@@ -172,9 +172,9 @@ Point3 OutdoorReference::to_local(Point3 enu) const
             local_anchor_.z + enu.z};
 }
 
-Point3 OutdoorReference::from_local(Point3 local) const
+Point3 OutdoorReference::convertLocalToMissionEnu(Point3 local) const
 {
-    if (!is_finite(local)) {
+    if (!isFinitePoint(local)) {
         throw std::invalid_argument("Local position must be finite");
     }
     double east = local.x - local_anchor_.x;
