@@ -14,6 +14,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('enable_flight', default_value='false'),
         DeclareLaunchArgument('execute_square', default_value='true'),
+        DeclareLaunchArgument('execute_figure_eight', default_value='true'),
         DeclareLaunchArgument(
             'params_file',
             default_value=PathJoinSubstitution([
@@ -30,6 +31,8 @@ def generate_launch_description():
             launch_arguments={
                 'enable_flight': LaunchConfiguration('enable_flight'),
                 'execute_square': LaunchConfiguration('execute_square'),
+                'execute_figure_eight':
+                    LaunchConfiguration('execute_figure_eight'),
                 'params_file': LaunchConfiguration('params_file'),
                 'use_sim_time': 'false',
             }.items()),

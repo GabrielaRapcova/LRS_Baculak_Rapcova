@@ -50,6 +50,8 @@ class FakeVehicle(Node):
         self.samples = []
         self.return_samples = []
         self.square_samples = []
+        self.curve_samples = []
+        self.freeze_position = False
         self.states = []
         self.violations = []
         self.last_tick = time.monotonic()
@@ -132,6 +134,8 @@ class FakeVehicle(Node):
         if self.states and self.states[-1] == 'SQUARE':
             self.square_samples.append((
                 time.monotonic(), message, self.x, self.y, self.yaw))
+        if self.states and self.states[-1] == 'FIGURE_EIGHT':
+            self.curve_samples.append(message)
 
     def tick(self):
         """Publish coherent telemetry and integrate a simple vertical model."""
@@ -147,8 +151,9 @@ class FakeVehicle(Node):
         elif self.mode == 'GUIDED' and self.armed:
             destination = self.desired_z
             if self.target is not None:
-                self.x = self.target.position.x
-                self.y = self.target.position.y
+                if not self.freeze_position:
+                    self.x = self.target.position.x
+                    self.y = self.target.position.y
                 destination = self.target.position.z
                 difference = self.target.yaw - self.yaw
                 self.yaw += math.atan2(
@@ -211,41 +216,49 @@ def run_scenario(scenario):
     settle_duration = 0.4
     if scenario == 'stale_pose':
         settle_duration = 1.2
+    full_mission = scenario.startswith('full')
+    run_square = scenario.startswith('square') or full_mission
+    phase_timeout = 45.0 if full_mission else 6.0
     command = [
         'ros2', 'run', 'mission_executor', 'outdoor_mission_node',
         '--ros-args',
         '-p', 'enable_flight:=true', '-p', 'gps_ready_duration:=0.2',
-        '-p', f'execute_square:={str(scenario.startswith("square")).lower()}',
+        '-p', f'execute_square:={str(run_square).lower()}',
+        '-p', f'execute_figure_eight:={str(full_mission).lower()}',
         '-p', f'settle_duration:={settle_duration}',
         '-p', 'command_timeout:=1.5',
-        '-p', 'takeoff_timeout:=2.5', '-p', 'phase_timeout:=6.0',
+        '-p', 'takeoff_timeout:=2.5', '-p', f'phase_timeout:={phase_timeout}',
         '-p', 'landing_timeout:=6.0', '-p', 'telemetry_timeout:=0.8']
     process = subprocess.Popen(command, start_new_session=True)
     abort_future = None
     event_triggered = False
     expected = 'ABORTED'
     if scenario in ('complete', 'return_drift', 'square',
-                    'heading_disagreement'):
+                    'heading_disagreement', 'full'):
         expected = 'DONE'
     if scenario in ('reject_land', 'landing_timeout'):
         expected = 'FAILED'
-    if scenario in ('pilot_override', 'connection_loss'):
+    if scenario in ('pilot_override', 'connection_loss', 'full_override'):
         expected = 'RELEASE_CONTROL'
-    deadline = time.monotonic() + 80.0
+    deadline = time.monotonic() + 110.0
     try:
         while time.monotonic() < deadline:
             rclpy.spin_once(vehicle, timeout_sec=0.01)
             trigger_state = 'STABILIZE'
             if scenario.startswith('square'):
                 trigger_state = 'SQUARE'
+            if full_mission:
+                trigger_state = 'FIGURE_EIGHT'
             if (trigger_state in vehicle.states and not event_triggered):
                 event_triggered = True
-                if scenario in ('abort', 'square_abort'):
+                if scenario in ('abort', 'square_abort', 'full_abort'):
                     assert vehicle.abort_client.service_is_ready()
                     abort_future = vehicle.abort_client.call_async(
                         Trigger.Request())
-                elif scenario == 'pilot_override':
+                elif scenario in ('pilot_override', 'full_override'):
                     vehicle.mode = 'LOITER'
+                elif scenario == 'full_tracking':
+                    vehicle.freeze_position = True
                 elif scenario == 'connection_loss':
                     vehicle.connected = False
                 elif scenario == 'bad_gps':
@@ -271,7 +284,7 @@ def run_scenario(scenario):
             assert not vehicle.samples
         if scenario == 'unconfirmed_mode':
             assert 'ARM' not in vehicle.calls
-        if scenario in ('pilot_override', 'connection_loss'):
+        if scenario in ('pilot_override', 'connection_loss', 'full_override'):
             assert 'LAND' not in vehicle.calls
             count = len(vehicle.samples)
             until = time.monotonic() + 0.4
@@ -284,7 +297,7 @@ def run_scenario(scenario):
         else:
             assert not vehicle.armed
         if scenario in ('complete', 'return_drift', 'square',
-                        'heading_disagreement'):
+                        'heading_disagreement', 'full'):
             assert vehicle.calls == ['GUIDED', 'ARM', 'TAKEOFF', 'LAND',
                                      'DISARM'], vehicle.calls
             assert len(vehicle.samples) >= 15
@@ -337,6 +350,43 @@ def run_scenario(scenario):
                     following[1].position.x - previous[1].position.x,
                     following[1].position.y - previous[1].position.y)
                 assert step <= elapsed + 0.04, (step, elapsed)
+        if scenario == 'full':
+            phases = ['SQUARE', 'MOVE_TO_CENTER', 'ALIGN_TANGENT',
+                      'FIGURE_EIGHT', 'SETTLE_CENTER', 'RETURN_HOME', 'LAND']
+            indices = [vehicle.states.index(phase) for phase in phases]
+            assert indices == sorted(indices), vehicle.states
+            assert vehicle.states.count('FIGURE_EIGHT') == 1
+            samples = vehicle.curve_samples
+            assert len(samples) > 500, len(samples)
+            # A queued alignment hold can arrive after the phase notification.
+            while abs(samples[0].position.x - 12.5) < 0.02:
+                samples = samples[1:]
+            initial_phase = math.asin((samples[0].position.x - 12.5) / 3.0)
+            first_stamp = samples[0].header.stamp
+            first_time = first_stamp.sec + first_stamp.nanosec * 1e-9
+            for message in samples:
+                stamp = message.header.stamp
+                elapsed = stamp.sec + stamp.nanosec * 1e-9 - first_time
+                phase = min(initial_phase + 0.2 * elapsed, 2.0 * math.pi)
+                assert abs(message.position.x - (
+                    12.5 + 3.0 * math.sin(phase))) < 0.02, (phase, message)
+                assert abs(message.position.y - (
+                    22.5 + 3.0 * math.sin(phase) * math.cos(phase))) < 0.02
+                yaw = math.atan2(math.cos(2.0 * phase), math.cos(phase))
+                assert abs(math.atan2(math.sin(message.yaw - yaw),
+                                      math.cos(message.yaw - yaw))) < 0.02
+            assert 31.2 < elapsed < 31.6, elapsed
+            assert abs(samples[-1].position.x - 12.5) < 0.1
+            assert abs(samples[-1].position.y - 22.5) < 0.1
+            for previous, following in zip(samples, samples[1:]):
+                previous_time = (previous.header.stamp.sec +
+                                 previous.header.stamp.nanosec * 1e-9)
+                following_time = (following.header.stamp.sec +
+                                  following.header.stamp.nanosec * 1e-9)
+                step = math.hypot(following.position.x - previous.position.x,
+                                  following.position.y - previous.position.y)
+                assert step <= 0.85 * (following_time - previous_time) + 0.02
+                assert abs(following.yaw - previous.yaw) < 0.1
         if abort_future is not None:
             assert abort_future.done() and abort_future.result().success
         print(f'PASS: {scenario}: {vehicle.calls}', flush=True)
@@ -356,7 +406,8 @@ def main():
         'frame_change',
         'reject_arm', 'unconfirmed_mode', 'unconfirmed_arm',
         'reject_takeoff', 'no_home', 'reject_land', 'landing_timeout',
-        'square', 'square_abort', 'heading_disagreement']
+        'square', 'square_abort', 'heading_disagreement',
+        'full', 'full_abort', 'full_override', 'full_tracking']
     try:
         for scenario in scenarios:
             run_scenario(scenario)

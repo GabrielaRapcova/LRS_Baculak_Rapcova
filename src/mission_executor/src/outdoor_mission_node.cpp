@@ -34,7 +34,8 @@ constexpr double pi = 3.14159265358979323846;
 
 enum class OutdoorState
 {
-    WAIT_READY, SET_GUIDED, ARM, TAKEOFF, STABILIZE, SQUARE, RETURN_HOME,
+    WAIT_READY, SET_GUIDED, ARM, TAKEOFF, STABILIZE, SQUARE, MOVE_TO_CENTER,
+    ALIGN_TANGENT, FIGURE_EIGHT, SETTLE_CENTER, RETURN_HOME,
     LAND, DISARM, DONE, ABORTED, RELEASE_CONTROL, FAILED
 };
 
@@ -47,6 +48,10 @@ const char * state_name(OutdoorState state)
         case OutdoorState::TAKEOFF: return "TAKEOFF";
         case OutdoorState::STABILIZE: return "STABILIZE";
         case OutdoorState::SQUARE: return "SQUARE";
+        case OutdoorState::MOVE_TO_CENTER: return "MOVE_TO_CENTER";
+        case OutdoorState::ALIGN_TANGENT: return "ALIGN_TANGENT";
+        case OutdoorState::FIGURE_EIGHT: return "FIGURE_EIGHT";
+        case OutdoorState::SETTLE_CENTER: return "SETTLE_CENTER";
         case OutdoorState::RETURN_HOME: return "RETURN_HOME";
         case OutdoorState::LAND: return "LAND";
         case OutdoorState::DISARM: return "DISARM";
@@ -82,6 +87,7 @@ public:
         sample_window_ = declare_parameter("reference_sample_window", 0.5);
         enable_flight_ = declare_parameter("enable_flight", false);
         execute_square_ = declare_parameter("execute_square", true);
+        execute_figure_eight_ = declare_parameter("execute_figure_eight", true);
         position_tolerance_ = declare_parameter("position_tolerance", 0.25);
         altitude_tolerance_ = declare_parameter("altitude_tolerance", 0.2);
         velocity_tolerance_ = declare_parameter("velocity_tolerance", 0.2);
@@ -182,7 +188,7 @@ public:
         });
         reporting_timer_ = create_wall_timer(std::chrono::seconds(1), [this]() {report();});
         RCLCPP_INFO(get_logger(), "Outdoor mode: %s; configured yaw offset %.1f degrees.",
-            enable_flight_ ? (execute_square_ ? "SQUARE MISSION" : "TAKEOFF/RETURN FLIGHT CHECK") :
+            enable_flight_ ? (execute_square_ ? "OUTDOOR MISSION" : "TAKEOFF/RETURN FLIGHT CHECK") :
             "TELEMETRY ONLY", yaw_offset_ * 180.0 / pi);
     }
 
@@ -585,6 +591,11 @@ private:
         return reference_->to_local(corners[square_corner_]);
     }
 
+    Point3 centre_enu() const
+    {
+        return {poi_.x, poi_.y, launch_enu_.z + altitude_};
+    }
+
     void update_flight()
     {
         if (terminal()) {return;}
@@ -703,8 +714,39 @@ private:
                     } else {
                         target_ = local_position();
                         previous_target_time_ = now();
-                        change_phase(OutdoorState::RETURN_HOME, "Square closed and settled; returning to launch");
+                        if (execute_figure_eight_) {
+                            change_phase(OutdoorState::MOVE_TO_CENTER, "Square closed; moving above POI");
+                        } else {
+                            change_phase(OutdoorState::RETURN_HOME, "Square closed and settled; returning to launch");
+                        }
                     }
+                }
+                break;
+            case OutdoorState::MOVE_TO_CENTER:
+                if (settled_at(reference_->to_local(centre_enu()))) {
+                    target_ = reference_->to_local(centre_enu());
+                    target_yaw_ = unwrap_angle(target_yaw_, pi / 4.0 + yaw_offset_);
+                    change_phase(OutdoorState::ALIGN_TANGENT, "Centre settled; aligning to initial tangent");
+                }
+                break;
+            case OutdoorState::ALIGN_TANGENT:
+                if (settled_at(target_)) {
+                    previous_target_time_ = now();
+                    change_phase(OutdoorState::FIGURE_EIGHT, "Tangent settled; starting one figure-eight lap");
+                }
+                break;
+            case OutdoorState::FIGURE_EIGHT:
+                if ((now() - phase_started_).seconds() >= 2.0 * pi / omega_) {
+                    target_ = reference_->to_local(centre_enu());
+                    target_yaw_ = unwrap_angle(target_yaw_, pi / 4.0 + yaw_offset_);
+                    change_phase(OutdoorState::SETTLE_CENTER, "Lap complete; settling at centre");
+                }
+                break;
+            case OutdoorState::SETTLE_CENTER:
+                if (settled_at(target_)) {
+                    target_ = local_position();
+                    previous_target_time_ = now();
+                    change_phase(OutdoorState::RETURN_HOME, "Centre settled; returning to launch");
                 }
                 break;
             case OutdoorState::RETURN_HOME:
@@ -736,41 +778,52 @@ private:
         std::lock_guard<std::mutex> lock(mutex_);
         bool taking_off = flight_state_ == OutdoorState::TAKEOFF && command_complete_ && command_accepted_ &&
             extended_.landed_state == mavros_msgs::msg::ExtendedState::LANDED_STATE_IN_AIR;
-        bool holding = flight_state_ == OutdoorState::STABILIZE;
+        bool holding = flight_state_ == OutdoorState::STABILIZE ||
+            flight_state_ == OutdoorState::ALIGN_TANGENT || flight_state_ == OutdoorState::SETTLE_CENTER;
         bool returning = flight_state_ == OutdoorState::RETURN_HOME;
         bool square = flight_state_ == OutdoorState::SQUARE;
-        if (!taking_off && !holding && !returning && !square) {return;}
+        bool centring = flight_state_ == OutdoorState::MOVE_TO_CENTER;
+        bool curve = flight_state_ == OutdoorState::FIGURE_EIGHT;
+        if (!taking_off && !holding && !returning && !square && !centring && !curve) {return;}
         if (!fresh(state_time_) || !state_.connected || state_.mode != "GUIDED") {
             change_phase(OutdoorState::RELEASE_CONTROL, "Lost GUIDED control; setpoints stopped");
             return;
         }
         auto problem = flight_navigation_problem();
         if (!problem.empty() || !state_.armed) {begin_abort(problem.empty() ? "Unexpected disarm" : problem); return;}
-        if (returning || square) {
+        if (returning || square || centring || curve) {
             auto current_time = now();
             double elapsed = (current_time - previous_target_time_).seconds();
             previous_target_time_ = current_time;
             if (elapsed < 0.0 || elapsed > timeout_) {begin_abort("Setpoint clock discontinuity"); return;}
-            Point3 destination{launch_local_.x, launch_local_.y, launch_local_.z + altitude_};
-            if (square) {
-                destination = square_destination();
-                const auto poi_local = reference_->to_local(poi_);
-                target_yaw_ = unwrap_angle(target_yaw_,
-                    poi_yaw(local_position(), poi_local, target_yaw_, 0.2));
-            }
-            double east = destination.x - target_.x;
-            double north = destination.y - target_.y;
-            double distance = std::hypot(east, north);
-            if (distance > 1e-6) {
-                if (returning) {target_yaw_ = unwrap_angle(target_yaw_, std::atan2(north, east));}
-                // Return faces travel; square yaw follows the POI independently.
-                if (square || std::abs(wrap_angle(local_yaw() - target_yaw_)) <= yaw_tolerance_) {
-                    double step = std::min(return_speed_ * elapsed, distance);
-                    target_.x += step * east / distance;
-                    target_.y += step * north / distance;
+            if (curve) {
+                const double curve_elapsed = std::clamp((current_time - phase_started_).seconds(),
+                    0.0, 2.0 * pi / omega_);
+                const auto sample = figure_eight(centre_enu(), amplitude_, omega_, curve_elapsed);
+                target_ = reference_->to_local(sample.position);
+                target_yaw_ = unwrap_angle(target_yaw_, sample.yaw + yaw_offset_);
+            } else {
+                Point3 destination{launch_local_.x, launch_local_.y, launch_local_.z + altitude_};
+                if (square || centring) {
+                    destination = square ? square_destination() : reference_->to_local(centre_enu());
+                    const auto poi_local = reference_->to_local(poi_);
+                    target_yaw_ = unwrap_angle(target_yaw_,
+                        poi_yaw(local_position(), poi_local, target_yaw_, 0.2));
                 }
+                double east = destination.x - target_.x;
+                double north = destination.y - target_.y;
+                double distance = std::hypot(east, north);
+                if (distance > 1e-6) {
+                    if (returning) {target_yaw_ = unwrap_angle(target_yaw_, std::atan2(north, east));}
+                    // Return faces travel; square yaw follows the POI independently.
+                    if (square || centring || std::abs(wrap_angle(local_yaw() - target_yaw_)) <= yaw_tolerance_) {
+                        double step = std::min(return_speed_ * elapsed, distance);
+                        target_.x += step * east / distance;
+                        target_.y += step * north / distance;
+                    }
+                }
+                target_.z = destination.z;
             }
-            target_.z = destination.z;
         }
         if (!taking_off && std::hypot(std::hypot(target_.x - pose_.pose.position.x,
             target_.y - pose_.pose.position.y), target_.z - pose_.pose.position.z) > max_tracking_error_) {
@@ -886,6 +939,7 @@ private:
     OutdoorState flight_state_ = OutdoorState::WAIT_READY;
     bool enable_flight_ = false, owns_guided_ = false, aborting_ = false;
     bool execute_square_ = true;
+    bool execute_figure_eight_ = true;
     std::size_t square_corner_ = 0;
     bool command_sent_ = false, command_complete_ = false, command_accepted_ = false;
     bool arm_pending_ = false, home_locked_ = false, land_mode_seen_ = false;

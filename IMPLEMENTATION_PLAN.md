@@ -203,3 +203,19 @@ Build and square/abort fake-vehicle tests passed, including ordered corner visit
 stops, POI heading, speed limits, return and ground-confirmed disarm.
 Actual SITL validation remains for the user. Centre alignment and figure-eight
 execution are the next implementation stage.
+
+## A1.3 figure-eight flight stage
+
+The user accepted the square behavior in simulation. Added MOVE_TO_CENTER,
+ALIGN_TANGENT, FIGURE_EIGHT and SETTLE_CENTER before return/landing. Transfers
+retain bounded-speed targets and POI yaw. The centre must settle before aligning
+to the 45-degree mission tangent, and alignment must settle before starting the
+lap clock. The figure-eight evaluates the agreed analytic curve directly from
+elapsed ROS time, with transformed positions and unwrapped tangent yaw. One lap
+ends in a centre/final-tangent hold before return. execute_figure_eight=false
+retains the square-only sequence; execute_square=false retains takeoff/return.
+
+The package builds and all six geometry tests pass. The full fake-vehicle flight
+passes analytic position/yaw, phase order, one-lap duration, speed/continuity and
+landing checks. Full-sequence Gazebo/SITL evaluation, repeated runs and recordings
+remain for the user.
