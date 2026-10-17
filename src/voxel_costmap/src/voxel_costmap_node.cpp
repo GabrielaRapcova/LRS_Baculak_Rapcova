@@ -34,17 +34,18 @@ public:
     const double radius = declare_parameter("vehicle_radius", 0.3);
     const double tolerance = declare_parameter("position_tolerance", 0.1);
     const double margin = declare_parameter("safety_margin", 0.1);
-    inflation_ = declare_parameter("inflation_radius", 0.8);
+    inflation_width_ = declare_parameter("inflation_radius", 0.8);
     scaling_ = declare_parameter("cost_scaling_factor", 3.0);
     stencil_limit_ = declare_parameter<int64_t>("max_stencil_cells", 1000000);
     const auto policy = declare_parameter<std::string>("unknown_policy", "blocked");
-    for (auto value : {radius, tolerance, margin, inflation_, scaling_}) {
+    for (auto value : {radius, tolerance, margin, inflation_width_, scaling_}) {
       if (!std::isfinite(value) || value < 0) {throw std::invalid_argument("Clearance parameters must be finite and nonnegative");}
     }
     clearance_ = radius + tolerance + margin;
-    if (!std::isfinite(clearance_) || inflation_ < clearance_ ||
+    outer_radius_ = clearance_ + inflation_width_;
+    if (!std::isfinite(clearance_) || !std::isfinite(outer_radius_) ||
       stencil_limit_ <= 0 || policy != "blocked") {
-      throw std::invalid_argument("Require inflation_radius >= clearance, positive stencil limit, unknown_policy=blocked");
+      throw std::invalid_argument("Require finite total radius, positive stencil limit, unknown_policy=blocked");
     }
     auto qos = rclcpp::QoS(1).reliable().transient_local();
     publisher_ = create_publisher<Costmap>("costmap", qos);
@@ -105,7 +106,7 @@ private:
   }
   std::vector<Offset> stencil(double resolution)
   {
-    const double extent = std::ceil(inflation_ / resolution);
+    const double extent = std::ceil(outer_radius_ / resolution);
     const long double width = 2 * static_cast<long double>(extent) + 1;
     if (!std::isfinite(extent) || width * width * width > stencil_limit_) {
       throw std::invalid_argument("Inflation stencil exceeds max_stencil_cells");
@@ -116,7 +117,7 @@ private:
       for (int y = -cells; y <= cells; ++y) {
         for (int x = -cells; x <= cells; ++x) {
           const double distance = std::sqrt(double(x)*x + double(y)*y + double(z)*z) * resolution;
-          if (distance > inflation_ + 1e-9) {continue;}
+          if (distance > outer_radius_ + 1e-9) {continue;}
           const uint8_t cost = distance <= clearance_ + 1e-9 ? Block::INSCRIBED :
             static_cast<uint8_t>(std::clamp(252.0 * std::exp(-scaling_ * (distance - clearance_)), 1.0, 252.0));
           result.push_back({x, y, z, cost});
@@ -199,8 +200,8 @@ private:
       }
     }
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-    RCLCPP_INFO(get_logger(), "Costmap: %zu blocks, clearance %.3f m, inflation %.3f m, rebuild %.1f ms",
-      costs_.size(), clearance_, inflation_, ms);
+    RCLCPP_INFO(get_logger(), "Costmap: %zu blocks, clearance %.3f m, inflation width %.3f m, total radius %.3f m, rebuild %.1f ms",
+      costs_.size(), clearance_, inflation_width_, outer_radius_, ms);
     make_cloud();
   }
   void make_cloud()
@@ -238,7 +239,7 @@ private:
     cloud_.header = output.header;
     publisher_->publish(output); cloud_publisher_->publish(cloud_);
   }
-  double clearance_, inflation_, scaling_;
+  double clearance_, inflation_width_, outer_radius_, scaling_;
   int64_t stencil_limit_;
   bool synchronized_ = false;
   uint64_t map_id_ = 0, map_sequence_ = 0, cost_sequence_ = 0;
