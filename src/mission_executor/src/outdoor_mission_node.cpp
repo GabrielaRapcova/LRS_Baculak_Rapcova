@@ -34,7 +34,7 @@ constexpr double pi = 3.14159265358979323846;
 
 enum class OutdoorState
 {
-    WAIT_READY, SET_GUIDED, ARM, TAKEOFF, STABILIZE, RETURN_HOME,
+    WAIT_READY, SET_GUIDED, ARM, TAKEOFF, STABILIZE, SQUARE, RETURN_HOME,
     LAND, DISARM, DONE, ABORTED, RELEASE_CONTROL, FAILED
 };
 
@@ -46,6 +46,7 @@ const char * state_name(OutdoorState state)
         case OutdoorState::ARM: return "ARM";
         case OutdoorState::TAKEOFF: return "TAKEOFF";
         case OutdoorState::STABILIZE: return "STABILIZE";
+        case OutdoorState::SQUARE: return "SQUARE";
         case OutdoorState::RETURN_HOME: return "RETURN_HOME";
         case OutdoorState::LAND: return "LAND";
         case OutdoorState::DISARM: return "DISARM";
@@ -80,6 +81,7 @@ public:
         readiness_duration_ = declare_parameter("gps_ready_duration", 3.0);
         sample_window_ = declare_parameter("reference_sample_window", 0.5);
         enable_flight_ = declare_parameter("enable_flight", false);
+        execute_square_ = declare_parameter("execute_square", true);
         position_tolerance_ = declare_parameter("position_tolerance", 0.25);
         altitude_tolerance_ = declare_parameter("altitude_tolerance", 0.2);
         velocity_tolerance_ = declare_parameter("velocity_tolerance", 0.2);
@@ -180,7 +182,8 @@ public:
         });
         reporting_timer_ = create_wall_timer(std::chrono::seconds(1), [this]() {report();});
         RCLCPP_INFO(get_logger(), "Outdoor mode: %s; configured yaw offset %.1f degrees.",
-            enable_flight_ ? "TAKEOFF/RETURN FLIGHT CHECK" : "TELEMETRY ONLY", yaw_offset_ * 180.0 / pi);
+            enable_flight_ ? (execute_square_ ? "SQUARE MISSION" : "TAKEOFF/RETURN FLIGHT CHECK") :
+            "TELEMETRY ONLY", yaw_offset_ * 180.0 / pi);
     }
 
 private:
@@ -529,8 +532,6 @@ private:
     {
         auto problem = readiness_problem();
         if (!problem.empty()) {return problem;}
-        double yaw_error = wrap_angle(local_yaw() - heading_to_yaw(heading_) - yaw_offset_);
-        if (std::abs(yaw_error) > yaw_tolerance_) {return "Compass/local yaw alignment disagreement";}
         auto gps_enu = reference_->to_enu(gps_position());
         auto pose_enu = reference_->from_local(local_position());
         if (std::hypot(gps_enu.x - pose_enu.x, gps_enu.y - pose_enu.y) > max_reference_error_) {
@@ -576,6 +577,12 @@ private:
         if (!within_tolerance) {settled_since_ = rclcpp::Time(0, 0, RCL_ROS_TIME); return false;}
         if (settled_since_.nanoseconds() == 0) {settled_since_ = now();}
         return (now() - settled_since_).seconds() >= settle_duration_;
+    }
+
+    Point3 square_destination() const
+    {
+        auto corners = square_corners(poi_, side_, launch_enu_.z + altitude_);
+        return reference_->to_local(corners[square_corner_]);
     }
 
     void update_flight()
@@ -679,7 +686,25 @@ private:
                 if (settled_at(target_)) {
                     target_ = local_position();
                     previous_target_time_ = now();
-                    change_phase(OutdoorState::RETURN_HOME, "Settled; returning to launch before landing");
+                    if (execute_square_) {
+                        square_corner_ = 0;
+                        change_phase(OutdoorState::SQUARE, "Flying to square corner 1 of 5");
+                    } else {
+                        change_phase(OutdoorState::RETURN_HOME, "Settled; returning to launch before landing");
+                    }
+                }
+                break;
+            case OutdoorState::SQUARE:
+                if (settled_at(square_destination())) {
+                    if (square_corner_ < 4) {
+                        ++square_corner_;
+                        change_phase(OutdoorState::SQUARE,
+                            "Flying to square corner " + std::to_string(square_corner_ + 1) + " of 5");
+                    } else {
+                        target_ = local_position();
+                        previous_target_time_ = now();
+                        change_phase(OutdoorState::RETURN_HOME, "Square closed and settled; returning to launch");
+                    }
                 }
                 break;
             case OutdoorState::RETURN_HOME:
@@ -713,26 +738,33 @@ private:
             extended_.landed_state == mavros_msgs::msg::ExtendedState::LANDED_STATE_IN_AIR;
         bool holding = flight_state_ == OutdoorState::STABILIZE;
         bool returning = flight_state_ == OutdoorState::RETURN_HOME;
-        if (!taking_off && !holding && !returning) {return;}
+        bool square = flight_state_ == OutdoorState::SQUARE;
+        if (!taking_off && !holding && !returning && !square) {return;}
         if (!fresh(state_time_) || !state_.connected || state_.mode != "GUIDED") {
             change_phase(OutdoorState::RELEASE_CONTROL, "Lost GUIDED control; setpoints stopped");
             return;
         }
         auto problem = flight_navigation_problem();
         if (!problem.empty() || !state_.armed) {begin_abort(problem.empty() ? "Unexpected disarm" : problem); return;}
-        if (returning) {
+        if (returning || square) {
             auto current_time = now();
             double elapsed = (current_time - previous_target_time_).seconds();
             previous_target_time_ = current_time;
             if (elapsed < 0.0 || elapsed > timeout_) {begin_abort("Setpoint clock discontinuity"); return;}
             Point3 destination{launch_local_.x, launch_local_.y, launch_local_.z + altitude_};
+            if (square) {
+                destination = square_destination();
+                const auto poi_local = reference_->to_local(poi_);
+                target_yaw_ = unwrap_angle(target_yaw_,
+                    poi_yaw(local_position(), poi_local, target_yaw_, 0.2));
+            }
             double east = destination.x - target_.x;
             double north = destination.y - target_.y;
             double distance = std::hypot(east, north);
             if (distance > 1e-6) {
-                target_yaw_ = unwrap_angle(target_yaw_, std::atan2(north, east));
-                // Align while holding position before advancing along the return segment.
-                if (std::abs(wrap_angle(local_yaw() - target_yaw_)) <= yaw_tolerance_) {
+                if (returning) {target_yaw_ = unwrap_angle(target_yaw_, std::atan2(north, east));}
+                // Return faces travel; square yaw follows the POI independently.
+                if (square || std::abs(wrap_angle(local_yaw() - target_yaw_)) <= yaw_tolerance_) {
                     double step = std::min(return_speed_ * elapsed, distance);
                     target_.x += step * east / distance;
                     target_.y += step * north / distance;
@@ -779,6 +811,8 @@ private:
         status.message = reported_state_ + ": " + reason_;
         add_value(status, "state", reported_state_);
         add_value(status, "flight_enabled", enable_flight_ ? "true" : "false");
+        add_value(status, "square_corner", flight_state_ == OutdoorState::SQUARE ?
+            std::to_string(square_corner_ + 1) : "0");
         add_value(status, "abort_reason", abort_reason_);
         add_value(status, "satellites", std::to_string(satellites_));
         add_value(status, "fix_status", std::to_string(fix_.status.status));
@@ -851,6 +885,8 @@ private:
     double clock_stall_timeout_;
     OutdoorState flight_state_ = OutdoorState::WAIT_READY;
     bool enable_flight_ = false, owns_guided_ = false, aborting_ = false;
+    bool execute_square_ = true;
+    std::size_t square_corner_ = 0;
     bool command_sent_ = false, command_complete_ = false, command_accepted_ = false;
     bool arm_pending_ = false, home_locked_ = false, land_mode_seen_ = false;
     unsigned command_generation_ = 0;

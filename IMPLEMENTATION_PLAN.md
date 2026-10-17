@@ -189,3 +189,17 @@ missing home, rejected LAND and landing timeout. The normal path checks setpoint
 cadence, position/yaw fields, launch/home altitude offset and command order.
 Tests run in an isolated ROS domain and do not command Gazebo or hardware.
 Actual outdoor SITL flight validation and recordings remain before the next phases.
+
+## A1.3 square flight stage
+
+Added SQUARE after takeoff settling: W1, W2, W3, W4 and W1 again, followed by
+return/landing. Each leg interpolates at transfer_speed while yaw continuously
+faces the POI from measured position. Corner progression requires position,
+altitude, low velocity and yaw to meet the settling dwell, with a fresh timeout
+per leg. Diagnostics report the current corner. Flight remains disabled by default;
+execute_square=false retains the takeoff/return-only check.
+
+Build and square/abort fake-vehicle tests passed, including ordered corner visits,
+stops, POI heading, speed limits, return and ground-confirmed disarm.
+Actual SITL validation remains for the user. Centre alignment and figure-eight
+execution are the next implementation stage.

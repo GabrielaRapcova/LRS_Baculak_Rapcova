@@ -247,6 +247,7 @@ source overlay active as their underlay.
 
 Requirements, interfaces, coordinate conventions, state machine and validation
 stages are documented in [README_outdoor_mission.md](README_outdoor_mission.md).
-Geometry utilities, default telemetry diagnostics and an explicitly enabled
-takeoff/return flight check are implemented. Square and figure-eight flight are
-the next stage. See the specification for launch, abort and test commands.
+Geometry utilities, default telemetry diagnostics, takeoff/return checks and an
+explicitly enabled square mission with continuous POI yaw are implemented.
+Centre alignment and figure-eight flight are next. See the specification for
+launch, abort and test commands.

@@ -1,7 +1,8 @@
 outdoor_mission_node:
   ros__parameters:
-    # Default mode remains telemetry-only. Flight mode runs takeoff/return only.
+    # Default mode remains telemetry-only. Disable square for a takeoff/return check.
     enable_flight: false
+    execute_square: true
     poi_east: 2.5
     poi_north: 2.5
     flight_altitude: 5.0

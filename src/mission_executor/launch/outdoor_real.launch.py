@@ -13,6 +13,7 @@ def generate_launch_description():
     """Reuse the common mission launch and keep flight disabled by default."""
     return LaunchDescription([
         DeclareLaunchArgument('enable_flight', default_value='false'),
+        DeclareLaunchArgument('execute_square', default_value='true'),
         DeclareLaunchArgument(
             'params_file',
             default_value=PathJoinSubstitution([
@@ -28,6 +29,7 @@ def generate_launch_description():
                 'launch', 'outdoor_launch.py'])),
             launch_arguments={
                 'enable_flight': LaunchConfiguration('enable_flight'),
+                'execute_square': LaunchConfiguration('execute_square'),
                 'params_file': LaunchConfiguration('params_file'),
                 'use_sim_time': 'false',
             }.items()),
