@@ -23,7 +23,10 @@ target_compile_features(outdoor_geometry PUBLIC cxx_std_17)
 target_include_directories(outdoor_geometry PUBLIC include ${GeographicLib_INCLUDE_DIRS})
 target_link_libraries(outdoor_geometry ${GeographicLib_LIBRARIES})
 
-add_executable(outdoor_mission_node src/outdoor_mission_node.cpp)
+add_executable(outdoor_mission_node
+  src/outdoor_mission_node.cpp
+  src/outdoor_mission_main.cpp
+)
 ament_target_dependencies(outdoor_mission_node
   rclcpp geometry_msgs mavros_msgs sensor_msgs std_msgs std_srvs diagnostic_msgs)
 target_link_libraries(outdoor_mission_node outdoor_geometry)
