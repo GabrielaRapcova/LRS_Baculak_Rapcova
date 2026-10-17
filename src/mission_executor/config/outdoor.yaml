@@ -34,5 +34,6 @@ outdoor_mission_node:
     phase_timeout: 60.0
     landing_timeout: 60.0
     max_tracking_error: 2.0
+    # Diagnostic disagreement flags; these do not abort flight.
     max_reference_error: 3.0
     altitude_disagreement: 1.0

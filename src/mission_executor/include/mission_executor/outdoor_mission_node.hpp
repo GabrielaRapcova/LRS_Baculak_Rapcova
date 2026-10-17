@@ -4,7 +4,6 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <string>
 
 #include "diagnostic_msgs/msg/diagnostic_array.hpp"
@@ -57,8 +56,8 @@ const char * stateName(OutdoorState state);
 /**
  * @brief Execute the outdoor mission through MAVROS.
  *
- * Telemetry, phase changes and service responses share the default callback group.
- * The independent setpoint group accesses shared state through mutex_.
+ * All callbacks run serially on a SingleThreadedExecutor. Service calls are
+ * asynchronous; no callback waits for another callback or a service response.
  */
 class OutdoorMissionNode : public rclcpp::Node
 {
@@ -86,7 +85,7 @@ private:
   void abortCallback(
     std::shared_ptr<std_srvs::srv::Trigger::Request>,
     std::shared_ptr<std_srvs::srv::Trigger::Response> response);
-  /// Run readiness or mission progression under the shared-data lock.
+  /// Run readiness or mission progression without blocking the executor.
   void controlLoop();
   /// Detect clock stalls and discard telemetry from an earlier ROS timeline.
   void updateClock();
@@ -96,6 +95,8 @@ private:
   bool isFresh(rclcpp::Time received) const;
   Point3 localPosition() const;
   GeodeticPosition gpsPosition() const;
+  /// Check the navigation telemetry required both before and during flight.
+  std::string telemetryProblem() const;
   std::string readinessProblem() const;
   void captureReference();
   void updateReadiness();
@@ -186,8 +187,7 @@ private:
   std::string origin_source_;
   std::string local_frame_;
 
-  // Mission execution state and shared-data lock.
-  std::mutex mutex_;
+  // Mission execution state.
   OutdoorState flight_state_ = OutdoorState::WAIT_READY;
   bool owns_guided_ = false;
   bool aborting_ = false;
@@ -202,9 +202,7 @@ private:
   TimePoint phase_started_wall_;
   rclcpp::Time phase_started_{0, 0, RCL_ROS_TIME};
   rclcpp::Time settled_since_{0, 0, RCL_ROS_TIME};
-  rclcpp::Time previous_control_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time previous_target_time_{0, 0, RCL_ROS_TIME};
-  bool control_clock_started_ = false;
   Point3 target_{0.0, 0.0, 0.0};
   double target_yaw_ = 0.0;
   mavros_msgs::msg::HomePosition flight_home_;
@@ -225,7 +223,6 @@ private:
 
   // ROS interfaces.
   rclcpp::Client<mavros_msgs::srv::MessageInterval>::SharedPtr interval_client_;
-  rclcpp::CallbackGroup::SharedPtr setpoint_group_;
   rclcpp::TimerBase::SharedPtr setpoint_timer_;
   rclcpp::Publisher<mavros_msgs::msg::PositionTarget>::SharedPtr setpoint_pub_;
   rclcpp::Client<mavros_msgs::srv::SetMode>::SharedPtr mode_client_;

@@ -163,10 +163,9 @@ void OutdoorMissionNode::configureFlightControl()
     abort_service_ = create_service<std_srvs::srv::Trigger>(
       "outdoor_mission/abort",
       std::bind(&OutdoorMissionNode::abortCallback, this, _1, _2));
-    setpoint_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     setpoint_timer_ = create_wall_timer(
       std::chrono::duration<double>(1.0 / 30.0),
-      std::bind(&OutdoorMissionNode::publishSetpoint, this), setpoint_group_);
+      std::bind(&OutdoorMissionNode::publishSetpoint, this));
   }
 }
 
@@ -182,63 +181,54 @@ void OutdoorMissionNode::configureTimers()
 
 void OutdoorMissionNode::stateCallback(mavros_msgs::msg::State::ConstSharedPtr msg)
 {
-  std::lock_guard<std::mutex> lock(mutex_);
   state_ = *msg;
   state_time_ = now();
 }
 
 void OutdoorMissionNode::extendedStateCallback(mavros_msgs::msg::ExtendedState::ConstSharedPtr msg)
 {
-  std::lock_guard<std::mutex> lock(mutex_);
   extended_ = *msg;
   extended_time_ = now();
 }
 
 void OutdoorMissionNode::gpsFixCallback(sensor_msgs::msg::NavSatFix::ConstSharedPtr msg)
 {
-  std::lock_guard<std::mutex> lock(mutex_);
   fix_ = *msg;
   fix_time_ = now();
 }
 
 void OutdoorMissionNode::satellitesCallback(std_msgs::msg::UInt32::ConstSharedPtr msg)
 {
-  std::lock_guard<std::mutex> lock(mutex_);
   satellites_ = msg->data;
   satellites_time_ = now();
 }
 
 void OutdoorMissionNode::homeCallback(mavros_msgs::msg::HomePosition::ConstSharedPtr msg)
 {
-  std::lock_guard<std::mutex> lock(mutex_);
   home_ = *msg;
   home_received_ = true;
 }
 
 void OutdoorMissionNode::headingCallback(std_msgs::msg::Float64::ConstSharedPtr msg)
 {
-  std::lock_guard<std::mutex> lock(mutex_);
   heading_ = msg->data;
   heading_time_ = now();
 }
 
 void OutdoorMissionNode::relativeAltitudeCallback(std_msgs::msg::Float64::ConstSharedPtr msg)
 {
-  std::lock_guard<std::mutex> lock(mutex_);
   relative_altitude_ = msg->data;
   altitude_time_ = now();
 }
 
 void OutdoorMissionNode::poseCallback(geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
 {
-  std::lock_guard<std::mutex> lock(mutex_);
   pose_ = *msg;
   pose_time_ = now();
 }
 
 void OutdoorMissionNode::velocityCallback(geometry_msgs::msg::TwistStamped::ConstSharedPtr msg)
 {
-  std::lock_guard<std::mutex> lock(mutex_);
   velocity_ = *msg;
   velocity_time_ = now();
 }
@@ -247,7 +237,6 @@ void OutdoorMissionNode::abortCallback(
   std::shared_ptr<std_srvs::srv::Trigger::Request>,
   std::shared_ptr<std_srvs::srv::Trigger::Response> response)
 {
-  std::lock_guard<std::mutex> lock(mutex_);
   response->success = !isTerminal();
   response->message =
     response->success ? "Abort accepted; monitor mission state" : "Mission already terminal";
@@ -258,7 +247,6 @@ void OutdoorMissionNode::abortCallback(
 
 void OutdoorMissionNode::controlLoop()
 {
-  std::lock_guard<std::mutex> lock(mutex_);
   updateClock();
   updateLandedStateStream();
   if (enable_flight_) {
@@ -277,11 +265,18 @@ void OutdoorMissionNode::updateClock()
     state_time_ = extended_time_ = fix_time_ = satellites_time_ =
       pose_time_ = velocity_time_ = heading_time_ = altitude_time_ =
       ready_since_ = settled_since_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
-    control_clock_started_ = false;
     if (enable_flight_ && flight_state_ != OutdoorState::WAIT_READY && !isTerminal()) {
       changePhase(OutdoorState::RELEASE_CONTROL, "ROS clock moved backwards; restart mission node");
     }
     RCLCPP_WARN(get_logger(), "ROS clock moved backwards; waiting for new telemetry");
+  }
+  const bool navigating = enable_flight_ && !isTerminal() &&
+    flight_state_ != OutdoorState::WAIT_READY && flight_state_ != OutdoorState::LAND &&
+    flight_state_ != OutdoorState::DISARM;
+  if (navigating && last_clock_time_.nanoseconds() != 0 &&
+    (current_time - last_clock_time_).seconds() > timeout_)
+  {
+    beginAbort("ROS clock discontinuity");
   }
   if (current_time != last_clock_time_ || last_clock_advance_ == TimePoint{}) {
     last_clock_advance_ = wall_time;
@@ -330,7 +325,6 @@ void OutdoorMissionNode::updateLandedStateStream()
   auto result = interval_client_->async_send_request(
     request,
     [this, generation](rclcpp::Client<mavros_msgs::srv::MessageInterval>::SharedFuture future) {
-      std::lock_guard<std::mutex> lock(mutex_);
       if (generation != interval_generation_) {
         return;
       }
@@ -347,7 +341,7 @@ void OutdoorMissionNode::updateLandedStateStream()
 
 void OutdoorMissionNode::validateParameters()
 {
-  for (double value : {altitude_, side_, amplitude_, omega_, max_speed_, max_distance_,
+  for (double value : {omega_, max_speed_, max_distance_,
       max_altitude_, timeout_, readiness_duration_, sample_window_, position_tolerance_,
       altitude_tolerance_, velocity_tolerance_, yaw_tolerance_, settle_duration_, return_speed_,
       command_timeout_, takeoff_timeout_, phase_timeout_, landing_timeout_, max_tracking_error_,
@@ -398,16 +392,13 @@ GeodeticPosition OutdoorMissionNode::gpsPosition() const
   return {fix_.latitude, fix_.longitude, fix_.altitude};
 }
 
-std::string OutdoorMissionNode::readinessProblem() const
+std::string OutdoorMissionNode::telemetryProblem() const
 {
   if (now().nanoseconds() == 0) {
     return "Waiting for ROS clock";
   }
   if (clock_stalled_) {
     return "ROS clock stalled";
-  }
-  if (!isFresh(state_time_) || !state_.connected) {
-    return "Missing/stale FCU connection";
   }
   if (!isFresh(fix_time_)) {
     return "Missing/stale GPS fix";
@@ -421,19 +412,13 @@ std::string OutdoorMissionNode::readinessProblem() const
   if (!isFresh(velocity_time_)) {
     return "Missing/stale local velocity";
   }
-  if (!isFresh(heading_time_)) {
-    return "Missing/stale compass heading";
-  }
-  if (!isFresh(altitude_time_)) {
-    return "Missing/stale relative altitude";
-  }
   if (!isFresh(extended_time_)) {
     return "Missing/stale landed state";
   }
   if (fix_.status.status < sensor_msgs::msg::NavSatStatus::STATUS_FIX || !is_valid(gpsPosition())) {
     return "Invalid GPS fix";
   }
-  if (satellites_ == 255 || satellites_ > 254 ||
+  if (satellites_ > 254 ||
     satellites_ < static_cast<unsigned>(min_satellites_))
   {
     return "Insufficient/unknown satellites";
@@ -442,11 +427,33 @@ std::string OutdoorMissionNode::readinessProblem() const
   const auto & q = pose_.pose.orientation;
   double quaternion_norm = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
   if (!is_finite(localPosition()) || !is_finite({v.x, v.y, v.z}) ||
-    !std::isfinite(quaternion_norm) || std::abs(quaternion_norm - 1.0) > 0.01 ||
-    !std::isfinite(heading_) || heading_ < 0.0 || heading_ >= 360.0 ||
-    !std::isfinite(relative_altitude_))
+    !std::isfinite(quaternion_norm) || std::abs(quaternion_norm - 1.0) > 0.01)
   {
-    return "Invalid position, velocity, attitude, heading or altitude";
+    return "Invalid position, velocity or attitude";
+  }
+  if (pose_.header.frame_id.empty()) {
+    return "Local pose frame is empty";
+  }
+  if (reference_ && pose_.header.frame_id != local_frame_) {
+    return "Local pose frame changed";
+  }
+  return "";
+}
+
+std::string OutdoorMissionNode::readinessProblem() const
+{
+  if (!isFresh(state_time_) || !state_.connected) {
+    return "Missing/stale FCU connection";
+  }
+  auto problem = telemetryProblem();
+  if (!problem.empty()) {
+    return problem;
+  }
+  if (!isFresh(heading_time_) || !std::isfinite(heading_) || heading_ < 0.0 || heading_ >= 360.0) {
+    return "Missing/stale or invalid compass heading";
+  }
+  if (!isFresh(altitude_time_) || !std::isfinite(relative_altitude_)) {
+    return "Missing/stale or invalid relative altitude";
   }
   double sample_separation = std::abs((pose_time_ - fix_time_).seconds());
   if (!reference_ && sample_separation > sample_window_) {
@@ -456,12 +463,6 @@ std::string OutdoorMissionNode::readinessProblem() const
     extended_.landed_state != mavros_msgs::msg::ExtendedState::LANDED_STATE_ON_GROUND))
   {
     return "Reference capture requires disarmed vehicle on ground";
-  }
-  if (pose_.header.frame_id.empty()) {
-    return "Local pose frame is empty";
-  }
-  if (reference_ && pose_.header.frame_id != local_frame_) {
-    return "Local pose frame changed";
   }
   return "";
 }
@@ -602,7 +603,6 @@ void OutdoorMissionNode::requestMode(const std::string & mode)
   mode_client_->async_send_request(
     request,
     [this, generation](rclcpp::Client<mavros_msgs::srv::SetMode>::SharedFuture future) {
-      std::lock_guard<std::mutex> lock(mutex_);
       if (generation != command_generation_) {
         return;
       }
@@ -633,7 +633,6 @@ void OutdoorMissionNode::requestArm(bool arm)
   arm_client_->async_send_request(
     request,
     [this, generation](rclcpp::Client<mavros_msgs::srv::CommandBool>::SharedFuture future) {
-      std::lock_guard<std::mutex> lock(mutex_);
       arm_pending_ = false;
       if (generation != command_generation_) {
         return;
@@ -674,7 +673,6 @@ void OutdoorMissionNode::requestTakeoff()
   takeoff_client_->async_send_request(
     request,
     [this, generation](rclcpp::Client<mavros_msgs::srv::CommandTOL>::SharedFuture future) {
-      std::lock_guard<std::mutex> lock(mutex_);
       if (generation != command_generation_) {
         return;
       }
@@ -689,14 +687,14 @@ void OutdoorMissionNode::requestTakeoff()
 
 std::string OutdoorMissionNode::flightNavigationProblem() const
 {
-  auto problem = readinessProblem();
+  auto problem = telemetryProblem();
   if (!problem.empty()) {
     return problem;
   }
-  auto gps_enu = reference_->to_enu(gpsPosition());
-  auto pose_enu = reference_->from_local(localPosition());
-  if (std::hypot(gps_enu.x - pose_enu.x, gps_enu.y - pose_enu.y) > max_reference_error_) {
-    return "GPS/local position reference disagreement";
+  if (flight_state_ == OutdoorState::TAKEOFF &&
+    (!isFresh(altitude_time_) || !std::isfinite(relative_altitude_)))
+  {
+    return "Missing/stale or invalid takeoff relative altitude";
   }
   auto position = localPosition();
   if (std::hypot(position.x - launch_local_.x, position.y - launch_local_.y) > max_distance_ ||
@@ -722,11 +720,7 @@ std::string OutdoorMissionNode::flightNavigationProblem() const
     {
       return "FCU home changed after takeoff reference was fixed";
     }
-    double local_height = position.z - launch_local_.z;
-    double relative_height = relative_altitude_ - launch_relative_altitude_;
-    if (std::abs(local_height - relative_height) > altitude_disagreement_) {
-      return "Local and relative altitude disagree";
-    }
+
   }
   return "";
 }
@@ -811,37 +805,24 @@ void OutdoorMissionNode::updateFlight()
       beginAbort(problem);
       return;
     }
-    auto current_time = now();
-    if (control_clock_started_) {
-      double elapsed = (current_time - previous_control_time_).seconds();
-      if (elapsed < 0.0 || elapsed > timeout_) {
-        beginAbort("ROS clock discontinuity");
-        return;
-      }
-    }
-    previous_control_time_ = current_time;
-    control_clock_started_ = true;
-  }
-  double limit = phase_timeout_;
-  if (flight_state_ == OutdoorState::SET_GUIDED || flight_state_ == OutdoorState::ARM ||
-    flight_state_ == OutdoorState::DISARM)
-  {
-    limit = command_timeout_;
-  }
-  if (flight_state_ == OutdoorState::TAKEOFF) {
-    limit = takeoff_timeout_;
-  }
-  if (flight_state_ == OutdoorState::LAND) {
-    limit = landing_timeout_;
+
   }
   const bool command_phase = flight_state_ == OutdoorState::SET_GUIDED ||
     flight_state_ == OutdoorState::ARM || flight_state_ == OutdoorState::DISARM;
+  double limit = phase_timeout_;
+  if (command_phase) {
+    limit = command_timeout_;
+  } else if (flight_state_ == OutdoorState::TAKEOFF) {
+    limit = takeoff_timeout_;
+  } else if (flight_state_ == OutdoorState::LAND) {
+    limit = landing_timeout_;
+  }
+  const double wall_elapsed =
+    std::chrono::duration<double>(SteadyClock::now() - phase_started_wall_).count();
   const double phase_elapsed = command_phase ?
-    std::chrono::duration<double>(SteadyClock::now() - phase_started_wall_).count() :
-    (now() - phase_started_).seconds();
-  const bool response_timed_out = command_sent_ && !command_complete_ &&
-    std::chrono::duration<double>(SteadyClock::now() - phase_started_wall_).count() >
-    command_timeout_;
+    wall_elapsed : (now() - phase_started_).seconds();
+  const bool response_timed_out = !command_phase && command_sent_ && !command_complete_ &&
+    wall_elapsed > command_timeout_;
   if (phase_elapsed > limit || response_timed_out) {
     if (landing) {
       changePhase(OutdoorState::FAILED, "Landing/disarm timed out; manual recovery required");
@@ -983,7 +964,6 @@ void OutdoorMissionNode::updateFlight()
 
 void OutdoorMissionNode::publishSetpoint()
 {
-  std::lock_guard<std::mutex> lock(mutex_);
   bool taking_off = flight_state_ == OutdoorState::TAKEOFF && command_complete_ &&
     command_accepted_ &&
     extended_.landed_state == mavros_msgs::msg::ExtendedState::LANDED_STATE_IN_AIR;
@@ -1025,9 +1005,7 @@ void OutdoorMissionNode::publishSetpoint()
       if (square || centring) {
         destination = square ? squareDestination() : reference_->to_local(centreEnu());
         const auto poi_local = reference_->to_local(poi_);
-        target_yaw_ = unwrap_angle(
-          target_yaw_,
-          poi_yaw(localPosition(), poi_local, target_yaw_, 0.2));
+        target_yaw_ = poi_yaw(localPosition(), poi_local, target_yaw_, 0.2);
       }
       double east = destination.x - target_.x;
       double north = destination.y - target_.y;
@@ -1084,7 +1062,6 @@ void OutdoorMissionNode::addValue(
 
 void OutdoorMissionNode::publishDiagnostics()
 {
-  std::lock_guard<std::mutex> lock(mutex_);
   diagnostic_msgs::msg::DiagnosticStatus status;
   status.name = "outdoor_mission/telemetry";
   status.hardware_id = "mavros";
@@ -1116,9 +1093,7 @@ void OutdoorMissionNode::publishDiagnostics()
     const auto & q = pose_.pose.orientation;
     double norm = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
     if (isFresh(pose_time_) && std::isfinite(norm) && std::abs(norm - 1.0) <= 0.01) {
-      double local_yaw = std::atan2(
-        2.0 * (q.w * q.z + q.x * q.y),
-        norm - 2.0 * (q.y * q.y + q.z * q.z));
+      double local_yaw = localYaw();
       addValue(status, "local_yaw_degrees", std::to_string(local_yaw * 180.0 / pi));
       addValue(
         status, "yaw_alignment_error_degrees", std::to_string(
@@ -1156,11 +1131,24 @@ void OutdoorMissionNode::publishDiagnostics()
       addValue(status, "gps_east", std::to_string(enu.x));
       addValue(status, "gps_north", std::to_string(enu.y));
       addValue(status, "gps_up", std::to_string(enu.z));
+      if (isFresh(pose_time_) && is_finite(localPosition())) {
+        auto local_enu = reference_->from_local(localPosition());
+        double error = std::hypot(enu.x - local_enu.x, enu.y - local_enu.y);
+        addValue(status, "gps_local_error_m", std::to_string(error));
+        addValue(status, "gps_local_disagreement", error > max_reference_error_ ? "true" : "false");
+      }
     }
     if (isFresh(altitude_time_) && std::isfinite(relative_altitude_)) {
       addValue(
         status, "height_above_launch_relative",
         std::to_string(relative_altitude_ - launch_relative_altitude_));
+      if (isFresh(pose_time_) && is_finite(localPosition())) {
+        double error = std::abs((pose_.pose.position.z - launch_local_.z) -
+            (relative_altitude_ - launch_relative_altitude_));
+        addValue(status, "altitude_difference_m", std::to_string(error));
+        addValue(status, "altitude_disagreement",
+            error > altitude_disagreement_ ? "true" : "false");
+      }
     }
   }
   diagnostic_msgs::msg::DiagnosticArray message;

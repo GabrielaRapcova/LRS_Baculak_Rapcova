@@ -56,6 +56,9 @@ class FakeVehicle(Node):
         self.violations = []
         self.last_tick = time.monotonic()
         self.suppress_local = False
+        self.suppress_heading = False
+        self.gps_bias = 0.0
+        self.altitude_bias = 0.0
         self.mode_service = self.create_service(
             SetMode, '/mavros/set_mode', self.set_mode)
         self.arm_service = self.create_service(
@@ -191,13 +194,15 @@ class FakeVehicle(Node):
         fix.status.status = 0 if self.gps_valid else -1
         fix.latitude = 48.15 + (self.y - 20.0) / 111190.0
         fix.longitude = 17.07 + (self.x - 10.0) / (
-            111320.0 * math.cos(math.radians(48.15)))
+            111320.0 * math.cos(math.radians(48.15))) + self.gps_bias
         fix.altitude = 150.0 + self.z - 3.0
         self.fix_pub.publish(fix)
-        self.heading_pub.publish(Float64(
-            data=(90.0 - self.yaw * 180.0 / math.pi +
-                  self.heading_bias) % 360.0))
-        self.altitude_pub.publish(Float64(data=1.2 + self.z - 3.0))
+        if not self.suppress_heading:
+            self.heading_pub.publish(Float64(
+                data=(90.0 - self.yaw * 180.0 / math.pi +
+                      self.heading_bias) % 360.0))
+        self.altitude_pub.publish(Float64(
+            data=1.2 + self.z - 3.0 + self.altitude_bias))
         self.satellites_pub.publish(UInt32(data=12))
         if self.scenario != 'no_home':
             home = HomePosition()
@@ -234,7 +239,8 @@ def run_scenario(scenario):
     event_triggered = False
     expected = 'ABORTED'
     if scenario in ('complete', 'return_drift', 'square',
-                    'heading_disagreement', 'full'):
+                    'heading_disagreement', 'full', 'missing_heading',
+                    'position_disagreement', 'altitude_disagreement'):
         expected = 'DONE'
     if scenario in ('reject_land', 'landing_timeout'):
         expected = 'FAILED'
@@ -263,6 +269,12 @@ def run_scenario(scenario):
                     vehicle.connected = False
                 elif scenario == 'bad_gps':
                     vehicle.gps_valid = False
+                elif scenario == 'missing_heading':
+                    vehicle.suppress_heading = True
+                elif scenario == 'position_disagreement':
+                    vehicle.gps_bias = 0.0001
+                elif scenario == 'altitude_disagreement':
+                    vehicle.altitude_bias = 3.0
                 elif scenario == 'stale_pose':
                     vehicle.suppress_local = True
                 elif scenario == 'home_change':
@@ -297,7 +309,8 @@ def run_scenario(scenario):
         else:
             assert not vehicle.armed
         if scenario in ('complete', 'return_drift', 'square',
-                        'heading_disagreement', 'full'):
+                        'heading_disagreement', 'full', 'missing_heading',
+                        'position_disagreement', 'altitude_disagreement'):
             assert vehicle.calls == ['GUIDED', 'ARM', 'TAKEOFF', 'LAND',
                                      'DISARM'], vehicle.calls
             assert len(vehicle.samples) >= 15
@@ -407,7 +420,8 @@ def main():
         'reject_arm', 'unconfirmed_mode', 'unconfirmed_arm',
         'reject_takeoff', 'no_home', 'reject_land', 'landing_timeout',
         'square', 'square_abort', 'heading_disagreement',
-        'full', 'full_abort', 'full_override', 'full_tracking']
+        'full', 'full_abort', 'full_override', 'full_tracking',
+        'missing_heading', 'position_disagreement', 'altitude_disagreement']
     try:
         for scenario in scenarios:
             run_scenario(scenario)
