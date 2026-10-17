@@ -76,6 +76,7 @@ public:
         yaw_offset_ = declare_parameter("local_yaw_offset_deg", 0.0) * pi / 180.0;
         min_satellites_ = declare_parameter("min_satellites", 8);
         timeout_ = declare_parameter("telemetry_timeout", 2.0);
+        clock_stall_timeout_ = declare_parameter("clock_stall_timeout", 10.0);
         readiness_duration_ = declare_parameter("gps_ready_duration", 3.0);
         sample_window_ = declare_parameter("reference_sample_window", 0.5);
         enable_flight_ = declare_parameter("enable_flight", false);
@@ -98,25 +99,25 @@ public:
         state_sub_ = create_subscription<mavros_msgs::msg::State>("mavros/state", sensor_qos,
             [this](mavros_msgs::msg::State::ConstSharedPtr msg) {
                 std::lock_guard<std::mutex> lock(mutex_);
-                state_ = *msg; state_time_ = SteadyClock::now();
+                state_ = *msg; state_time_ = now();
             });
         extended_sub_ = create_subscription<mavros_msgs::msg::ExtendedState>(
             "mavros/extended_state", sensor_qos,
             [this](mavros_msgs::msg::ExtendedState::ConstSharedPtr msg) {
                 std::lock_guard<std::mutex> lock(mutex_);
-                extended_ = *msg; extended_time_ = SteadyClock::now();
+                extended_ = *msg; extended_time_ = now();
             });
         fix_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
             "mavros/global_position/global", sensor_qos,
             [this](sensor_msgs::msg::NavSatFix::ConstSharedPtr msg) {
                 std::lock_guard<std::mutex> lock(mutex_);
-                fix_ = *msg; fix_time_ = SteadyClock::now();
+                fix_ = *msg; fix_time_ = now();
             });
         satellites_sub_ = create_subscription<std_msgs::msg::UInt32>(
             "mavros/global_position/raw/satellites", sensor_qos,
             [this](std_msgs::msg::UInt32::ConstSharedPtr msg) {
                 std::lock_guard<std::mutex> lock(mutex_);
-                satellites_ = msg->data; satellites_time_ = SteadyClock::now();
+                satellites_ = msg->data; satellites_time_ = now();
             });
         home_sub_ = create_subscription<mavros_msgs::msg::HomePosition>(
             "mavros/home_position/home", rclcpp::QoS(1).reliable().transient_local(),
@@ -128,25 +129,25 @@ public:
             "mavros/global_position/compass_hdg", sensor_qos,
             [this](std_msgs::msg::Float64::ConstSharedPtr msg) {
                 std::lock_guard<std::mutex> lock(mutex_);
-                heading_ = msg->data; heading_time_ = SteadyClock::now();
+                heading_ = msg->data; heading_time_ = now();
             });
         relative_altitude_sub_ = create_subscription<std_msgs::msg::Float64>(
             "mavros/global_position/rel_alt", sensor_qos,
             [this](std_msgs::msg::Float64::ConstSharedPtr msg) {
                 std::lock_guard<std::mutex> lock(mutex_);
-                relative_altitude_ = msg->data; altitude_time_ = SteadyClock::now();
+                relative_altitude_ = msg->data; altitude_time_ = now();
             });
         pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
             "mavros/local_position/pose", sensor_qos,
             [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) {
                 std::lock_guard<std::mutex> lock(mutex_);
-                pose_ = *msg; pose_time_ = SteadyClock::now();
+                pose_ = *msg; pose_time_ = now();
             });
         velocity_sub_ = create_subscription<geometry_msgs::msg::TwistStamped>(
             "mavros/local_position/velocity_local", sensor_qos,
             [this](geometry_msgs::msg::TwistStamped::ConstSharedPtr msg) {
                 std::lock_guard<std::mutex> lock(mutex_);
-                velocity_ = *msg; velocity_time_ = SteadyClock::now();
+                velocity_ = *msg; velocity_time_ = now();
             });
         state_pub_ = create_publisher<std_msgs::msg::String>(
             "outdoor_mission/state", rclcpp::QoS(1).reliable().transient_local());
@@ -173,6 +174,7 @@ public:
         }
         readiness_timer_ = create_wall_timer(std::chrono::milliseconds(100), [this]() {
             std::lock_guard<std::mutex> lock(mutex_);
+            update_clock();
             update_landed_state_stream();
             if (enable_flight_) {update_flight();} else {update_readiness();}
         });
@@ -182,6 +184,28 @@ public:
     }
 
 private:
+    void update_clock()
+    {
+        const auto current_time = now();
+        const auto wall_time = SteadyClock::now();
+        if (current_time < last_clock_time_) {
+            // Samples from the old timeline cannot establish readiness after a reset.
+            state_time_ = extended_time_ = fix_time_ = satellites_time_ =
+                pose_time_ = velocity_time_ = heading_time_ = altitude_time_ =
+                ready_since_ = settled_since_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+            control_clock_started_ = false;
+            if (enable_flight_ && flight_state_ != OutdoorState::WAIT_READY && !terminal()) {
+                change_phase(OutdoorState::RELEASE_CONTROL, "ROS clock moved backwards; restart mission node");
+            }
+            RCLCPP_WARN(get_logger(), "ROS clock moved backwards; waiting for new telemetry");
+        }
+        if (current_time != last_clock_time_ || last_clock_advance_ == TimePoint{}) {
+            last_clock_advance_ = wall_time;
+        }
+        last_clock_time_ = current_time;
+        clock_stalled_ = std::chrono::duration<double>(wall_time - last_clock_advance_).count() > clock_stall_timeout_;
+    }
+
     void update_landed_state_stream()
     {
         const bool connected = fresh(state_time_) && state_.connected;
@@ -234,7 +258,7 @@ private:
                 max_altitude_, timeout_, readiness_duration_, sample_window_, position_tolerance_,
                 altitude_tolerance_, velocity_tolerance_, yaw_tolerance_, settle_duration_, return_speed_,
                 command_timeout_, takeoff_timeout_, phase_timeout_, landing_timeout_, max_tracking_error_,
-                max_reference_error_, altitude_disagreement_}) {
+                max_reference_error_, altitude_disagreement_, clock_stall_timeout_}) {
             if (!std::isfinite(value) || value <= 0.0) {
                 throw std::invalid_argument("Outdoor dimensions, limits and durations must be finite and positive");
             }
@@ -258,12 +282,13 @@ private:
         }
     }
 
-    bool fresh(TimePoint received) const
+    bool fresh(rclcpp::Time received) const
     {
-        if (received == TimePoint{}) {
+        if (received.nanoseconds() == 0) {
             return false;
         }
-        return std::chrono::duration<double>(SteadyClock::now() - received).count() <= timeout_;
+        const double age = (now() - received).seconds();
+        return age >= 0.0 && age <= timeout_;
     }
 
     Point3 local_position() const
@@ -279,6 +304,8 @@ private:
 
     std::string readiness_problem() const
     {
+        if (now().nanoseconds() == 0) {return "Waiting for ROS clock";}
+        if (clock_stalled_) {return "ROS clock stalled";}
         if (!fresh(state_time_) || !state_.connected) {return "Missing/stale FCU connection";}
         if (!fresh(fix_time_)) {return "Missing/stale GPS fix";}
         if (!fresh(satellites_time_)) {return "Missing/stale satellite count";}
@@ -302,7 +329,7 @@ private:
             !std::isfinite(relative_altitude_)) {
             return "Invalid position, velocity, attitude, heading or altitude";
         }
-        double sample_separation = std::abs(std::chrono::duration<double>(pose_time_ - fix_time_).count());
+        double sample_separation = std::abs((pose_time_ - fix_time_).seconds());
         if (!reference_ && sample_separation > sample_window_) {
             return "GPS and local pose samples are too far apart";
         }
@@ -353,12 +380,12 @@ private:
         std::string problem = readiness_problem();
         std::string next_state;
         if (!problem.empty()) {
-            ready_since_ = TimePoint{};
+            ready_since_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
             reason_ = problem;
             next_state = reference_ ? "TELEMETRY_LOST" : "WAIT_READY";
         } else {
-            if (ready_since_ == TimePoint{}) {ready_since_ = SteadyClock::now();}
-            double ready_for = std::chrono::duration<double>(SteadyClock::now() - ready_since_).count();
+            if (ready_since_.nanoseconds() == 0) {ready_since_ = now();}
+            double ready_for = (now() - ready_since_).seconds();
             if (ready_for < readiness_duration_) {
                 reason_ = "Waiting for continuous telemetry readiness";
                 next_state = "WAIT_READY";
@@ -398,8 +425,9 @@ private:
     {
         flight_state_ = next;
         if (next == OutdoorState::LAND) {land_mode_seen_ = false;}
-        phase_started_ = SteadyClock::now();
-        settled_since_ = TimePoint{};
+        phase_started_ = now();
+        phase_started_wall_ = SteadyClock::now();
+        settled_since_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
         command_sent_ = false;
         command_complete_ = false;
         command_accepted_ = false;
@@ -545,9 +573,9 @@ private:
         bool within_tolerance = std::hypot(position.x - destination.x, position.y - destination.y) <= position_tolerance_ &&
             std::abs(position.z - destination.z) <= altitude_tolerance_ &&
             speed < velocity_tolerance_ && std::abs(wrap_angle(local_yaw() - target_yaw_)) <= yaw_tolerance_;
-        if (!within_tolerance) {settled_since_ = TimePoint{}; return false;}
-        if (settled_since_ == TimePoint{}) {settled_since_ = SteadyClock::now();}
-        return std::chrono::duration<double>(SteadyClock::now() - settled_since_).count() >= settle_duration_;
+        if (!within_tolerance) {settled_since_ = rclcpp::Time(0, 0, RCL_ROS_TIME); return false;}
+        if (settled_since_.nanoseconds() == 0) {settled_since_ = now();}
+        return (now() - settled_since_).seconds() >= settle_duration_;
     }
 
     void update_flight()
@@ -603,7 +631,14 @@ private:
             flight_state_ == OutdoorState::DISARM) {limit = command_timeout_;}
         if (flight_state_ == OutdoorState::TAKEOFF) {limit = takeoff_timeout_;}
         if (flight_state_ == OutdoorState::LAND) {limit = landing_timeout_;}
-        if (std::chrono::duration<double>(SteadyClock::now() - phase_started_).count() > limit) {
+        const bool command_phase = flight_state_ == OutdoorState::SET_GUIDED ||
+            flight_state_ == OutdoorState::ARM || flight_state_ == OutdoorState::DISARM;
+        const double phase_elapsed = command_phase ?
+            std::chrono::duration<double>(SteadyClock::now() - phase_started_wall_).count() :
+            (now() - phase_started_).seconds();
+        const bool response_timed_out = command_sent_ && !command_complete_ &&
+            std::chrono::duration<double>(SteadyClock::now() - phase_started_wall_).count() > command_timeout_;
+        if (phase_elapsed > limit || response_timed_out) {
             if (landing) {change_phase(OutdoorState::FAILED, "Landing/disarm timed out; manual recovery required");}
             else {begin_abort("Mission phase timed out");}
             return;
@@ -747,12 +782,12 @@ private:
         add_value(status, "abort_reason", abort_reason_);
         add_value(status, "satellites", std::to_string(satellites_));
         add_value(status, "fix_status", std::to_string(fix_.status.status));
-        if (fix_time_ != TimePoint{}) {
+        if (fix_time_.nanoseconds() != 0) {
             add_value(status, "latitude", std::to_string(fix_.latitude));
             add_value(status, "longitude", std::to_string(fix_.longitude));
             add_value(status, "altitude_ellipsoid", std::to_string(fix_.altitude));
             add_value(status, "fix_age", std::to_string(
-                std::chrono::duration<double>(SteadyClock::now() - fix_time_).count()));
+                (now() - fix_time_).seconds()));
         }
         if (fresh(heading_time_) && std::isfinite(heading_) && heading_ >= 0.0 && heading_ < 360.0) {
             double compass_yaw = heading_to_yaw(heading_);
@@ -810,12 +845,17 @@ private:
     int64_t interval_request_id_ = 0;
     unsigned interval_generation_ = 0;
     TimePoint interval_attempt_time_;
+    rclcpp::Time last_clock_time_{0, 0, RCL_ROS_TIME};
+    TimePoint last_clock_advance_;
+    bool clock_stalled_ = false;
+    double clock_stall_timeout_;
     OutdoorState flight_state_ = OutdoorState::WAIT_READY;
     bool enable_flight_ = false, owns_guided_ = false, aborting_ = false;
     bool command_sent_ = false, command_complete_ = false, command_accepted_ = false;
     bool arm_pending_ = false, home_locked_ = false, land_mode_seen_ = false;
     unsigned command_generation_ = 0;
-    TimePoint phase_started_, settled_since_;
+    TimePoint phase_started_wall_;
+    rclcpp::Time phase_started_{0, 0, RCL_ROS_TIME}, settled_since_{0, 0, RCL_ROS_TIME};
     rclcpp::Time previous_control_time_{0, 0, RCL_ROS_TIME};
     rclcpp::Time previous_target_time_{0, 0, RCL_ROS_TIME};
     bool control_clock_started_ = false;
@@ -843,8 +883,11 @@ private:
     bool envelope_ok_ = false, home_received_ = false;
     std::unique_ptr<OutdoorReference> reference_;
     std::string origin_source_, local_frame_, reported_state_, reason_;
-    TimePoint ready_since_, state_time_, extended_time_, fix_time_, satellites_time_;
-    TimePoint pose_time_, velocity_time_, heading_time_, altitude_time_;
+    rclcpp::Time ready_since_{0, 0, RCL_ROS_TIME}, state_time_{0, 0, RCL_ROS_TIME};
+    rclcpp::Time extended_time_{0, 0, RCL_ROS_TIME}, fix_time_{0, 0, RCL_ROS_TIME};
+    rclcpp::Time satellites_time_{0, 0, RCL_ROS_TIME}, pose_time_{0, 0, RCL_ROS_TIME};
+    rclcpp::Time velocity_time_{0, 0, RCL_ROS_TIME}, heading_time_{0, 0, RCL_ROS_TIME};
+    rclcpp::Time altitude_time_{0, 0, RCL_ROS_TIME};
     mavros_msgs::msg::State state_;
     mavros_msgs::msg::ExtendedState extended_;
     mavros_msgs::msg::HomePosition home_;
