@@ -853,7 +853,7 @@ private:
             }
 
             case MissionState::LAND:
-            {.
+            {
                 break;
             }
 
