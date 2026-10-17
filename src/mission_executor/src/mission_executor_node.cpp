@@ -234,20 +234,23 @@ public:
         if (task_sequence_check_ || task_flight_enabled_) {
             validate_task_mission();
             RCLCPP_WARN(this->get_logger(),
-                "A1.2.3 task mode: %s. Takeoff/land/landtakeoff implemented "
-                "via MAVROS CommandTOL; yaw tasks unsupported in this stage. "
+                "A1.2 task mode: %s. Takeoff/land/landtakeoff via MAVROS "
+                "CommandTOL; yaw in absolute ENU degrees. "
                 "Direct waypoint legs have NO A* collision avoidance.",
                 task_sequence_check_ ? "READ-ONLY SEQUENCE CHECK" :
                     "SITL FLIGHT ENABLED AFTER EXPLICIT CONFIRMATION");
             for (std::size_t i = 0; i < mission_.size(); ++i) {
                 const auto &w = mission_[i];
-                const char *task = w.task == TaskType::TAKEOFF ? "takeoff" :
+                const std::string task = w.task == TaskType::TAKEOFF ? "takeoff" :
                     w.task == TaskType::LAND ? "land" :
-                    w.task == TaskType::LANDTAKEOFF ? "landtakeoff" : "none";
+                    w.task == TaskType::LANDTAKEOFF ? "landtakeoff" :
+                    w.task == TaskType::YAW ?
+                        "yaw" + std::to_string(w.yaw_angle) : "none";
                 RCLCPP_INFO(this->get_logger(),
                     "TASK PLAN CSV[%zu/%zu] (%.2f, %.2f, %.2f) [%s] %s",
                     i + 1, mission_.size(), w.x, w.y, w.z,
-                    w.precision == Precision::HARD ? "HARD" : "SOFT", task);
+                    w.precision == Precision::HARD ? "HARD" : "SOFT",
+                    task.c_str());
             }
         }
         if (enable_planned_navigation_preview_) {
@@ -434,6 +437,15 @@ private:
     double task_ground_wait_s_ = 3.0;
     double task_max_direct_leg_m_ = 1.25;
     std::atomic<bool> task_navigation_active_{false};
+    // The state timer writes heading commands; the 20 Hz setpoint timer reads them.
+    enum class TaskHeadingPhase { PREPARE, ALIGN, FLY, YAW_TASK };
+    std::mutex task_heading_mutex_;
+    TaskHeadingPhase task_heading_phase_ = TaskHeadingPhase::PREPARE;
+    geometry_msgs::msg::Point task_heading_hold_position_{};
+    double task_heading_target_rad_ = 0.0;
+    std::chrono::steady_clock::time_point task_heading_phase_since_{};
+    std::chrono::steady_clock::time_point task_heading_stable_since_{};
+    bool task_heading_stable_started_ = false;
     bool task_landtakeoff_ = false;
     bool task_takeoff_sent_ = false;
     bool task_takeoff_response_received_ = false;
@@ -566,13 +578,14 @@ private:
                     "A1.2.3 invalid waypoint coordinate or altitude; "
                     "test altitudes must be within 0.75..3.0 m.");
             }
-            if (w.task == TaskType::YAW ||
+            if ((w.task == TaskType::YAW &&
+                 !std::isfinite(w.yaw_angle)) ||
                 (w.task == TaskType::TAKEOFF && i != 0) ||
                 (w.task == TaskType::LAND && i + 1 != mission_.size()) ||
                 (w.task == TaskType::LANDTAKEOFF &&
                     (i == 0 || i + 1 == mission_.size()))) {
                 throw std::runtime_error(
-                    "A1.2.3 mission has unsupported task placement or yaw task.");
+                    "A1.2 invalid task placement or nonfinite yaw angle.");
             }
             if (i != 0) {
                 const auto &prev = mission_[i - 1];
@@ -665,6 +678,163 @@ private:
             task_stable_since_ = now;
         }
         return now - task_stable_since_ >= duration;
+    }
+
+    // Yaw convention: absolute world ENU, zero=East, positive=CCW toward North.
+    // The MAVROS setpoint_raw plugin converts ROS ENU yaw to MAVLink/ArduPilot NED.
+    // Use shortest angular displacement so crossing +/-pi never requests a full turn.
+    static constexpr double kPi = 3.14159265358979323846;
+    static constexpr double kYawToleranceRad = 8.0 * kPi / 180.0;
+
+    static double angular_error(double target, double measured)
+    {
+        return std::remainder(target - measured, 2.0 * kPi);
+    }
+
+    static double unwrap_near(double target, double measured)
+    {
+        return measured + angular_error(target, measured);
+    }
+
+    static bool yaw_from_enu_pose(
+        const geometry_msgs::msg::PoseStamped &pose, double &yaw)
+    {
+        if (pose.header.frame_id != "map") return false;
+        const auto &q = pose.pose.orientation;
+        if (!std::isfinite(q.x) || !std::isfinite(q.y) ||
+            !std::isfinite(q.z) || !std::isfinite(q.w)) return false;
+        const double n = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w;
+        if (!std::isfinite(n) || n < 1e-12) return false;
+        yaw = std::atan2(2.0 * (q.w*q.z + q.x*q.y) / n,
+            (q.w*q.w + q.x*q.x - q.y*q.y - q.z*q.z) / n);
+        return std::isfinite(yaw);
+    }
+
+    TaskHeadingPhase heading_phase()
+    {
+        std::lock_guard<std::mutex> lock(task_heading_mutex_);
+        return task_heading_phase_;
+    }
+
+    void set_heading_phase(
+        TaskHeadingPhase phase, double yaw,
+        const geometry_msgs::msg::Point &hold_position)
+    {
+        std::lock_guard<std::mutex> lock(task_heading_mutex_);
+        task_heading_phase_ = phase;
+        task_heading_target_rad_ = yaw;
+        task_heading_hold_position_ = hold_position;
+        task_heading_phase_since_ = std::chrono::steady_clock::now();
+        task_heading_stable_started_ = false;
+    }
+
+    void reset_heading_for_next_leg()
+    {
+        std::lock_guard<std::mutex> lock(task_heading_mutex_);
+        task_heading_phase_ = TaskHeadingPhase::PREPARE;
+        task_heading_stable_started_ = false;
+    }
+
+    bool prepare_task_leg(std::size_t index)
+    {
+        if (index == 0 || index >= mission_.size()) return false;
+        geometry_msgs::msg::PoseStamped pose;
+        geometry_msgs::msg::TwistStamped velocity;
+        if (!task_snapshot(pose, velocity)) return false;
+        double current_yaw = 0.0;
+        if (!yaw_from_enu_pose(pose, current_yaw)) return false;
+
+        // Always derive travel heading from converted MAVROS ENU coordinates,
+        // not directly from the CSV/PCD coordinates (the frames differ).
+        const auto from = position_controller_.gazebo_to_enu(mission_[index - 1]);
+        const auto to = position_controller_.gazebo_to_enu(mission_[index]);
+        const double dx = to.x - from.x;
+        const double dy = to.y - from.y;
+        // A vertical-only leg has no horizontal travel direction: retain yaw.
+        const double desired_yaw = std::hypot(dx, dy) > 0.05 ?
+            std::atan2(dy, dx) : current_yaw;
+        const double commanded_yaw = unwrap_near(desired_yaw, current_yaw);
+        set_heading_phase(TaskHeadingPhase::ALIGN, commanded_yaw,
+            pose.pose.position);
+        RCLCPP_INFO(this->get_logger(),
+            "WP%zu: ALIGN BEFORE MOVING. ENU segment (%.2f,%.2f) -> "
+            "(%.2f,%.2f); travel heading %.1f deg ENU.",
+            index + 1, from.x, from.y, to.x, to.y,
+            desired_yaw * 180.0 / kPi);
+        return true;
+    }
+
+    bool begin_waypoint_yaw(std::size_t index)
+    {
+        geometry_msgs::msg::PoseStamped pose;
+        geometry_msgs::msg::TwistStamped velocity;
+        if (!task_snapshot(pose, velocity)) return false;
+        double measured_yaw = 0.0;
+        if (!yaw_from_enu_pose(pose, measured_yaw)) return false;
+        const auto goal = position_controller_.gazebo_to_enu(mission_[index]);
+        const double target = unwrap_near(
+            std::remainder(mission_[index].yaw_angle, 360.0) *
+                kPi / 180.0, measured_yaw);
+        set_heading_phase(TaskHeadingPhase::YAW_TASK, target, goal);
+        RCLCPP_INFO(this->get_logger(),
+            "WP%zu: YAW TASK %.1f degrees absolute ENU; hold at waypoint.",
+            index + 1, mission_[index].yaw_angle);
+        return true;
+    }
+
+    // Called only by the state timer, with fresh telemetry checked by caller.
+    // Returns true only after the vehicle has held the requested heading for 1 s.
+    bool task_heading_held(
+        const geometry_msgs::msg::PoseStamped &pose,
+        const geometry_msgs::msg::TwistStamped &velocity,
+        std::chrono::steady_clock::time_point now)
+    {
+        double measured_yaw = 0.0;
+        if (!yaw_from_enu_pose(pose, measured_yaw)) {
+            RCLCPP_ERROR(this->get_logger(), "Invalid ENU quaternion during yaw.");
+            change_state(MissionState::ERROR);
+            return false;
+        }
+        double commanded_yaw = 0.0;
+        geometry_msgs::msg::Point hold_position;
+        std::chrono::steady_clock::time_point since;
+        TaskHeadingPhase phase;
+        {
+            std::lock_guard<std::mutex> lock(task_heading_mutex_);
+            phase = task_heading_phase_;
+            commanded_yaw = task_heading_target_rad_;
+            hold_position = task_heading_hold_position_;
+            since = task_heading_phase_since_;
+        }
+        if (phase != TaskHeadingPhase::ALIGN &&
+            phase != TaskHeadingPhase::YAW_TASK) return false;
+        if (now - since > 60s) {
+            RCLCPP_ERROR(this->get_logger(),
+                "Yaw/segment alignment timed out (60 s). Setpoints stopped.");
+            change_state(MissionState::ERROR);
+            return false;
+        }
+        const double err = std::fabs(angular_error(commanded_yaw, measured_yaw));
+        const auto &v = velocity.twist.linear;
+        const double speed = std::hypot(std::hypot(v.x, v.y), v.z);
+        const double position_err = distance_between(
+            pose.pose.position, hold_position);
+        const bool within_limits = err <= kYawToleranceRad &&
+            speed <= 0.25 && position_err <= 0.25;
+        if (!within_limits) {
+            task_heading_stable_started_ = false;
+        } else if (!task_heading_stable_started_) {
+            task_heading_stable_started_ = true;
+            task_heading_stable_since_ = now;
+        }
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+            "%s: target=%.1f deg ENU measured=%.1f deg ENU "
+            "error=%.1f deg drift=%.2f m stable=%s",
+            phase == TaskHeadingPhase::ALIGN ? "LEG ALIGN" : "WAYPOINT YAW",
+            commanded_yaw * 180.0 / kPi, measured_yaw * 180.0 / kPi,
+            err * 180.0 / kPi, position_err, within_limits ? "YES" : "NO");
+        return task_heading_stable_started_ &&
+            now - task_heading_stable_since_ >= 1s;
     }
 
     void request_takeoff_task(double altitude_above_ground)
@@ -1651,7 +1821,8 @@ private:
         MissionWaypoint waypoint = mission_[index];
          if (task_flight_enabled_ &&
             (waypoint.task == TaskType::LAND ||
-             waypoint.task == TaskType::LANDTAKEOFF)) {
+             waypoint.task == TaskType::LANDTAKEOFF ||
+             waypoint.task == TaskType::YAW)) {
             waypoint.precision = Precision::HARD;
         }
         const auto target = position_controller_.gazebo_to_enu(waypoint);
@@ -1693,7 +1864,16 @@ private:
                     state_to_string(new_state));
         current_state_ = new_state;
         if (task_flight_enabled_) {
-            task_navigation_active_.store(new_state == MissionState::NAVIGATE);
+            // TASK can publish setpoints only for a YAW task, never for LAND.
+            const std::size_t idx = current_waypoint_index_.load();
+            const bool is_yaw_task = idx < mission_.size() &&
+                mission_[idx].task == TaskType::YAW;
+            if (new_state == MissionState::NAVIGATE) {
+                reset_heading_for_next_leg();
+            }
+            task_navigation_active_.store(
+                new_state == MissionState::NAVIGATE ||
+                (new_state == MissionState::TASK && is_yaw_task));
             if (new_state == MissionState::SET_MODE) {
                 mode_request_sent_ = false;
                 mode_response_received_ = false;
@@ -1790,11 +1970,23 @@ private:
                 !task_telemetry_ok(false) || !task_airborne()) return;
             const auto goal_idx = current_waypoint_index_.load();
             if (goal_idx == 0 || goal_idx >= mission_.size()) return;
+            TaskHeadingPhase phase;
+            double commanded_yaw;
+            geometry_msgs::msg::Point hold_position;
+            {
+                std::lock_guard<std::mutex> lock(task_heading_mutex_);
+                phase = task_heading_phase_;
+                commanded_yaw = task_heading_target_rad_;
+                hold_position = task_heading_hold_position_;
+            }
+            // PREPARE means no waypoint movement until a valid heading is set.
+            if (phase == TaskHeadingPhase::PREPARE) return;
             auto target = create_position_target();
-            target.position =
-                position_controller_.gazebo_to_enu(mission_[goal_idx]);
-            target.type_mask |=
-                mavros_msgs::msg::PositionTarget::IGNORE_YAW;
+            target.position = phase == TaskHeadingPhase::FLY ?
+                position_controller_.gazebo_to_enu(mission_[goal_idx]) :
+                hold_position;
+            target.yaw = static_cast<float>(commanded_yaw);
+            // DO NOT set IGNORE_YAW: yaw and position are both controlled.
             mavros_setpoint_pub_->publish(target);
             return;
         }
@@ -2248,6 +2440,40 @@ private:
                         change_state(MissionState::DONE);
                         break;
                     }
+                    const auto phase = heading_phase();
+                    if (phase == TaskHeadingPhase::PREPARE) {
+                        if (!prepare_task_leg(i)) {
+                            RCLCPP_ERROR(this->get_logger(),
+                                "Cannot prepare heading: invalid/stale ENU pose.");
+                            change_state(MissionState::ERROR);
+                        }
+                        break;
+                    }
+                    if (phase == TaskHeadingPhase::ALIGN) {
+                        geometry_msgs::msg::PoseStamped pose;
+                        geometry_msgs::msg::TwistStamped velocity;
+                        if (!task_snapshot(pose, velocity)) {
+                            change_state(MissionState::ERROR);
+                            break;
+                        }
+                        if (task_heading_held(pose, velocity, now)) {
+                            double yaw;
+                            geometry_msgs::msg::Point hold;
+                            {
+                                std::lock_guard<std::mutex> lock(task_heading_mutex_);
+                                yaw = task_heading_target_rad_;
+                                hold = task_heading_hold_position_;
+                            }
+                            set_heading_phase(TaskHeadingPhase::FLY, yaw, hold);
+                            RCLCPP_INFO(this->get_logger(),
+                                "WP%zu: leg aligned; position travel begins.", i + 1);
+                        }
+                        break;
+                    }
+                    if (phase != TaskHeadingPhase::FLY) {
+                        change_state(MissionState::ERROR);
+                        break;
+                    }
                     if (process_current_waypoint()) {
                         position_controller_.reset_arrival();
                         const auto task = mission_[i].task;
@@ -2258,7 +2484,16 @@ private:
                                 "WP%zu reached: entering TASK (%s).", i + 1,
                                 task_landtakeoff_ ? "LANDTAKEOFF" : "LAND");
                             change_state(MissionState::TASK);
+                        } else if (task == TaskType::YAW) {
+                            if (!begin_waypoint_yaw(i)) {
+                                RCLCPP_ERROR(this->get_logger(),
+                                    "Cannot begin yaw task: invalid ENU pose.");
+                                change_state(MissionState::ERROR);
+                            } else {
+                                change_state(MissionState::TASK);
+                            }
                         } else if (task == TaskType::NONE) {
+                            reset_heading_for_next_leg();
                             current_waypoint_index_.store(i + 1);
                             if (i + 1 < mission_.size()) {
                                 RCLCPP_INFO(this->get_logger(),
@@ -2349,14 +2584,39 @@ private:
             {
                 if (task_flight_enabled_) {
                     const auto idx = current_waypoint_index_.load();
-                    if (idx >= mission_.size() ||
-                        (mission_[idx].task != TaskType::LAND &&
-                         mission_[idx].task != TaskType::LANDTAKEOFF)) {
-                        RCLCPP_ERROR(this->get_logger(),
-                            "TASK: unexpected task or invalid index.");
+                    if (idx >= mission_.size()) {
+                        RCLCPP_ERROR(this->get_logger(), "TASK: invalid waypoint index.");
                         change_state(MissionState::ERROR);
-                    } else {
+                    } else if (mission_[idx].task == TaskType::YAW) {
+                        if (!armed || mode != "GUIDED" ||
+                            !task_telemetry_ok(false) || !task_airborne()) {
+                            RCLCPP_ERROR(this->get_logger(),
+                                "YAW TASK aborted: arm/GUIDED or telemetry lost.");
+                            change_state(MissionState::ERROR);
+                            break;
+                        }
+                        geometry_msgs::msg::PoseStamped pose;
+                        geometry_msgs::msg::TwistStamped velocity;
+                        if (!task_snapshot(pose, velocity) ||
+                            heading_phase() != TaskHeadingPhase::YAW_TASK) {
+                            change_state(MissionState::ERROR);
+                            break;
+                        }
+                        if (task_heading_held(pose, velocity, now)) {
+                            RCLCPP_INFO(this->get_logger(),
+                                "WP%zu YAW completed and held. Continue next leg.",
+                                idx + 1);
+                            reset_heading_for_next_leg();
+                            current_waypoint_index_.store(idx + 1);
+                            change_state(MissionState::NAVIGATE);
+                        }
+                    } else if (mission_[idx].task == TaskType::LAND ||
+                               mission_[idx].task == TaskType::LANDTAKEOFF) {
                         change_state(MissionState::LAND);
+                    } else {
+                        RCLCPP_ERROR(this->get_logger(),
+                            "TASK: unsupported task type.");
+                        change_state(MissionState::ERROR);
                     }
                 }
                 break;
