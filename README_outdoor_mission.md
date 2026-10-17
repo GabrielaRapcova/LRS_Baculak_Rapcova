@@ -227,6 +227,23 @@ Technical references: [MAVROS global position](https://raw.githubusercontent.com
 
 ## Current implementation: telemetry only
 
+For simulation, start Gazebo and MAVROS separately, then run:
+
+```bash
+ros2 launch mission_executor outdoor_sim.launch.py
+```
+
+This launch starts the one-way Gazebo `/clock` bridge and the mission node with
+`use_sim_time=true`. Stop any manually started `/clock` bridge first to avoid
+duplicate publishers. Configure the separately launched MAVROS to use simulation
+time as well. Flight remains disabled unless `enable_flight:=true` is supplied.
+
+`outdoor_real.launch.py` is a placeholder that starts the mission node with
+`use_sim_time=false` and no clock bridge. It contains TODOs for MAVROS hardware
+transport, telemetry setup, frame alignment, limits and failsafe validation;
+real-flight setup has not been completed. Both entry points reuse the common
+`outdoor_launch.py` and accept `params_file` and `enable_flight` arguments.
+
 ```bash
 source /opt/ros/jazzy/setup.bash
 colcon build --packages-select mission_executor
