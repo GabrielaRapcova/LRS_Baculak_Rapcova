@@ -1,0 +1,39 @@
+outdoor_mission_node:
+  ros__parameters:
+    # Default mode remains telemetry-only. Disable square for a takeoff/return check.
+    enable_flight: false
+    execute_square: true
+    # Disable to retain square-only flight; requires execute_square=true.
+    execute_figure_eight: true
+    poi_east: 2.5
+    poi_north: 2.5
+    flight_altitude: 5.0
+    square_side: 5.0
+    figure8_amplitude: 3.0
+    omega: 0.2
+    max_speed: 1.5
+    max_horizontal_distance: 10.0
+    max_altitude: 6.0
+    envelope_margin: 0.5
+    # Assumed value for diagnostics; verify against a ground rotation/axis test.
+    local_yaw_offset_deg: 0.0
+    min_satellites: 8
+    gps_ready_duration: 3.0
+    telemetry_timeout: 4.0 #2.0   <-- debugging gazebo low fps
+    reference_sample_window: 0.5
+    # Wall seconds without ROS clock progress before telemetry is invalidated.
+    clock_stall_timeout: 10.0
+    transfer_speed: 1.0
+    position_tolerance: 0.25
+    altitude_tolerance: 0.2
+    velocity_tolerance: 0.2
+    yaw_tolerance_deg: 5.0
+    settle_duration: 1.0
+    command_timeout: 10.0
+    takeoff_timeout: 45.0
+    phase_timeout: 60.0
+    landing_timeout: 60.0
+    max_tracking_error: 2.0
+    # Diagnostic disagreement flags; these do not abort flight.
+    max_reference_error: 3.0
+    altitude_disagreement: 1.0

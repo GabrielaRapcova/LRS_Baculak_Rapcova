@@ -241,3 +241,13 @@ and launch `flexbe_ocs.launch.py headless:=true`; open `http://127.0.0.1:8000`.
 Always source the matching FlexBE overlay on both sides; the source 4.x messages
 must not be mixed with the apt 3.x engine. Build future mission packages with this
 source overlay active as their underlay.
+
+
+## Outdoor mission design (A1.3)
+
+Requirements, interfaces, coordinate conventions, state machine and validation
+stages are documented in [README_outdoor_mission.md](README_outdoor_mission.md).
+Geometry utilities, default telemetry diagnostics, takeoff/return checks and an
+explicitly enabled full outdoor mission are implemented: square with POI yaw,
+centre alignment, one figure-eight lap with tangent yaw, return and landing.
+See the specification for launch, abort and test commands.
