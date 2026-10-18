@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <deque>
@@ -72,6 +73,13 @@ public:
         this->declare_parameter<bool>("enable_task_flight", false);
         this->declare_parameter<bool>("task_flight_confirmed", false);
         this->declare_parameter<bool>("task_slow_sitl_telemetry", false);
+        // Experimental A* route following. Off by default; frame gate is independent.
+        this->declare_parameter<bool>("enable_task_planned_flight", false);
+        this->declare_parameter<bool>("task_planner_frame_confirmed", false);
+        this->declare_parameter<double>("task_path_point_tolerance_m", 0.20);
+        // Flight envelope for A* waypoints (including intermediate detours).
+        // A* may plan higher than any CSV waypoint: verify Gazebo ceiling!
+        this->declare_parameter<double>("task_planned_max_z_m", 4.0);
         this->declare_parameter<double>("task_ground_wait_s", 3.0);
         this->declare_parameter<double>("task_max_direct_leg_m", 1.25);
 
@@ -99,6 +107,34 @@ public:
         task_flight_confirmed_ =
             this->get_parameter("task_flight_confirmed").as_bool();
         task_slow_sitl_telemetry_ = this->get_parameter("task_slow_sitl_telemetry").as_bool();
+        enable_task_planned_flight_ = this->get_parameter("enable_task_planned_flight").as_bool();
+        task_planner_frame_confirmed_ = this->get_parameter("task_planner_frame_confirmed").as_bool();
+        task_path_point_tolerance_m_ = this->get_parameter("task_path_point_tolerance_m").as_double();
+        task_planned_max_z_m_ = this->get_parameter("task_planned_max_z_m").as_double();
+        if (!std::isfinite(task_planned_max_z_m_) ||
+            task_planned_max_z_m_ < 1.0 || task_planned_max_z_m_ > 6.0) {
+            throw std::runtime_error("task_planned_max_z_m must be within 1.0..6.0m");
+        }
+        if (!std::isfinite(task_path_point_tolerance_m_) ||
+            task_path_point_tolerance_m_ < 0.10 ||
+            task_path_point_tolerance_m_ > 0.25) {
+            throw std::runtime_error("task_path_point_tolerance_m must be within 0.10..0.25m");
+        }
+        if (enable_task_planned_flight_ &&
+            (!task_flight_enabled_ || !task_flight_confirmed_ ||
+             !task_planner_frame_confirmed_)) {
+            throw std::runtime_error(
+                "A* FLIGHT DENIED: need enable_task_flight, "
+                "task_flight_confirmed, and independently verified "
+                "task_planner_frame_confirmed=true. Not for real UAV.");
+        }
+        if (enable_task_planned_flight_) {
+            RCLCPP_WARN(this->get_logger(),
+                "EXPERIMENTAL A* TASK FLIGHT: planning and route following "
+                "enabled; no direct fallback if planning fails. "
+                "The map->MAVROS transform and costmap inflation MUST be "
+                "verified separately before flight (Gazebo SITL only).");
+        }
         task_ground_wait_s_ =
             this->get_parameter("task_ground_wait_s").as_double();
         task_max_direct_leg_m_ =
@@ -248,9 +284,12 @@ public:
             RCLCPP_WARN(this->get_logger(),
                 "A1.2 task mode: %s. Takeoff/land/landtakeoff via MAVROS "
                 "CommandTOL; yaw in absolute ENU degrees. "
-                "Direct waypoint legs have NO A* collision avoidance.",
+                "%s",
                 task_sequence_check_ ? "READ-ONLY SEQUENCE CHECK" :
-                    "SITL FLIGHT ENABLED AFTER EXPLICIT CONFIRMATION");
+                    "SITL FLIGHT ENABLED AFTER EXPLICIT CONFIRMATION",
+                enable_task_planned_flight_ ?
+                    "A* planned navigation is EXPERIMENTAL (frame gate required)." :
+                    "Direct waypoint legs have NO A* collision avoidance.");
             for (std::size_t i = 0; i < mission_.size(); ++i) {
                 const auto &w = mission_[i];
                 const std::string task = w.task == TaskType::TAKEOFF ? "takeoff" :
@@ -402,6 +441,10 @@ public:
                 100ms, std::bind(&MissionExecutorNode::state_machine_callback, this),
                 state_group_);
         } else {
+            if (enable_task_planned_flight_) {
+                planner_client_ = rclcpp_action::create_client<ComputePath3D>(
+                    this, "/compute_path_3d");
+            }
             state_timer_ = this->create_wall_timer(
                 100ms, std::bind(&MissionExecutorNode::state_machine_callback, this),
                 state_group_);
@@ -447,6 +490,10 @@ private:
     bool task_flight_enabled_ = false;
     bool task_flight_confirmed_ = false;
     bool task_slow_sitl_telemetry_ = false;
+    bool enable_task_planned_flight_ = false;
+    bool task_planner_frame_confirmed_ = false;
+    double task_path_point_tolerance_m_ = 0.20;
+    double task_planned_max_z_m_ = 4.0;
     double task_ground_wait_s_ = 3.0;
     double task_max_direct_leg_m_ = 1.25;
     std::atomic<bool> task_navigation_active_{false};
@@ -496,6 +543,20 @@ private:
     bool planned_path_monitor_active_ = false;
     bool planned_path_reset_arrival_ = false;
     std::atomic<bool> flight_navigation_active_{false};
+
+    // Separate A* flight state: no planner callbacks ever change MissionState.
+    enum class TaskRoutePhase { NEED_PLAN, WAIT_RESULT, FOLLOW_PATH, FAILURE };
+    std::mutex task_route_mutex_;
+    TaskRoutePhase task_route_phase_ = TaskRoutePhase::NEED_PLAN;
+    std::vector<geometry_msgs::msg::Point> task_route_enu_;
+    // Mark original A* LOS bends separately from resampled 0.35m targets.
+    // Align only at genuine bends, not every resampled point.
+    std::vector<uint8_t> task_route_corners_;
+    std::size_t task_route_point_index_ = 0;
+    std::size_t task_route_waypoint_index_ = 0;
+    std::size_t task_route_sequence_ = 0;
+    std::string task_route_failure_;
+    std::chrono::steady_clock::time_point task_route_started_{};
 
     enum class PreviewPhase { NEED_PLAN, WAIT_RESULT, FOLLOW_PATH, FAILURE };
     std::mutex preview_mutex_;
@@ -602,8 +663,9 @@ private:
             }
             if (i != 0) {
                 const auto &prev = mission_[i - 1];
-                if (std::hypot(w.x - prev.x, w.y - prev.y) >
-                    task_max_direct_leg_m_) {
+                if (!enable_task_planned_flight_ &&
+                    std::hypot(w.x - prev.x, w.y - prev.y) >
+                        task_max_direct_leg_m_) {
                     throw std::runtime_error(
                         "A1.2.3 direct XY leg too long for this guarded SITL "
                         "test; use a short inspected obstacle-free corridor.");
@@ -755,6 +817,238 @@ private:
         task_heading_stable_started_ = false;
     }
 
+    void reset_task_route()
+    {
+        if (!enable_task_planned_flight_) return;
+        std::lock_guard<std::mutex> lock(task_route_mutex_);
+        ++task_route_sequence_;  // Ignore late callbacks from a previous leg.
+        task_route_phase_ = TaskRoutePhase::NEED_PLAN;
+        task_route_enu_.clear();
+        task_route_corners_.clear();
+        task_route_point_index_ = 0;
+        task_route_waypoint_index_ = current_waypoint_index_.load();
+        task_route_failure_.clear();
+        task_route_started_ = std::chrono::steady_clock::now();
+    }
+
+    bool task_route_target(geometry_msgs::msg::Point &target,
+                           bool &final_point, std::size_t &point_index,
+                           std::size_t &point_count)
+    {
+        std::lock_guard<std::mutex> lock(task_route_mutex_);
+        if (task_route_phase_ != TaskRoutePhase::FOLLOW_PATH ||
+            task_route_waypoint_index_ != current_waypoint_index_.load() ||
+            task_route_point_index_ >= task_route_enu_.size()) return false;
+        point_index = task_route_point_index_;
+        point_count = task_route_enu_.size();
+        final_point = point_index + 1 == point_count;
+        target = task_route_enu_[point_index];
+        return true;
+    }
+
+    // Called ONLY from state timer; async result callback only writes route state.
+    void request_task_route()
+    {
+        if (!planner_client_ || !planner_client_->action_server_is_ready()) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "A* TASK: waiting for /compute_path_3d; holding current position.");
+            return;
+        }
+        geometry_msgs::msg::PoseStamped pose;
+        geometry_msgs::msg::TwistStamped vel;
+        if (!task_snapshot(pose, vel) || !task_airborne()) return;
+        const auto index = current_waypoint_index_.load();
+        if (index >= mission_.size()) return;
+        const auto &p = pose.pose.position;
+        // PROVISIONAL inverse of map->MAVROS: x_map=y_enu, y_map=-x_enu.
+        const std::vector<double> start{p.y, -p.x, p.z};
+        const auto &wp = mission_[index];
+        const std::vector<double> goal{wp.x, wp.y, wp.z};
+        ComputePath3D::Goal request;
+        request.start.header.frame_id = "map";
+        request.start.header.stamp = this->now();
+        request.start.pose.position.x = start[0];
+        request.start.pose.position.y = start[1];
+        request.start.pose.position.z = start[2];
+        request.start.pose.orientation.w = 1.0;
+        request.goal.header.frame_id = "map";
+        request.goal.header.stamp = this->now();
+        request.goal.pose.position.x = goal[0];
+        request.goal.pose.position.y = goal[1];
+        request.goal.pose.position.z = goal[2];
+        request.goal.pose.orientation.w = 1.0;
+        std::size_t sequence = 0;
+        {
+            std::lock_guard<std::mutex> lock(task_route_mutex_);
+            if (task_route_phase_ != TaskRoutePhase::NEED_PLAN ||
+                task_route_waypoint_index_ != index) return;
+            sequence = ++task_route_sequence_;
+            task_route_phase_ = TaskRoutePhase::WAIT_RESULT;
+            task_route_started_ = std::chrono::steady_clock::now();
+        }
+        RCLCPP_INFO(this->get_logger(),
+            "A* TASK: planning WP%zu map (%.2f,%.2f,%.2f) -> (%.2f,%.2f,%.2f)",
+            index + 1, start[0], start[1], start[2], goal[0], goal[1], goal[2]);
+        rclcpp_action::Client<ComputePath3D>::SendGoalOptions options;
+        options.goal_response_callback = [this, sequence](
+            const PlannerGoalHandle::SharedPtr &handle) {
+            if (handle) return;
+            std::lock_guard<std::mutex> lock(task_route_mutex_);
+            if (sequence == task_route_sequence_ &&
+                task_route_phase_ == TaskRoutePhase::WAIT_RESULT) {
+                task_route_phase_ = TaskRoutePhase::FAILURE;
+                task_route_failure_ = "Planner rejected the goal";
+            }
+        };
+        options.result_callback = [this, sequence, index, start, goal](
+            const PlannerGoalHandle::WrappedResult &wrapped) {
+            // Validate before publishing the route to the setpoint/state timers.
+            bool success = wrapped.code == rclcpp_action::ResultCode::SUCCEEDED &&
+                wrapped.result &&
+                wrapped.result->status == ComputePath3D::Result::SUCCESS &&
+                validate_planner_path(wrapped.result->path, start, goal);
+            std::vector<geometry_msgs::msg::Point> route;
+            std::vector<uint8_t> corners;
+            if (success) {
+                const auto &poses = wrapped.result->path.poses;
+                // The planned path is collision-checked in voxel map coordinates.
+                // Resample each LOS segment so position targets are nearby.
+                route.push_back(provisional_map_to_mavros(poses.front().pose.position));
+                corners.push_back(1);
+                for (std::size_t j = 1; j < poses.size(); ++j) {
+                    const auto a = provisional_map_to_mavros(poses[j-1].pose.position);
+                    const auto b = provisional_map_to_mavros(poses[j].pose.position);
+                    const double len = distance_between(a, b);
+                    // Fail closed if the planner asks us to fly above the
+                    // explicitly inspected ceiling, or below safe flight height.
+                    if (!std::isfinite(a.z) || !std::isfinite(b.z) ||
+                        a.z < 0.50 || b.z < 0.50 ||
+                        a.z > task_planned_max_z_m_ ||
+                        b.z > task_planned_max_z_m_) {
+                        success = false; break;
+                    }
+                    if (!std::isfinite(len)) { success = false; break; }
+                    const auto parts = static_cast<std::size_t>(std::ceil(len / 0.35));
+                    if (parts > 3000 || route.size() + parts > 3000) {
+                        success = false; break;
+                    }
+                    for (std::size_t k = 1; k <= parts; ++k) {
+                        const double t = static_cast<double>(k) / parts;
+                        geometry_msgs::msg::Point next;
+                        next.x = a.x + t * (b.x - a.x);
+                        next.y = a.y + t * (b.y - a.y);
+                        next.z = a.z + t * (b.z - a.z);
+                        route.push_back(next);
+                        corners.push_back(k == parts ? 1 : 0);
+                    }
+                }
+                if (route.empty() || corners.size() != route.size()) success = false;
+                if (route.front().z < 0.50 ||
+                    route.front().z > task_planned_max_z_m_) success = false;
+                if (success && distance_between(route.back(),
+                    position_controller_.gazebo_to_enu(mission_[index])) > 0.05) {
+                    success = false;
+                }
+            }
+            std::lock_guard<std::mutex> lock(task_route_mutex_);
+            if (sequence != task_route_sequence_ ||
+                task_route_phase_ != TaskRoutePhase::WAIT_RESULT ||
+                task_route_waypoint_index_ != index) return;
+            if (!success) {
+                task_route_phase_ = TaskRoutePhase::FAILURE;
+                task_route_failure_ = "A* failed or route invalid/too long";
+                return;
+            }
+            task_route_enu_ = std::move(route);
+            task_route_corners_ = std::move(corners);
+            task_route_point_index_ = task_route_enu_.size() > 1 ? 1 : 0;
+            task_route_phase_ = TaskRoutePhase::FOLLOW_PATH;
+            RCLCPP_INFO(this->get_logger(),
+                "A* TASK: WP%zu route received, %zu position targets; "
+                "flight Z ceiling %.2fm; no direct fallback.",
+                index + 1, task_route_enu_.size(), task_planned_max_z_m_);
+        };
+        planner_client_->async_send_goal(request, options);
+    }
+
+    bool task_route_ready(std::chrono::steady_clock::time_point now)
+    {
+        TaskRoutePhase phase;
+        std::string failure;
+        bool expired = false;
+        {
+            std::lock_guard<std::mutex> lock(task_route_mutex_);
+            phase = task_route_phase_;
+            failure = task_route_failure_;
+            expired = now - task_route_started_ > 30s &&
+                (phase == TaskRoutePhase::NEED_PLAN ||
+                 phase == TaskRoutePhase::WAIT_RESULT);
+        }
+        if (expired || phase == TaskRoutePhase::FAILURE) {
+            RCLCPP_ERROR(this->get_logger(), "A* TASK planning failed: %s",
+                expired ? "planner unavailable/result timed out" : failure.c_str());
+            change_state(MissionState::ERROR);
+            return false;
+        }
+        if (phase == TaskRoutePhase::NEED_PLAN) {
+            request_task_route();
+            return false;
+        }
+        return phase == TaskRoutePhase::FOLLOW_PATH;
+    }
+
+    // True when an intermediate target was reached and the next is ready.
+    bool advance_task_route_point()
+    {
+        geometry_msgs::msg::Point target;
+        bool final_point;
+        std::size_t point_index, point_count;
+        if (!task_route_target(target, final_point, point_index, point_count)) {
+            change_state(MissionState::ERROR);
+            return false;
+        }
+        if (final_point) return false;
+        geometry_msgs::msg::PoseStamped pose;
+        geometry_msgs::msg::TwistStamped velocity;
+        if (!task_snapshot(pose, velocity)) {
+            change_state(MissionState::ERROR);
+            return false;
+        }
+        const double distance = distance_between(pose.pose.position, target);
+        // At LOS path bends require the actual bend, not a 0.20m shortcut.
+        bool is_bend = false;
+        {
+            std::lock_guard<std::mutex> lock(task_route_mutex_);
+            if (point_index >= task_route_corners_.size()) {
+                change_state(MissionState::ERROR);
+                return false;
+            }
+            is_bend = task_route_corners_[point_index] != 0;
+        }
+        const double tolerance = is_bend ?
+            std::min(task_path_point_tolerance_m_, 0.10) :
+            task_path_point_tolerance_m_;
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+            "A* TASK path[%zu/%zu] dist=%.3f m (limit %.2f m)",
+            point_index + 1, point_count, distance, tolerance);
+        if (distance > tolerance) return false;
+        {
+            std::lock_guard<std::mutex> lock(task_route_mutex_);
+            if (task_route_phase_ != TaskRoutePhase::FOLLOW_PATH ||
+                task_route_point_index_ != point_index) return false;
+            ++task_route_point_index_;
+        }
+        RCLCPP_INFO(this->get_logger(),
+            "A* TASK: reached path point %zu/%zu, advance.",
+            point_index + 1, point_count);
+        // Keep FLY phase across densely sampled points on a straight LOS.
+        // Only real A* path corners need a new travel-heading alignment.
+        if (is_bend) {
+            reset_heading_for_next_leg();
+        }
+        return true;
+    }
+
     bool prepare_task_leg(std::size_t index)
     {
         if (index == 0 || index >= mission_.size()) return false;
@@ -766,8 +1060,15 @@ private:
 
         // Always derive travel heading from converted MAVROS ENU coordinates,
         // not directly from the CSV/PCD coordinates (the frames differ).
-        const auto from = position_controller_.gazebo_to_enu(mission_[index - 1]);
-        const auto to = position_controller_.gazebo_to_enu(mission_[index]);
+        auto from = position_controller_.gazebo_to_enu(mission_[index - 1]);
+        auto to = position_controller_.gazebo_to_enu(mission_[index]);
+        if (enable_task_planned_flight_) {
+            bool final_point;
+            std::size_t point_index, point_count;
+            if (!task_route_target(to, final_point, point_index, point_count))
+                return false;
+            from = pose.pose.position;
+        }
         const double dx = to.x - from.x;
         const double dy = to.y - from.y;
         // A vertical-only leg has no horizontal travel direction: retain yaw.
@@ -1891,6 +2192,7 @@ private:
                 mission_[idx].task == TaskType::YAW;
             if (new_state == MissionState::NAVIGATE) {
                 reset_heading_for_next_leg();
+                reset_task_route();
             }
             task_navigation_active_.store(
                 new_state == MissionState::NAVIGATE ||
@@ -2000,12 +2302,31 @@ private:
                 commanded_yaw = task_heading_target_rad_;
                 hold_position = task_heading_hold_position_;
             }
-            // PREPARE means no waypoint movement until a valid heading is set.
-            if (phase == TaskHeadingPhase::PREPARE) return;
+            // During A* planning / heading preparation, HOLD current position.
+            // Never fall back to a direct CSV goal if the route is absent.
+            if (phase == TaskHeadingPhase::PREPARE) {
+                if (!enable_task_planned_flight_) return;
+                geometry_msgs::msg::PoseStamped p;
+                geometry_msgs::msg::TwistStamped v;
+                double current_yaw = 0.0;
+                if (!task_snapshot(p, v) || !yaw_from_enu_pose(p, current_yaw)) return;
+                auto hold_target = create_position_target();
+                hold_target.position = p.pose.position;
+                hold_target.yaw = static_cast<float>(current_yaw);
+                mavros_setpoint_pub_->publish(hold_target);
+                return;
+            }
             auto target = create_position_target();
-            target.position = phase == TaskHeadingPhase::FLY ?
-                position_controller_.gazebo_to_enu(mission_[goal_idx]) :
-                hold_position;
+            if (phase == TaskHeadingPhase::FLY && enable_task_planned_flight_) {
+                bool final_point;
+                std::size_t point_index, point_count;
+                if (!task_route_target(target.position, final_point,
+                                       point_index, point_count)) return;
+            } else {
+                target.position = phase == TaskHeadingPhase::FLY ?
+                    position_controller_.gazebo_to_enu(mission_[goal_idx]) :
+                    hold_position;
+            }
             target.yaw = static_cast<float>(commanded_yaw);
             // DO NOT set IGNORE_YAW: yaw and position are both controlled.
             mavros_setpoint_pub_->publish(target);
@@ -2462,6 +2783,9 @@ private:
                         change_state(MissionState::DONE);
                         break;
                     }
+                    if (enable_task_planned_flight_ && !task_route_ready(now)) {
+                        break;  // Hover; never fly directly before A* returns.
+                    }
                     const auto phase = heading_phase();
                     if (phase == TaskHeadingPhase::PREPARE) {
                         if (!prepare_task_leg(i)) {
@@ -2496,6 +2820,20 @@ private:
                         change_state(MissionState::ERROR);
                         break;
                     }
+                    if (enable_task_planned_flight_) {
+                        geometry_msgs::msg::Point route_target;
+                        bool final_point;
+                        std::size_t point_index, point_count;
+                        if (!task_route_target(route_target, final_point,
+                                               point_index, point_count)) {
+                            change_state(MissionState::ERROR);
+                            break;
+                        }
+                        if (!final_point) {
+                            advance_task_route_point();
+                            break;
+                        }
+                    }
                     if (process_current_waypoint()) {
                         position_controller_.reset_arrival();
                         const auto task = mission_[i].task;
@@ -2517,6 +2855,7 @@ private:
                         } else if (task == TaskType::NONE) {
                             reset_heading_for_next_leg();
                             current_waypoint_index_.store(i + 1);
+                            reset_task_route();
                             if (i + 1 < mission_.size()) {
                                 RCLCPP_INFO(this->get_logger(),
                                     "WP%zu reached: advance to WP%zu.", i + 1, i + 2);
