@@ -1,0 +1,38 @@
+# A1.2 indoor Mission Executor configuration (ROS 2 Jazzy / Gazebo SITL)
+# Keep this file in: src/mission_executor/config/mission_executor.yaml
+# Flight is intentionally disabled by default. Enable it explicitly in the CLI
+# after verifying the simulated UAV is on the ground, disarmed, and safe to fly.
+mission_executor_node:
+  ros__parameters:
+    # Mission file: pass an absolute path at startup with -p mission_file:=...
+    mission_file: ""
+
+    # Safe default: parse/check the CSV, do not send flight commands.
+    enable_task_sequence_check: true
+    enable_task_flight: false
+    task_flight_confirmed: false
+
+    # A* integration (operator confirms map/frame alignment at flight startup).
+    enable_task_planned_flight: false
+    task_planner_frame_confirmed: false
+    task_planned_max_z_m: 4.0
+    task_path_point_tolerance_m: 0.20
+    task_path_resample_spacing_m: 1.5  # Maximum spacing of intermediate A* targets
+
+    # Precision for actual CSV mission waypoints (NOT path-intermediate points).
+    hard_tolerance_m: 0.15
+    soft_tolerance_m: 0.50
+    hard_speed_limit_mps: 0.15
+    hard_stable_time_s: 1.0
+
+    # Telemetry: slow SITL mode must be enabled explicitly for a flight test.
+    task_slow_sitl_telemetry: false
+    task_slow_sitl_sample_window_s: 10.0  # 8 received pose/velocity samples
+
+    # Task handling and legacy direct-navigation safety guard.
+    task_ground_wait_s: 3.0
+    task_max_direct_leg_m: 1.25
+
+    # Dynamic start disabled by default: requires manual clear-ascent check.
+    enable_dynamic_start: false
+    dynamic_start_clearance_confirmed: false
