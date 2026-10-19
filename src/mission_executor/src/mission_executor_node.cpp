@@ -55,9 +55,18 @@ public:
         this->declare_parameter<bool>("enable_task_planned_flight", false);
         this->declare_parameter<bool>("task_planner_frame_confirmed", false);
         this->declare_parameter<double>("task_path_point_tolerance_m", 0.20);
+        this->declare_parameter<double>("task_path_resample_spacing_m", 0.50);
+        this->declare_parameter<double>("hard_tolerance_m", 0.15);
+        this->declare_parameter<double>("soft_tolerance_m", 0.50);
+        this->declare_parameter<double>("hard_speed_limit_mps", 0.15);
+        this->declare_parameter<double>("hard_stable_time_s", 1.0);
+        this->declare_parameter<double>("task_slow_sitl_sample_window_s", 10.0);
         this->declare_parameter<double>("task_planned_max_z_m", 4.0);
         this->declare_parameter<double>("task_ground_wait_s", 3.0);
         this->declare_parameter<double>("task_max_direct_leg_m", 1.25);
+        // SITL only. Explicit consent is required because LAND descends at current XY.
+        this->declare_parameter<bool>("enable_error_auto_land", false);
+        this->declare_parameter<bool>("error_land_clearance_confirmed", false);
         this->declare_parameter<bool>("enable_dynamic_start", false);
         this->declare_parameter<bool>("dynamic_start_clearance_confirmed", false);
 
@@ -66,11 +75,43 @@ public:
         task_slow_sitl_telemetry_ = this->get_parameter("task_slow_sitl_telemetry").as_bool();
         enable_task_planned_flight_ = this->get_parameter("enable_task_planned_flight").as_bool();
         task_path_point_tolerance_m_ = this->get_parameter("task_path_point_tolerance_m").as_double();
+        task_path_resample_spacing_m_ = this->get_parameter("task_path_resample_spacing_m").as_double();
+        task_slow_sitl_sample_window_s_ = this->get_parameter("task_slow_sitl_sample_window_s").as_double();
+        const double hard_tol = this->get_parameter("hard_tolerance_m").as_double();
+        const double soft_tol = this->get_parameter("soft_tolerance_m").as_double();
+        const double hard_speed = this->get_parameter("hard_speed_limit_mps").as_double();
+        const double hard_stable = this->get_parameter("hard_stable_time_s").as_double();
+
+        if (!std::isfinite(task_path_resample_spacing_m_) ||
+            task_path_resample_spacing_m_ < 0.20 ||
+            task_path_resample_spacing_m_ > 2.00 ||
+            !std::isfinite(task_slow_sitl_sample_window_s_) ||
+            task_slow_sitl_sample_window_s_ < 7.0 ||
+            task_slow_sitl_sample_window_s_ > 15.0 ||
+            !std::isfinite(hard_tol) || hard_tol < 0.05 || hard_tol > 0.30 ||
+            !std::isfinite(soft_tol) || soft_tol < hard_tol || soft_tol > 1.0 ||
+            !std::isfinite(hard_speed) || hard_speed <= 0.0 || hard_speed > 0.50 ||
+            !std::isfinite(hard_stable) || hard_stable < 0.3 || hard_stable > 5.0) {
+            throw std::runtime_error("Invalid A1.2 YAML trajectory/precision/telemetry parameter.");
+        }
+        position_controller_ = PositionController(hard_tol, soft_tol,
+                                                  hard_speed, hard_stable);
         task_planned_max_z_m_ = this->get_parameter("task_planned_max_z_m").as_double();
         task_ground_wait_s_ = this->get_parameter("task_ground_wait_s").as_double();
         task_max_direct_leg_m_ = this->get_parameter("task_max_direct_leg_m").as_double();
         const bool task_flight_confirmed = this->get_parameter("task_flight_confirmed").as_bool();
         const bool frame_confirmed = this->get_parameter("task_planner_frame_confirmed").as_bool();
+        enable_error_auto_land_ = this->get_parameter("enable_error_auto_land").as_bool();
+        const bool error_land_clearance_confirmed =
+            this->get_parameter("error_land_clearance_confirmed").as_bool();
+        if (enable_error_auto_land_ &&
+            (!task_flight_enabled_ || !task_flight_confirmed ||
+             !error_land_clearance_confirmed)) {
+            throw std::runtime_error(
+                "ERROR AUTO LAND DENIED: enable only in supervised Gazebo SITL "
+                "after inspecting the vertical landing column along the ENTIRE route. "
+                "Set error_land_clearance_confirmed=true explicitly.");
+        }
         enable_dynamic_start_ = this->get_parameter("enable_dynamic_start").as_bool();
         const bool clearance_confirmed =
             this->get_parameter("dynamic_start_clearance_confirmed").as_bool();
@@ -160,8 +201,11 @@ public:
                 w.precision == Precision::HARD ? "HARD" : "SOFT", task.c_str());
         }
         RCLCPP_INFO(this->get_logger(),
-            "PositionController: HARD=0.15m, SOFT=0.50m, "
-            "HARD speed<=0.15m/s, stable>=1.0s");
+            "PositionController: HARD=%.2fm, SOFT=%.2fm, "
+            "HARD speed<=%.2fm/s, stable>=%.1fs; "
+            "path spacing=%.2fm; SITL 8-sample window=%.1fs",
+            hard_tol, soft_tol, hard_speed, hard_stable,
+            task_path_resample_spacing_m_, task_slow_sitl_sample_window_s_);
 
         state_group_ = this->create_callback_group(
             rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -243,6 +287,8 @@ private:
     bool dynamic_initial_takeoff_ = false;  
     geometry_msgs::msg::Point takeoff_anchor_{}; 
     double task_path_point_tolerance_m_ = 0.20;
+    double task_path_resample_spacing_m_ = 0.50;
+    double task_slow_sitl_sample_window_s_ = 10.0;
     double task_planned_max_z_m_ = 4.0;
     double task_ground_wait_s_ = 3.0;
     double task_max_direct_leg_m_ = 1.25;
@@ -255,6 +301,13 @@ private:
     std::chrono::steady_clock::time_point task_heading_phase_since_{};
     std::chrono::steady_clock::time_point task_heading_stable_since_{};
     bool task_heading_stable_started_ = false;
+    // Emergency mode switch is independent of the normal mission LAND sequence.
+    bool enable_error_auto_land_ = false;
+    bool emergency_landing_active_ = false; // state timer thread only
+    std::chrono::steady_clock::time_point emergency_landing_since_{};
+    std::chrono::steady_clock::time_point emergency_last_mode_request_{};
+    int emergency_mode_attempts_ = 0;
+    std::atomic<bool> emergency_mode_pending_{false};
     bool task_landtakeoff_ = false;
     bool task_takeoff_sent_ = false;
     bool task_takeoff_response_received_ = false;
@@ -398,10 +451,10 @@ private:
 
     static bool sample_rate_ok(
         const std::deque<std::chrono::steady_clock::time_point> &samples,
-        bool slow_sitl)
+        bool slow_sitl, double slow_window_s)
     {
         return samples.size() == 8 &&
-            samples.back() - samples.front() <= (slow_sitl ? 10s : 1400ms);
+            samples.back() - samples.front() <= std::chrono::duration<double>(slow_sitl ? slow_window_s : 1.4);
     }
 
     bool task_telemetry_ok(bool require_ground)
@@ -429,8 +482,8 @@ private:
         return pose_received_ && velocity_received_ &&
             now - last_pose_time_ <= motion_timeout &&
             now - last_velocity_time_ <= motion_timeout &&
-            sample_rate_ok(pose_samples_, task_slow_sitl_telemetry_) &&
-            sample_rate_ok(velocity_samples_, task_slow_sitl_telemetry_) &&
+            sample_rate_ok(pose_samples_, task_slow_sitl_telemetry_, task_slow_sitl_sample_window_s_) &&
+            sample_rate_ok(velocity_samples_, task_slow_sitl_telemetry_, task_slow_sitl_sample_window_s_) &&
             current_pose_.header.frame_id == "map" &&
             finite_point(p) &&
             std::isfinite(v.x) && std::isfinite(v.y) &&
@@ -455,7 +508,7 @@ private:
         const double state_limit = task_slow_sitl_telemetry_ ? 6.0 : 2.0;
         const double ext_limit = task_slow_sitl_telemetry_ ? 4.0 : 2.0;
         const double motion_limit = task_slow_sitl_telemetry_ ? 2.5 : 0.5;
-        const double samples_limit = task_slow_sitl_telemetry_ ? 9.0 : 1.4;
+        const double samples_limit = task_slow_sitl_telemetry_ ? task_slow_sitl_sample_window_s_ : 1.4;
         const auto age = [now](bool received,
             const std::chrono::steady_clock::time_point &last) {
             return received ?
@@ -495,10 +548,10 @@ private:
             const auto &p = current_pose_.pose.position;
             const auto &v = current_velocity_.twist.linear;
             const bool pose_ok = pose_received_ && pose_age <= motion_limit &&
-                sample_rate_ok(pose_samples_, task_slow_sitl_telemetry_) &&
+                sample_rate_ok(pose_samples_, task_slow_sitl_telemetry_, task_slow_sitl_sample_window_s_) &&
                 current_pose_.header.frame_id == "map" && finite_point(p);
             const bool vel_ok = velocity_received_ && vel_age <= motion_limit &&
-                sample_rate_ok(velocity_samples_, task_slow_sitl_telemetry_) &&
+                sample_rate_ok(velocity_samples_, task_slow_sitl_telemetry_, task_slow_sitl_sample_window_s_) &&
                 std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
             RCLCPP_ERROR(this->get_logger(),
                 "A1.2 TELEMETRY DIAG MOTION: pose received=%d age=%.2f/%.1fs "
@@ -684,7 +737,7 @@ private:
                         success = false; break;
                     }
                     if (!std::isfinite(len)) { success = false; break; }
-                    const auto parts = static_cast<std::size_t>(std::ceil(len / 0.50));
+                    const auto parts = static_cast<std::size_t>(std::ceil(len / task_path_resample_spacing_m_));
                     if (parts > 3000 || route.size() + parts > 3000) {
                         success = false; break;
                     }
@@ -1098,6 +1151,113 @@ private:
         }
     }
 
+    // Emergency landing never uses task_telemetry_ok(): its failure may have
+    // triggered this fallback. It sends LAND mode through MAVROS and monitors
+    // FCU confirmations; it does NOT disarm or resume the failed mission.
+    void emergency_land_tick(
+        bool connected, bool armed, bool state_received,
+        const std::string &mode,
+        std::chrono::steady_clock::time_point last_state_time,
+        std::chrono::steady_clock::time_point now)
+    {
+        if (!connected || !state_received ||
+            now - last_state_time > MAVROS_TIMEOUT) {
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
+                "FAILSAFE LAND: FCU state missing/stale. Cannot confirm "
+                "landing; check the vehicle and intervene manually.");
+            if (now - emergency_landing_since_ > 20s) {
+                emergency_landing_active_ = false;
+                change_state(MissionState::ERROR);
+            }
+            return;
+        }
+
+        if (mode != "LAND" && mode != "GUIDED") {
+            RCLCPP_ERROR(this->get_logger(),
+                "FAILSAFE LAND: mode overridden to '%s'; will not take back "
+                "control. Operator intervention required.", mode.c_str());
+            emergency_landing_active_ = false;
+            change_state(MissionState::ERROR);
+            return;
+        }
+
+        bool on_ground = false;
+        {
+            std::lock_guard<std::mutex> lock(mavros_mutex_);
+            const auto max_age = task_slow_sitl_telemetry_ ? 4s : 2s;
+            on_ground = extended_state_received_ &&
+                now - last_extended_state_time_ <= max_age &&
+                landed_state_ ==
+                    mavros_msgs::msg::ExtendedState::LANDED_STATE_ON_GROUND;
+        }
+        if (on_ground && !armed) {
+            RCLCPP_ERROR(this->get_logger(),
+                "FAILSAFE LAND completed: ON_GROUND and DISARMED. "
+                "Mission remains failed; reset/review before a new flight.");
+            emergency_landing_active_ = false;
+            change_state(MissionState::ERROR);
+            return;
+        }
+
+        if (mode != "LAND") {
+            if (now - emergency_landing_since_ > 20s) {
+                RCLCPP_ERROR(this->get_logger(),
+                    "FAILSAFE LAND: LAND mode not confirmed within 20 s; "
+                    "manual intervention needed.");
+                emergency_landing_active_ = false;
+                change_state(MissionState::ERROR);
+                return;
+            }
+            if (emergency_mode_attempts_ < 3 &&
+                !emergency_mode_pending_.load() &&
+                (emergency_mode_attempts_ == 0 ||
+                 now - emergency_last_mode_request_ >= 3s)) {
+                if (!set_mode_client_->service_is_ready()) {
+                    RCLCPP_WARN_THROTTLE(this->get_logger(),
+                        *this->get_clock(), 2000,
+                        "FAILSAFE LAND: waiting for /mavros/set_mode...");
+                    return;
+                }
+                auto request =
+                    std::make_shared<mavros_msgs::srv::SetMode::Request>();
+                request->base_mode = 0;
+                request->custom_mode = "LAND";
+                emergency_mode_pending_.store(true);
+                ++emergency_mode_attempts_;
+                emergency_last_mode_request_ = now;
+                RCLCPP_ERROR(this->get_logger(),
+                    "FAILSAFE LAND: requesting ArduPilot LAND mode (%d/3)",
+                    emergency_mode_attempts_);
+                set_mode_client_->async_send_request(
+                    request,
+                    [this](rclcpp::Client<mavros_msgs::srv::SetMode>::SharedFuture future) {
+                        try {
+                            const bool accepted = future.get()->mode_sent;
+                            if (!accepted) {
+                                RCLCPP_ERROR(this->get_logger(),
+                                    "FAILSAFE LAND: mode request rejected.");
+                            }
+                        } catch (const std::exception &e) {
+                            RCLCPP_ERROR(this->get_logger(),
+                                "FAILSAFE LAND: mode service error: %s", e.what());
+                        }
+                        emergency_mode_pending_.store(false);
+                    });
+            }
+            return;
+        }
+
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
+            "FAILSAFE LAND: ArduPilot reports LAND; waiting for verified "
+            "ON_GROUND + DISARMED, no position setpoints are being published.");
+        if (now - emergency_landing_since_ > 120s) {
+            RCLCPP_ERROR(this->get_logger(),
+                "FAILSAFE LAND monitoring timeout. Inspect FCU and intervene.");
+            emergency_landing_active_ = false;
+            change_state(MissionState::ERROR);
+        }
+    }
+
     void task_land_tick(
         bool armed, std::chrono::steady_clock::time_point now)
     {
@@ -1414,6 +1574,50 @@ private:
 
     void change_state(MissionState new_state)
     {
+        // No automatic rearming or landing on the ground. Automatic LAND is
+        // conditional: linked, armed, currently airborne and still in GUIDED/LAND.
+        // Do not override an operator-selected mode or attempt LAND without FCU.
+        if (new_state == MissionState::ERROR && enable_error_auto_land_ &&
+            !emergency_landing_active_ &&
+            (current_state_ == MissionState::TAKEOFF ||
+             current_state_ == MissionState::NAVIGATE ||
+             current_state_ == MissionState::TASK ||
+             current_state_ == MissionState::LAND)) {
+            const auto now = std::chrono::steady_clock::now();
+            bool can_request_land = false;
+            {
+                std::lock_guard<std::mutex> lock(mavros_mutex_);
+                const auto extended_max_age = task_slow_sitl_telemetry_ ? 4s : 2s;
+                can_request_land = mavros_state_received_ && mavros_connected_ &&
+                    mavros_armed_ &&
+                    (mavros_mode_ == "GUIDED" || mavros_mode_ == "LAND") &&
+                    now - last_mavros_state_time_ <= MAVROS_TIMEOUT &&
+                    extended_state_received_ &&
+                    now - last_extended_state_time_ <= extended_max_age &&
+                    (landed_state_ ==
+                         mavros_msgs::msg::ExtendedState::LANDED_STATE_IN_AIR ||
+                     landed_state_ ==
+                         mavros_msgs::msg::ExtendedState::LANDED_STATE_TAKEOFF ||
+                     landed_state_ ==
+                         mavros_msgs::msg::ExtendedState::LANDED_STATE_LANDING);
+            }
+            if (can_request_land) {
+                RCLCPP_ERROR(this->get_logger(),
+                    "A1.2 FAILSAFE: mission failed in flight. Entering LAND "
+                    "mode at CURRENT XY. This does not check obstacles below!");
+                emergency_landing_active_ = true;
+                emergency_landing_since_ = now;
+                emergency_mode_attempts_ = 0;
+                emergency_mode_pending_.store(false);
+                task_landtakeoff_ = false; // never restart after emergency LAND
+                new_state = MissionState::LAND;
+            } else {
+                RCLCPP_ERROR(this->get_logger(),
+                    "A1.2 FAILSAFE: automatic LAND not safe/available "
+                    "(disconnected, disarmed, stale/non-airborne state or mode "
+                    "override). Remain ERROR; operator intervention required.");
+            }
+        }
         if (current_state_ == new_state) {
             return;
         }
@@ -1654,7 +1858,8 @@ private:
             current_state_ != MissionState::IDLE &&
             current_state_ != MissionState::WAIT_CONNECTION &&
             current_state_ != MissionState::ERROR &&
-            current_state_ != MissionState::DONE)
+            current_state_ != MissionState::DONE &&
+            !emergency_landing_active_)
         {
             if (!connected) {
                 RCLCPP_ERROR(this->get_logger(), "MAVROS reports disconnected!");
@@ -1964,7 +2169,12 @@ private:
             }
             case MissionState::LAND:
             {
-                task_land_tick(armed, now);
+                if (emergency_landing_active_) {
+                    emergency_land_tick(connected, armed, state_received,
+                                        mode, last_state_time, now);
+                } else {
+                    task_land_tick(armed, now);
+                }
                 break;
             }
             case MissionState::DONE:
