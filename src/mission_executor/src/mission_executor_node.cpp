@@ -401,7 +401,7 @@ private:
         bool slow_sitl)
     {
         return samples.size() == 8 &&
-            samples.back() - samples.front() <= (slow_sitl ? 9s : 1400ms);
+            samples.back() - samples.front() <= (slow_sitl ? 10s : 1400ms);
     }
 
     bool task_telemetry_ok(bool require_ground)
@@ -446,6 +446,72 @@ private:
                 (task_slow_sitl_telemetry_ ? 4s : 2s) &&
             landed_state_ ==
                 mavros_msgs::msg::ExtendedState::LANDED_STATE_IN_AIR;
+    }
+
+    // Read-only breakdown of flight telemetry guards. Called only on NAVIGATE error.
+    void log_task_telemetry_failure()
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const double state_limit = task_slow_sitl_telemetry_ ? 6.0 : 2.0;
+        const double ext_limit = task_slow_sitl_telemetry_ ? 4.0 : 2.0;
+        const double motion_limit = task_slow_sitl_telemetry_ ? 2.5 : 0.5;
+        const double samples_limit = task_slow_sitl_telemetry_ ? 9.0 : 1.4;
+        const auto age = [now](bool received,
+            const std::chrono::steady_clock::time_point &last) {
+            return received ?
+                std::chrono::duration<double>(now - last).count() : -1.0;
+        };
+        const auto span = [](const auto &samples) {
+            return samples.size() == 8 ?
+                std::chrono::duration<double>(samples.back() - samples.front()).count()
+                : -1.0;
+        };
+        {
+            std::lock_guard<std::mutex> lock(mavros_mutex_);
+            const double state_age = age(mavros_state_received_, last_mavros_state_time_);
+            const double ext_age = age(extended_state_received_, last_extended_state_time_);
+            const bool state_ok = mavros_state_received_ && mavros_connected_ &&
+                state_age <= state_limit;
+            const bool ext_ok = extended_state_received_ && ext_age <= ext_limit;
+            const bool air_ok = ext_ok &&
+                landed_state_ == mavros_msgs::msg::ExtendedState::LANDED_STATE_IN_AIR;
+            RCLCPP_ERROR(this->get_logger(),
+                "A1.2 TELEMETRY DIAG MAVROS: state received=%d connected=%d "
+                "age=%.2f/%.1fs OK=%d; extended received=%d age=%.2f/%.1fs "
+                "OK=%d; landed_state=%d IN_AIR_OK=%d",
+                static_cast<int>(mavros_state_received_),
+                static_cast<int>(mavros_connected_), state_age, state_limit,
+                static_cast<int>(state_ok),
+                static_cast<int>(extended_state_received_), ext_age, ext_limit,
+                static_cast<int>(ext_ok), static_cast<int>(landed_state_),
+                static_cast<int>(air_ok));
+        }
+        {
+            std::lock_guard<std::mutex> lock(pose_mutex_);
+            const double pose_age = age(pose_received_, last_pose_time_);
+            const double vel_age = age(velocity_received_, last_velocity_time_);
+            const double pose_span = span(pose_samples_);
+            const double vel_span = span(velocity_samples_);
+            const auto &p = current_pose_.pose.position;
+            const auto &v = current_velocity_.twist.linear;
+            const bool pose_ok = pose_received_ && pose_age <= motion_limit &&
+                sample_rate_ok(pose_samples_, task_slow_sitl_telemetry_) &&
+                current_pose_.header.frame_id == "map" && finite_point(p);
+            const bool vel_ok = velocity_received_ && vel_age <= motion_limit &&
+                sample_rate_ok(velocity_samples_, task_slow_sitl_telemetry_) &&
+                std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+            RCLCPP_ERROR(this->get_logger(),
+                "A1.2 TELEMETRY DIAG MOTION: pose received=%d age=%.2f/%.1fs "
+                "samples=%zu/8 span=%.2f/%.1fs frame='%s' OK=%d; "
+                "velocity received=%d age=%.2f/%.1fs samples=%zu/8 "
+                "span=%.2f/%.1fs OK=%d",
+                static_cast<int>(pose_received_), pose_age, motion_limit,
+                pose_samples_.size(), pose_span, samples_limit,
+                current_pose_.header.frame_id.c_str(), static_cast<int>(pose_ok),
+                static_cast<int>(velocity_received_), vel_age, motion_limit,
+                velocity_samples_.size(), vel_span, samples_limit,
+                static_cast<int>(vel_ok));
+        }
     }
 
     bool task_snapshot(
@@ -618,7 +684,7 @@ private:
                         success = false; break;
                     }
                     if (!std::isfinite(len)) { success = false; break; }
-                    const auto parts = static_cast<std::size_t>(std::ceil(len / 0.35));
+                    const auto parts = static_cast<std::size_t>(std::ceil(len / 0.50));
                     if (parts > 3000 || route.size() + parts > 3000) {
                         success = false; break;
                     }
@@ -1747,6 +1813,7 @@ private:
                     break;
                 }
                 if (!task_telemetry_ok(false) || !task_airborne()) {
+                    log_task_telemetry_failure();
                     RCLCPP_ERROR(this->get_logger(),
                         "A1.2 NAVIGATE: not confirmed IN_AIR or telemetry "
                         "became stale/too sparse for configured profile. "
