@@ -180,6 +180,230 @@ colcon test-result --verbose
 python3 src/astar_planner/test/smoke_test.py
 ```
 
+## Indoor mission executor (A1.2)
+
+The `mission_executor` package implements **A1.2 — indoor mission execution** in
+ROS 2 Jazzy (C++). It reads waypoints from a CSV file and executes them using
+ArduPilot through MAVROS. The route **between CSV waypoints** is requested from
+the A1.1 3D A* planner (`/compute_path_3d`); intermediate path points are not
+additional mission tasks.
+
+Supported mission tasks: `takeoff`, `land`, `landtakeoff`, `yaw90`, `yaw180`
+(and other `yaw<angle>` values). `HARD` waypoints require close, stable arrival
+(0.15 m, speed <= 0.15 m/s for at least 1 s), whereas `SOFT` waypoints use a
+0.50 m acceptance radius. Waypoint yaw tasks are **absolute angles in MAVROS
+ENU**, and normal flight heading follows the direction of travel.
+
+### Build
+
+```bash
+cd ~/LRS_Baculak_Rapcova
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-up-to mission_executor
+source install/setup.bash
+ros2 pkg prefix mission_executor
+```
+
+The package path printed by the last command should point to this workspace.
+Use `source /opt/ros/jazzy/setup.bash` and `source
+~/LRS_Baculak_Rapcova/install/setup.bash` in **every new ROS 2 terminal**.
+
+### Start the complete system (separate terminals)
+
+Start the components in this order; leave each process running:
+
+1. **Gazebo Sim** with the indoor/hangar world and UAV model.
+2. **ArduPilot SITL** connected to that Gazebo instance.
+3. **MAVROS** connected to the SITL autopilot.
+4. **A1.1 mapper**, **voxel costmap**, then **3D A* planner**.
+5. **Mission Executor**, only after the checks below pass.
+
+Use **three separate terminals** for these simulator processes, following
+the Gazebo hangar-world, SITL vehicle-model and MAVROS FCU connection settings
+of your existing simulation setup:
+
+- **Terminal 1:** `gz sim` with the configured indoor world/UAV model.
+- **Terminal 2:** ArduPilot `sim_vehicle.py` configured for that Gazebo vehicle.
+- **Terminal 3:** MAVROS connected to the SITL FCU endpoint.
+
+The exact world file, `sim_vehicle.py` model options and MAVROS `fcu_url` vary
+between checkouts and are **not supplied here as unverified commands**. Follow
+the simulation setup used for your repository. Starting Gazebo alone is not
+equivalent to starting a fresh SITL/MAVROS session; avoid leaving an earlier
+armed autopilot running after restarting only Gazebo.
+
+After MAVROS starts, check connection and ground state from another sourced
+terminal:
+
+```bash
+ros2 topic echo /mavros/state --once
+ros2 topic echo /mavros/extended_state --once
+```
+
+Before a *new ground-start mission*, require `connected: true`, `armed: false`
+and `landed_state: 1` (`ON_GROUND`). Verify a fresh pose and velocity as well:
+
+```bash
+ros2 topic echo /mavros/local_position/pose --once
+ros2 topic echo /mavros/local_position/velocity_local --once
+```
+
+### MAVROS telemetry: required message interval in our SITL setup
+
+In previous Gazebo tests, `/mavros/extended_state` was sometimes too slow or
+stale, so the executor refused to arm with `A1.2 preflight blocked`. After
+**MAVROS and SITL are connected**, request the MAVLink `EXTENDED_SYS_STATE`
+message (ID **245**) at **5 Hz**:
+
+```bash
+ros2 service call /mavros/set_message_interval \
+  mavros_msgs/srv/MessageInterval \
+  "{message_id: 245, message_rate: 5.0}"
+```
+
+Confirm the response is successful and verify that the topic is updating:
+
+```bash
+ros2 topic hz /mavros/extended_state
+ros2 topic hz /mavros/local_position/pose
+ros2 topic hz /mavros/local_position/velocity_local
+```
+
+Run these `hz` checks one at a time (stop each with `Ctrl+C`). Message 245
+controls **extended state**, not the pose or velocity streams. If pose/velocity
+are stale, investigate their upstream MAVROS/SITL streams; do not assume the
+message-245 command fixes every topic. Repeat this service request after
+restarting SITL or MAVROS if the stream rate drops. The flight parameter
+`task_slow_sitl_telemetry:=true` only relaxes timing thresholds for slow SITL;
+it **does not disable preflight safety checks**.
+
+Start A1.1 in **three more terminals**, after sourcing ROS 2 and this workspace
+in each of them:
+
+```bash
+# Terminal 4: map provider
+ros2 launch mapper mapper_launch.py \
+  map_file:=$HOME/large_files/maps/FEI_LRS_PCD/map.pcd
+```
+
+```bash
+# Terminal 5: voxel costmap
+ros2 launch voxel_costmap costmap_launch.py
+```
+
+```bash
+# Terminal 6: A* planner
+ros2 launch astar_planner planner_launch.py
+```
+
+Check that the A* action server is available:
+
+```bash
+ros2 action list -t
+# Expected: /compute_path_3d [uav_navigation_msgs/action/ComputePath3D]
+```
+
+### Run the seven-waypoint mission (WP1 ground start)
+
+The example file is [`missions/exam_example.csv`](missions/exam_example.csv).
+The first CSV task must be `takeoff` and the last `land`. Once the UAV is safely
+on the ground, disarmed, and the route/map/frame configuration has been checked,
+start the executor in **Terminal 7**:
+
+```bash
+cd ~/LRS_Baculak_Rapcova
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+
+ros2 run mission_executor mission_executor_node --ros-args \
+  -p mission_file:=$HOME/LRS_Baculak_Rapcova/missions/exam_example.csv \
+  -p enable_task_flight:=true \
+  -p task_flight_confirmed:=true \
+  -p task_slow_sitl_telemetry:=true \
+  -p enable_task_planned_flight:=true \
+  -p task_planner_frame_confirmed:=true \
+  -p task_planned_max_z_m:=4.0 \
+  -p task_path_point_tolerance_m:=0.20
+```
+
+The confirmation parameters above apply **only to the previously checked
+Gazebo SITL setup**. They are not a way to bypass failed preflight checks.
+With dynamic start disabled (the default), the drone must begin close to WP1
+(approximately 0.45 m in horizontal distance).
+
+### Optional: start the same mission from another ground position
+
+Recent versions of the executor include an **opt-in dynamic start**: the UAV
+first takes off vertically at its **current ground XY**, then A* plans a route
+to WP1, which is visited without performing a second takeoff. It then flies
+the remaining CSV mission. Use this only in the checked Gazebo configuration
+with the mapped area reachable and a **manually verified clear ascent column**.
+The vertical ascent itself is **not collision-checked by A***.
+
+Use this **complete command** in place of the preceding `ros2 run` command:
+
+```bash
+ros2 run mission_executor mission_executor_node --ros-args \
+  -p mission_file:=$HOME/LRS_Baculak_Rapcova/missions/exam_example.csv \
+  -p enable_task_flight:=true \
+  -p task_flight_confirmed:=true \
+  -p task_slow_sitl_telemetry:=true \
+  -p enable_task_planned_flight:=true \
+  -p task_planner_frame_confirmed:=true \
+  -p task_planned_max_z_m:=4.0 \
+  -p task_path_point_tolerance_m:=0.20 \
+  -p enable_dynamic_start:=true \
+  -p dynamic_start_clearance_confirmed:=true
+```
+
+The dynamic-start flags exist only in the newer implementation. Check the
+source before running this command after changing Git branches:
+
+```bash
+grep -n 'DYNAMIC START' src/mission_executor/src/mission_executor_node.cpp
+```
+
+**Dynamic start is not an airborne restart:** stopping `mission_executor_node`
+does not stop/reset ArduPilot. After `LAND -> DONE`, the next ground-start run
+requires `ON_GROUND`, `DISARMED`, fresh telemetry, and a clear ascent area.
+Never disarm an airborne UAV to reset the test.
+
+### Non-flying CSV check and troubleshooting
+
+For validation **without issuing flight commands**, use:
+
+```bash
+ros2 run mission_executor mission_executor_node --ros-args \
+  -p mission_file:=$HOME/LRS_Baculak_Rapcova/missions/exam_example.csv \
+  -p enable_task_sequence_check:=true
+```
+
+A successful integrated flight ends with:
+
+```text
+LAND verified: ON_GROUND and DISARMED.
+State transition: LAND -> DONE
+```
+
+If the executor reports `A1.2 preflight blocked`, verify `armed: false`,
+`landed_state: 1`, current `/mavros/state`, pose/velocity message age/rate,
+and the extended-state interval above. A new run is intentionally blocked if
+the UAV is still flying or armed. If the node stays in `ARM`, check that you
+are executing the binary rebuilt from the expected source and workspace:
+
+```bash
+ros2 pkg prefix mission_executor
+```
+
+In this Gazebo/PCD configuration, the verified CSV/map to MAVROS ENU mapping is
+`(x_enu, y_enu, z_enu) = (-y_map, x_map, z_map)`. This is a setup-specific
+conversion, not a general TF transform. Planned-flight mode stops on A*
+failure rather than silently switching to an obstacle-crossing straight line.
+The earlier seven-waypoint example was completed in Gazebo SITL (including
+`yaw180`, `yaw90`, `landtakeoff` and final `LAND -> DONE`). Dynamic start and
+repeat flights should be recorded and verified against the **actual Git commit**
+being tested before describing them as fully accepted.
+
 ## Some interesting points for global planner:
 
 1.262; 6.6042; 4.8463 - over first regal
