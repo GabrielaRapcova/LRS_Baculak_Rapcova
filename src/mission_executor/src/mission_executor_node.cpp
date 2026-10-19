@@ -58,8 +58,10 @@ public:
         this->declare_parameter<double>("task_planned_max_z_m", 4.0);
         this->declare_parameter<double>("task_ground_wait_s", 3.0);
         this->declare_parameter<double>("task_max_direct_leg_m", 1.25);
+        this->declare_parameter<bool>("enable_dynamic_start", false);
+        this->declare_parameter<bool>("dynamic_start_clearance_confirmed", false);
 
-        const bool task_sequence_check = this->get_parameter("enable_task_sequence_check").as_bool();
+        task_sequence_check_ = this->get_parameter("enable_task_sequence_check").as_bool();
         task_flight_enabled_ = this->get_parameter("enable_task_flight").as_bool();
         task_slow_sitl_telemetry_ = this->get_parameter("task_slow_sitl_telemetry").as_bool();
         enable_task_planned_flight_ = this->get_parameter("enable_task_planned_flight").as_bool();
@@ -69,8 +71,11 @@ public:
         task_max_direct_leg_m_ = this->get_parameter("task_max_direct_leg_m").as_double();
         const bool task_flight_confirmed = this->get_parameter("task_flight_confirmed").as_bool();
         const bool frame_confirmed = this->get_parameter("task_planner_frame_confirmed").as_bool();
+        enable_dynamic_start_ = this->get_parameter("enable_dynamic_start").as_bool();
+        const bool clearance_confirmed =
+            this->get_parameter("dynamic_start_clearance_confirmed").as_bool();
 
-        if (task_flight_enabled_ == task_sequence_check) {
+        if (task_flight_enabled_ == task_sequence_check_) {
             throw std::runtime_error(
                 "Choose exactly one: enable_task_flight OR enable_task_sequence_check.");
         }
@@ -89,6 +94,22 @@ public:
                 "A* FLIGHT DENIED: need enable_task_flight, "
                 "task_flight_confirmed, and independently verified "
                 "task_planner_frame_confirmed=true. Not for real UAV.");
+        }
+        if (enable_dynamic_start_ &&
+            (!task_flight_enabled_ || !enable_task_planned_flight_ ||
+             !frame_confirmed || !clearance_confirmed)) {
+            throw std::runtime_error(
+                "DYNAMIC START DENIED: requires confirmed SITL task flight, "
+                "verified map/MAVROS transform, A* planner and explicit "
+                "dynamic_start_clearance_confirmed=true. "
+                "Takeoff column must be manually inspected and clear.");
+        }
+        if (enable_dynamic_start_) {
+            RCLCPP_WARN(this->get_logger(),
+                "DYNAMIC START (Gazebo SITL only): first ascent is VERTICAL "
+                "at measured XY; after takeoff A* must reach CSV WP1 before WP2. "
+                "The vertical takeoff column is NOT collision-checked by A*. "
+                "Operator must verify clearance and supervise flight.");
         }
         if (!std::isfinite(task_path_point_tolerance_m_) ||
             task_path_point_tolerance_m_ < 0.10 ||
@@ -184,7 +205,7 @@ public:
         mavros_setpoint_pub_ = this->create_publisher<mavros_msgs::msg::PositionTarget>(
             "/mavros/setpoint_raw/local", 10);
 
-        if (task_sequence_check) {
+        if (task_sequence_check_) {
             RCLCPP_WARN(this->get_logger(),
                 "TASK SEQUENCE CHECK COMPLETE. No GUIDED/ARM/TAKEOFF/LAND "
                 "requests, no setpoints, no state-machine execution.");
@@ -213,9 +234,14 @@ private:
     PositionController position_controller_;
     std::atomic<std::size_t> current_waypoint_index_{0};
 
+    bool task_sequence_check_ = false;
     bool task_flight_enabled_ = false;
     bool task_slow_sitl_telemetry_ = false;
     bool enable_task_planned_flight_ = false;
+    bool enable_dynamic_start_ = false;
+    std::atomic<bool> dynamic_wp1_nav_active_{false};
+    bool dynamic_initial_takeoff_ = false;  
+    geometry_msgs::msg::Point takeoff_anchor_{}; 
     double task_path_point_tolerance_m_ = 0.20;
     double task_planned_max_z_m_ = 4.0;
     double task_ground_wait_s_ = 3.0;
@@ -273,7 +299,8 @@ private:
     static constexpr auto MAVROS_TIMEOUT = 10s;
     static constexpr auto MODE_TIMEOUT = 10s;
     static constexpr auto ARM_TIMEOUT = 12s;
-    static constexpr auto MOTION_TIMEOUT = 2500ms;
+    static constexpr auto POSE_TIMEOUT = 2500ms;
+    static constexpr auto VELOCITY_TIMEOUT = 2500ms;
 
     std::mutex pose_mutex_;
     geometry_msgs::msg::PoseStamped current_pose_;
@@ -710,13 +737,16 @@ private:
 
     bool prepare_task_leg(std::size_t index)
     {
-        if (index == 0 || index >= mission_.size()) return false;
+        if (index >= mission_.size() ||
+            (index == 0 && !dynamic_wp1_nav_active_.load())) return false;
         geometry_msgs::msg::PoseStamped pose;
         geometry_msgs::msg::TwistStamped velocity;
         if (!task_snapshot(pose, velocity)) return false;
         double current_yaw = 0.0;
         if (!yaw_from_enu_pose(pose, current_yaw)) return false;
-        auto from = position_controller_.gazebo_to_enu(mission_[index - 1]);
+
+        auto from = index == 0 ? pose.pose.position :
+            position_controller_.gazebo_to_enu(mission_[index - 1]);
         auto to = position_controller_.gazebo_to_enu(mission_[index]);
         if (enable_task_planned_flight_) {
             bool final_point;
@@ -920,7 +950,8 @@ private:
         }
         const auto goal = position_controller_.gazebo_to_enu(mission_[idx]);
         const auto &p = pose.pose.position;
-        const double xy_error = std::hypot(p.x - goal.x, p.y - goal.y);
+        const auto &ascent_xy = dynamic_initial_takeoff_ ? takeoff_anchor_ : goal;
+        const double xy_error = std::hypot(p.x - ascent_xy.x, p.y - ascent_xy.y);
         if (!task_takeoff_sent_) {
             if (now - task_operation_started_ > 20s) {
                 RCLCPP_ERROR(this->get_logger(),
@@ -988,9 +1019,15 @@ private:
         if (task_stable_for(ready, now, 1s)) {
             RCLCPP_INFO(this->get_logger(),
                 "TAKEOFF verified: airborne and target height stable. "
-                "WP%zu complete.", idx + 1);
-            current_waypoint_index_.store(idx + 1);
+                "WP%zu %s.", idx + 1,
+                dynamic_initial_takeoff_ ? "ascent complete, next A* to WP1" : "complete");
             position_controller_.reset_arrival();
+            if (dynamic_initial_takeoff_) {
+                dynamic_wp1_nav_active_.store(true);
+                dynamic_initial_takeoff_ = false;
+            } else {
+                current_waypoint_index_.store(idx + 1);
+            }
             change_state(MissionState::NAVIGATE);
         }
     }
@@ -1044,13 +1081,14 @@ private:
         }
         if (!task_land_response_received_ || !task_land_accepted_) return;
         bool ground = false;
+        bool ext_fresh = false;
         {
             std::lock_guard<std::mutex> lock(mavros_mutex_);
-            ground = extended_state_received_ &&
+            ext_fresh = extended_state_received_ &&
                 now - last_extended_state_time_ <=
-                    (task_slow_sitl_telemetry_ ? 4s : 2s) &&
-                landed_state_ ==
-                    mavros_msgs::msg::ExtendedState::LANDED_STATE_ON_GROUND;
+                    (task_slow_sitl_telemetry_ ? 4s : 2s);
+            ground = ext_fresh && landed_state_ ==
+                mavros_msgs::msg::ExtendedState::LANDED_STATE_ON_GROUND;
         }
         if (!ground) {
             task_stable_started_ = false;
@@ -1251,9 +1289,9 @@ private:
             std::lock_guard<std::mutex> lock(pose_mutex_);
             const auto now = std::chrono::steady_clock::now();
             pose_ok = pose_received_ &&
-                now - last_pose_time_ <= MOTION_TIMEOUT;
+                now - last_pose_time_ <= POSE_TIMEOUT;
             velocity_ok = velocity_received_ &&
-                now - last_velocity_time_ <= MOTION_TIMEOUT;
+                now - last_velocity_time_ <= VELOCITY_TIMEOUT;
             if (pose_ok) {
                 pose_snapshot = current_pose_;
             }
@@ -1338,6 +1376,7 @@ private:
                 arm_request_sent_ = false;
                 arm_response_received_ = false;
                 arm_request_accepted_ = false;
+                arm_request_time_ = std::chrono::steady_clock::now();
             }
             if (new_state == MissionState::TAKEOFF) {
                 task_operation_started_ = std::chrono::steady_clock::now();
@@ -1385,56 +1424,61 @@ private:
         if (index >= mission_.size()) return;
         debug_setpoint_pub_->publish(create_position_target());
 
-        bool state_ok = false;
+        bool connected = false;
         bool armed = false;
+        bool state_fresh = false;
         std::string mode;
         {
             std::lock_guard<std::mutex> lock(mavros_mutex_);
-            state_ok = mavros_state_received_ && mavros_connected_ &&
-                (std::chrono::steady_clock::now() - last_mavros_state_time_
-                 <= MAVROS_TIMEOUT);
+            connected = mavros_state_received_ && mavros_connected_;
             armed = mavros_armed_;
             mode = mavros_mode_;
+            state_fresh = mavros_state_received_ &&
+                (std::chrono::steady_clock::now() - last_mavros_state_time_
+                 <= MAVROS_TIMEOUT);
         }
-        if (!task_navigation_active_.load() || !state_ok || !armed ||
-            mode != "GUIDED" || !task_telemetry_ok(false) || !task_airborne())
+
+            if (!task_navigation_active_.load() || !connected ||
+                !state_fresh || !armed || mode != "GUIDED" ||
+                !task_telemetry_ok(false) || !task_airborne()) return;
+            const auto goal_idx = current_waypoint_index_.load();
+            if (goal_idx >= mission_.size() ||
+                (goal_idx == 0 && !dynamic_wp1_nav_active_.load())) return;
+            TaskHeadingPhase phase;
+            double commanded_yaw;
+            geometry_msgs::msg::Point hold_position;
+            {
+                std::lock_guard<std::mutex> lock(task_heading_mutex_);
+                phase = task_heading_phase_;
+                commanded_yaw = task_heading_target_rad_;
+                hold_position = task_heading_hold_position_;
+            }
+            if (phase == TaskHeadingPhase::PREPARE) {
+                if (!enable_task_planned_flight_) return;
+                geometry_msgs::msg::PoseStamped p;
+                geometry_msgs::msg::TwistStamped v;
+                double current_yaw = 0.0;
+                if (!task_snapshot(p, v) || !yaw_from_enu_pose(p, current_yaw)) return;
+                auto hold_target = create_position_target();
+                hold_target.position = p.pose.position;
+                hold_target.yaw = static_cast<float>(current_yaw);
+                mavros_setpoint_pub_->publish(hold_target);
+                return;
+            }
+            auto target = create_position_target();
+            if (phase == TaskHeadingPhase::FLY && enable_task_planned_flight_) {
+                bool final_point;
+                std::size_t point_index, point_count;
+                if (!task_route_target(target.position, final_point,
+                                       point_index, point_count)) return;
+            } else {
+                target.position = phase == TaskHeadingPhase::FLY ?
+                    position_controller_.gazebo_to_enu(mission_[goal_idx]) :
+                    hold_position;
+            }
+            target.yaw = static_cast<float>(commanded_yaw);
+            mavros_setpoint_pub_->publish(target);
             return;
-        const auto goal_idx = current_waypoint_index_.load();
-        if (goal_idx == 0 || goal_idx >= mission_.size()) return;
-        TaskHeadingPhase phase;
-        double commanded_yaw;
-        geometry_msgs::msg::Point hold_position;
-        {
-            std::lock_guard<std::mutex> lock(task_heading_mutex_);
-            phase = task_heading_phase_;
-            commanded_yaw = task_heading_target_rad_;
-            hold_position = task_heading_hold_position_;
-        }
-        if (phase == TaskHeadingPhase::PREPARE) {
-            if (!enable_task_planned_flight_) return;
-            geometry_msgs::msg::PoseStamped p;
-            geometry_msgs::msg::TwistStamped v;
-            double current_yaw = 0.0;
-            if (!task_snapshot(p, v) || !yaw_from_enu_pose(p, current_yaw)) return;
-            auto hold_target = create_position_target();
-            hold_target.position = p.pose.position;
-            hold_target.yaw = static_cast<float>(current_yaw);
-            mavros_setpoint_pub_->publish(hold_target);
-            return;
-        }
-        auto target = create_position_target();
-        if (phase == TaskHeadingPhase::FLY && enable_task_planned_flight_) {
-            bool final_point;
-            std::size_t point_index, point_count;
-            if (!task_route_target(target.position, final_point,
-                                   point_index, point_count)) return;
-        } else {
-            target.position = phase == TaskHeadingPhase::FLY ?
-                position_controller_.gazebo_to_enu(mission_[goal_idx]) :
-                hold_position;
-        }
-        target.yaw = static_cast<float>(commanded_yaw);
-        mavros_setpoint_pub_->publish(target);
 
     }
 
@@ -1535,7 +1579,9 @@ private:
             armed = mavros_armed_;
             state_received = mavros_state_received_;
             mode = mavros_mode_;
-            last_state_time = last_mavros_state_time_;
+            if (state_received) {
+                last_state_time = last_mavros_state_time_;
+            }
         }
         const auto now = std::chrono::steady_clock::now();
         if (state_received &&
@@ -1637,11 +1683,41 @@ private:
                     const auto target =
                         position_controller_.gazebo_to_enu(mission_[index]);
                     const auto &p = check_pose.pose.position;
-                    if (std::hypot(p.x - target.x, p.y - target.y) > 0.45) {
+                    const double distance = std::hypot(p.x - target.x, p.y - target.y);
+                    const bool remote_start = index == 0 && distance > 0.45;
+                    if (remote_start && !enable_dynamic_start_) {
+                        RCLCPP_ERROR(this->get_logger(),
+                            "A1.2.3 ARM refused: not above planned takeoff XY "
+                            "(%.2f m). Dynamic start is disabled.", distance);
+                        change_state(MissionState::ERROR);
+                        break;
+                    }
+                    if (distance > 0.45 && !remote_start) {
                         RCLCPP_ERROR(this->get_logger(),
                             "A1.2.3 ARM refused: not above planned takeoff XY.");
                         change_state(MissionState::ERROR);
                         break;
+                    }
+                    if (remote_start) {
+                        if (!planner_client_ || !planner_client_->action_server_is_ready()) {
+                            if (now - arm_request_time_ > 30s) {
+                                RCLCPP_ERROR(this->get_logger(),
+                                    "DYNAMIC START: planner unavailable for 30s. "
+                                    "No ARM or TAKEOFF command sent.");
+                                change_state(MissionState::ERROR);
+                                break;
+                            }
+                            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(),
+                                3000, "DYNAMIC START: waiting for A* planner before ARM.");
+                            break;
+                        }
+                        dynamic_initial_takeoff_ = true;
+                        takeoff_anchor_ = p;
+                        RCLCPP_WARN(this->get_logger(),
+                            "DYNAMIC START: initial ground ENU XY=(%.2f, %.2f), "
+                            "%.2fm from WP1. Vertical ascent to z=%.2f, "
+                            "then A* navigation to WP1. Ensure clear airspace!",
+                            p.x, p.y, distance, target.z);
                     }
                     request_arm();
                 }
@@ -1685,7 +1761,7 @@ private:
                     break;
                 }
                 if (enable_task_planned_flight_ && !task_route_ready(now)) {
-                    break; 
+                    break;  
                 }
                 const auto phase = heading_phase();
                 if (phase == TaskHeadingPhase::PREPARE) {
@@ -1737,6 +1813,15 @@ private:
                 }
                 if (process_current_waypoint()) {
                     position_controller_.reset_arrival();
+                    if (i == 0 && dynamic_wp1_nav_active_.load()) {
+                        dynamic_wp1_nav_active_.store(false);
+                        current_waypoint_index_.store(1);
+                        reset_heading_for_next_leg();
+                        reset_task_route();
+                        RCLCPP_INFO(this->get_logger(),
+                            "DYNAMIC START: reached WP1; continue to WP2.");
+                        break;
+                    }
                     const auto task = mission_[i].task;
                     if (task == TaskType::LAND ||
                         task == TaskType::LANDTAKEOFF) {
