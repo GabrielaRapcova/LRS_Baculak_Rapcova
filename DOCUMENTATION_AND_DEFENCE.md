@@ -201,8 +201,8 @@ ENU degrees. The prototype map-to-MAVROS transform is a fixed rotation
 This matches the current simulator convention and must be verified independently
 for another world or vehicle.
 
-The indoor launch configures the existing MAVROS local-position plugin to label
-telemetry `mavros_local`, then publishes a zero-translation, −90° yaw transform
+Configure MAVROS local-position telemetry to use `mavros_local`. The indoor
+launch publishes a zero-translation, −90° yaw transform
 from `map` to `mavros_local`. In RViz, Fixed Frame `map` therefore aligns odometry
 with the plan. The executor still converts target coordinates explicitly; TF is
 not a second rotation of the flight commands. Start MAVROS separately with the
@@ -212,8 +212,7 @@ An optional dynamic start performs a vertical ascent at measured ground XY, then
 plans to CSV waypoint 1 before continuing the mission. It is not an airborne
 restart, and A* does not check the vertical ascent column. It requires explicit
 `enable_dynamic_start` and `dynamic_start_clearance_confirmed` parameters in
-addition to confirmed planned flight. The default launch uses the normal WP1
-start. A previously completed seven-waypoint simulation included yaw tasks,
+addition to confirmed planned flight. The indoor launch enables dynamic start. A previously completed seven-waypoint simulation included yaw tasks,
 landing/relaunch and final ground-confirmed disarm; repeat evidence should identify
 the exact revision and configuration used.
 
@@ -357,27 +356,45 @@ ros2 launch voxel_costmap costmap_launch.py
 ros2 launch astar_planner planner_launch.py
 ```
 
-The mission is [missions/exam_example.csv](missions/exam_example.csv). With MAVROS
-connected and the UAV on ground/disarmed, preview its task sequence and frame setup:
+The mission is `/home/user/LRS-URK/missions/exam_example.csv`. With MAVROS
+connected and the UAV on ground/disarmed, run the executor manually from `ros2_ws`:
 
 ```bash
-ros2 launch mission_executor indoor.launch.py \
-  mission_file:="$PWD/missions/exam_example.csv"
+ros2 run mission_executor mission_executor_node --ros-args \
+  --params-file "$PWD/src/mission_executor/config/mission_executor.yaml" \
+  -p mission_file:=/home/user/LRS-URK/missions/exam_example.csv \
+  -p mavros_frame:=mavros_local \
+  -p enable_task_sequence_check:=false \
+  -p enable_task_flight:=true \
+  -p task_flight_confirmed:=true \
+  -p task_slow_sitl_telemetry:=true \
+  -p enable_task_planned_flight:=true \
+  -p task_planner_frame_confirmed:=true \
+  -p task_planned_max_z_m:=4.0 \
+  -p task_path_point_tolerance_m:=0.50 \
+  -p enable_dynamic_start:=true \
+  -p dynamic_start_clearance_confirmed:=true
 ```
 
-This launch does not start MAVROS. It configures its local frame parameters before
-starting the executor and publishes the RViz alignment transform. No flight is
-commanded in preview mode. After verifying frames and the route, restart it with:
+For RViz during a manual run, publish the static transform in another terminal:
 
 ```bash
-ros2 launch mission_executor indoor.launch.py \
-  mission_file:="$PWD/missions/exam_example.csv" \
-  enable_flight:=true \
-  task_flight_confirmed:=true \
-  task_planner_frame_confirmed:=true
+ros2 run tf2_ros static_transform_publisher \
+  --x 0 --y 0 --z 0 \
+  --yaw -1.57079632679 --pitch 0 --roll 0 \
+  --frame-id map --child-frame-id mavros_local
 ```
 
-For slow simulation, add `task_slow_sitl_telemetry:=true`. If landed-state telemetry
+Alternatively, the simplified launch starts both nodes with the same mission settings:
+
+```bash
+ros2 launch mission_executor indoor.launch.py
+```
+
+It starts the mission with flight enabled and dynamic start enabled. It does not
+start or configure MAVROS; local-position telemetry must already use `mavros_local`.
+
+If landed-state telemetry
 is missing, request it after FCU connection:
 
 ```bash
@@ -386,10 +403,8 @@ ros2 service call /mavros/set_message_interval mavros_msgs/srv/MessageInterval \
 ```
 
 Use RViz Fixed Frame `map`, `/plan`, `/map_cloud`, `/costmap_cloud` and
-`/mavros/local_position/odom`. Initial pose must be close to the CSV takeoff point
-for the normal launch. Direct node runs use `mavros_frame=map` by default; after
-using the launch's `mavros_local` settings, either use that launch again or explicitly
-pass the matching frame parameter. Indoor automatic error-landing is an opt-in
+`/mavros/local_position/odom`. The static transform assumes coincident origins
+and the executor's fixed map-to-local rotation. Indoor automatic error-landing is an opt-in
 feature, disabled by default; it requires separate clearance confirmation.
 
 ### Outdoor mission
