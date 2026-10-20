@@ -201,8 +201,8 @@ ENU degrees. The prototype map-to-MAVROS transform is a fixed rotation
 This matches the current simulator convention and must be verified independently
 for another world or vehicle.
 
-Configure MAVROS local-position telemetry to use `mavros_local`. The indoor
-launch publishes a zero-translation, −90° yaw transform
+Configure MAVROS local-position telemetry to use `mavros_local`. Run the static
+TF publisher below to publish a zero-translation, −90° yaw transform
 from `map` to `mavros_local`. In RViz, Fixed Frame `map` therefore aligns odometry
 with the plan. The executor still converts target coordinates explicitly; TF is
 not a second rotation of the flight commands. Start MAVROS separately with the
@@ -212,7 +212,8 @@ An optional dynamic start performs a vertical ascent at measured ground XY, then
 plans to CSV waypoint 1 before continuing the mission. It is not an airborne
 restart, and A* does not check the vertical ascent column. It requires explicit
 `enable_dynamic_start` and `dynamic_start_clearance_confirmed` parameters in
-addition to confirmed planned flight. The indoor launch enables dynamic start. A previously completed seven-waypoint simulation included yaw tasks,
+addition to confirmed planned flight. The manual command below enables dynamic
+start. A previously completed seven-waypoint simulation included yaw tasks,
 landing/relaunch and final ground-confirmed disarm; repeat evidence should identify
 the exact revision and configuration used.
 
@@ -384,15 +385,6 @@ ros2 run tf2_ros static_transform_publisher \
   --yaw -1.57079632679 --pitch 0 --roll 0 \
   --frame-id map --child-frame-id mavros_local
 ```
-
-Alternatively, the simplified launch starts both nodes with the same mission settings:
-
-```bash
-ros2 launch mission_executor indoor.launch.py
-```
-
-It starts the mission with flight enabled and dynamic start enabled. It does not
-start or configure MAVROS; local-position telemetry must already use `mavros_local`.
 
 If landed-state telemetry
 is missing, request it after FCU connection:
