@@ -236,7 +236,7 @@ def run_scenario(scenario):
     phase_timeout = 45.0 if full_mission else 6.0
     command = [
         'ros2', 'run', 'mission_executor', 'outdoor_mission_node',
-        '--ros-args',
+        '--ros-args', '-p', 'coordinate_mode:=enu',
         '-p', 'enable_flight:=true', '-p', 'gps_ready_duration:=0.2',
         '-p', f'execute_square:={str(run_square).lower()}',
         '-p', f'execute_figure_eight:={str(full_mission).lower()}',

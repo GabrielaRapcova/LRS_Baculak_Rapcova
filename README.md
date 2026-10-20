@@ -467,6 +467,50 @@ must not be mixed with the apt 3.x engine. Build future mission packages with th
 source overlay active as their underlay.
 
 
+## Indoor mission launch (A1.2)
+
+Keep Gazebo/SITL running and start MAVROS with `scripts/run_mavros.sh` from the repo
+root. The indoor launch configures the existing MAVROS instance; it does not start
+or stop it. Mapper, costmap and planner are started separately.
+From `ros2_ws`, after sourcing ROS and `install/setup.bash`:
+
+```bash
+# Check the CSV sequence and visualize telemetry; no mission flight commands.
+ros2 launch mission_executor indoor.launch.py \
+  mission_file:="$PWD/missions/exam_example.csv"
+
+# Execute the A*-planned indoor mission in SITL after checking frame alignment.
+ros2 launch mission_executor indoor.launch.py \
+  mission_file:="$PWD/missions/exam_example.csv" \
+  enable_flight:=true \
+  task_flight_confirmed:=true \
+  task_planner_frame_confirmed:=true
+```
+
+Set RViz Fixed Frame to `map`; display `/plan` and `/mavros/local_position/odom`.
+MAVROS local telemetry is labelled `mavros_local`, with TF to `base_link`. The launch
+publishes `map` → `mavros_local` at yaw −90°, zero translation, matching the current
+executor's fixed `(x_local, y_local, z_local) = (-y_map, x_map, z_map)` conversion.
+Verify a known position before flight; another origin/world requires revisiting
+both the transform and executor conversion. This change labels frames correctly;
+it does not rotate the MAVROS telemetry values or change flight targets.
+
+The launch waits up to 10 seconds for `/mavros/local_position` parameter services,
+then applies `config/indoor_mavros.yaml` before starting the executor. A rejected
+or timed-out configuration stops launch. Frame settings remain on MAVROS until
+changed or MAVROS is restarted. Restart/reconfigure it before switching to an
+outdoor setup that expects different frame labels. The default `mavros_frame=map`
+is retained for direct executor runs outside this launch. Indoor freshness checks
+still use wall time; `task_slow_sitl_telemetry:=true` selects the existing slow-SITL
+profile for flight. No clock bridge or timing-policy change is included here.
+Landed-state telemetry must be present; the indoor node does not request it
+automatically. If missing, request it once:
+
+```bash
+ros2 service call /mavros/set_message_interval mavros_msgs/srv/MessageInterval \
+  '{message_id: 245, message_rate: 2.0}'
+```
+
 ## Outdoor mission design (A1.3)
 
 Requirements, interfaces, coordinate conventions, state machine and validation
@@ -475,3 +519,7 @@ Geometry utilities, default telemetry diagnostics, takeoff/return checks and an
 explicitly enabled full outdoor mission are implemented: square with POI yaw,
 centre alignment, one figure-eight lap with tangent yaw, return and landing.
 See the specification for launch, abort and test commands.
+
+Outdoor run recordings: [Google Drive folder](https://drive.google.com/drive/folders/18p4L7dQqtNPm-RtJtOg_cNxpsdhLNMUm?usp=sharing).
+GPS and magnetometer noise tests are still pending; these recordings do not establish
+robustness to sensor noise.

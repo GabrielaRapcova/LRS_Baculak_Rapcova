@@ -7,6 +7,53 @@ and recordings remain. Requirements:
 Initial target: ROS 2 Jazzy, MAVROS and ArduPilot SITL in
 `../worlds/fei_lrs_outdoor.world`.
 
+## GPS or ENU mission coordinates
+
+`config/outdoor.yaml` defaults to `coordinate_mode: gps`. Set four ordered
+`square_corner_N_gps: [latitude, longitude]` arrays and
+`poi_gps: [latitude, longitude]` in WGS84 decimal degrees. The node visits corners
+1 → 2 → 3 → 4 → 1. The explicit GPS POI determines square-facing yaw and the
+figure-eight centre; it is not inferred from the corners.
+
+The supplied coordinates describe the existing 5 m square and central POI at the
+outdoor-world example home **48.15144444, 17.07375000**. Use the matching SITL home:
+
+```bash
+HOME_LOCATION=48.15144444,17.07375000,150,0 scripts/run_sitl.sh
+```
+
+Check/edit these absolute coordinates before launching elsewhere. All flight
+heights remain 5 m above the captured launch height; GPS arrays contain no altitude.
+Corners and POI are converted once through the captured GeographicLib reference.
+The mission envelope includes the actual configured corners and figure-eight;
+coordinates outside the permitted envelope block readiness rather than falling
+back to an ENU square. The operator must supply an ordered square of the assignment's
+required dimensions; GPS mode follows the supplied corners, not `square_side`.
+
+To retain the previous home-relative layout, set `coordinate_mode: enu` in YAML.
+That mode uses `poi_east`, `poi_north` and `square_side`; GPS values are unused.
+Both modes use the same local setpoints, interpolation, corner stops and yaw policy.
+Neither mode changes the MAVROS ENU/NED conversion.
+
+## MAVROS interface prefix
+
+The outdoor node's `mavros_prefix` parameter selects the absolute namespace for
+all MAVROS telemetry, flight setpoints and command/stream-configuration services.
+The default is `/mavros`; for another vehicle use, for example:
+
+```bash
+ros2 launch mission_executor outdoor_sim.launch.py mavros_prefix:=/drone01
+```
+
+The common and real-placeholder launches accept the same argument. This selects
+an existing MAVROS interface; it does not start or rename MAVROS. Flight remains
+disabled by default, and real-flight setup is still pending.
+Direct node runs can set `-p mavros_prefix:=/drone01` or load `config/outdoor.yaml`.
+Launch arguments override the YAML prefix. A missing leading slash is added and
+trailing slashes are removed; an empty or root-only prefix is rejected. Mission
+interfaces such as `/outdoor_mission/state`, diagnostics and abort retain their
+names. The indoor executor and its launch are unaffected.
+
 ## 1. Mission and responsibility
 
 Take off to **5 m above launch**, fly a **5 m square** while facing a ground POI,

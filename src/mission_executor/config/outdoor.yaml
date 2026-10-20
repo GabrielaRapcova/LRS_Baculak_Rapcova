@@ -1,10 +1,22 @@
 outdoor_mission_node:
   ros__parameters:
+    mavros_prefix: /mavros
     # Default mode remains telemetry-only. Disable square for a takeoff/return check.
     enable_flight: false
     execute_square: true
     # Disable to retain square-only flight; requires execute_square=true.
     execute_figure_eight: true
+    # gps: four ordered [latitude, longitude] corners; returns to corner 1.
+    # Example: 5 m square at outdoor home 48.15144444, 17.07375000.
+    # POI also defines the figure-eight centre. Altitude stays launch-relative.
+    coordinate_mode: gps
+    poi_gps: [48.150868185, 17.072763300]
+
+    square_corner_1_gps: [48.15089067, 17.07272970]
+    square_corner_2_gps: [48.15089067, 17.07279690]
+    square_corner_3_gps: [48.15084570, 17.07279690]
+    square_corner_4_gps: [48.15084570, 17.07272970]
+    # Used only in enu mode: square centred at this offset from mission origin.
     poi_east: 2.5
     poi_north: 2.5
     flight_altitude: 5.0

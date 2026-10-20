@@ -60,6 +60,7 @@ subscription = node.create_subscription(
     lambda msg: states.append(msg.data), retained)
 process = subprocess.Popen([
     'ros2', 'run', 'mission_executor', 'outdoor_mission_node', '--ros-args',
+    '-p', 'coordinate_mode:=enu',
     '-p', 'use_sim_time:=true', '-p', 'gps_ready_duration:=0.6',
     '-p', 'telemetry_timeout:=0.4', '-p', 'clock_stall_timeout:=1.0'],
     start_new_session=True)

@@ -12,6 +12,7 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     """Reuse the common mission launch and keep flight disabled by default."""
     return LaunchDescription([
+        DeclareLaunchArgument('mavros_prefix', default_value='/mavros'),
         DeclareLaunchArgument('enable_flight', default_value='false'),
         DeclareLaunchArgument('execute_square', default_value='true'),
         DeclareLaunchArgument('execute_figure_eight', default_value='true'),
@@ -29,6 +30,7 @@ def generate_launch_description():
                 FindPackageShare('mission_executor'),
                 'launch', 'outdoor_launch.py'])),
             launch_arguments={
+                'mavros_prefix': LaunchConfiguration('mavros_prefix'),
                 'enable_flight': LaunchConfiguration('enable_flight'),
                 'execute_square': LaunchConfiguration('execute_square'),
                 'execute_figure_eight':
