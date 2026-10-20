@@ -1,9 +1,13 @@
+> **Archived development document.** Progress notes, examples and TODOs below
+> describe earlier revisions and are not the current acceptance checklist.
+> See [DOCUMENTATION_AND_DEFENCE.md](../../DOCUMENTATION_AND_DEFENCE.md).
+
 # A1.3 outdoor mission specification
 
 Status: the complete outdoor sequence is implemented: takeoff, square, centre
 alignment, one figure-eight lap, return and landing. Full-flight SITL acceptance
 and recordings remain. Requirements:
-[course A1.3](../assignments/assignment1/03_outdoor_gps_mission.md).
+[course A1.3](../../../assignments/assignment1/03_outdoor_gps_mission.md).
 Initial target: ROS 2 Jazzy, MAVROS and ArduPilot SITL in
 `../worlds/fei_lrs_outdoor.world`.
 

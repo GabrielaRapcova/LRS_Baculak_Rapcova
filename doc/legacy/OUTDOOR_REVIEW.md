@@ -1,3 +1,7 @@
+> **Archived development document.** Progress notes, examples and TODOs below
+> describe earlier revisions and are not the current acceptance checklist.
+> See [DOCUMENTATION_AND_DEFENCE.md](../../DOCUMENTATION_AND_DEFENCE.md).
+
 # Outdoor mission review
 
 Living list: append topics; mark resolved only when the decision/evidence is recorded.
