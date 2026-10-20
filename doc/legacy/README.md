@@ -1,3 +1,7 @@
+> **Archived development document.** Progress notes, examples and TODOs below
+> describe earlier revisions and are not the current acceptance checklist.
+> See [DOCUMENTATION_AND_DEFENCE.md](../../DOCUMENTATION_AND_DEFENCE.md).
+
 # ROS 2 UAV navigation
 
 Target architecture: [system overview](README_mapper_planner_overview.md).
@@ -29,7 +33,7 @@ ros2 launch mapper mapper_launch.py map_file:=/absolute/path/to/map.pcd
 
 For the course checkout, the map is `../maps/FEI_LRS_PCD/map.pcd` relative to
 this workspace. Pass its absolute path. Override `params_file` to use your own
-YAML; the default is [params.yaml](src/mapper/config/params.yaml).
+YAML; the default is [params.yaml](../../src/mapper/config/params.yaml).
 
 - `/map`: retained reliable `VoxelMap` snapshot, periodically republished.
 - `/map_cloud`: retained `PointCloud2` of occupied voxel centers; display it in
@@ -170,7 +174,7 @@ The node accepts one active request at a time and rejects concurrent requests.
 Search runs in a managed worker so costmap reception and cancellation remain
 responsive. Feedback reports expansions every 256 nodes. Configure time, expansion,
 discovered-node and segment-traversal limits in
-[astar.yaml](src/astar_planner/config/astar.yaml), or override `params_file` at launch.
+[astar.yaml](../../src/astar_planner/config/astar.yaml), or override `params_file` at launch.
 Cancellation, invalid start/goal, missing map, no path and limit exhaustion return
 explicit statuses with empty paths. Parameters are read at startup.
 
@@ -305,7 +309,7 @@ ros2 action list -t
 
 ### Run the seven-waypoint mission (WP1 ground start)
 
-The example file is [`missions/exam_example.csv`](missions/exam_example.csv).
+The example file is [`missions/exam_example.csv`](../../missions/exam_example.csv).
 The first CSV task must be `takeoff` and the last `land`. Once the UAV is safely
 on the ground, disarmed, and the route/map/frame configuration has been checked,
 start the executor in **Terminal 7**:
@@ -414,9 +418,7 @@ being tested before describing them as fully accepted.
 4.3806; 9.1802; 2.2504 - left to first regal
 5.7076; 4.8771; 2.0405 - between regals
 
-# TODO:
--[ ] check the A* heuristic
--[ ] 
+Historical review note: review the A* heuristic rationale in the current documentation.
 
 ## FlexBE installation for A1.2
 

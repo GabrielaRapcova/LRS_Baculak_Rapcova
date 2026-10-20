@@ -2,9 +2,11 @@
 
 This document covers A1.1–A1.3 against the [A1.4 requirements](https://github.com/KocurMaros/LRS-URK/blob/f35c518df2eaf7ee4cca34d1afbeac0734df86f3/assignments/assignment1/04_documentation_and_defence.md).
 It describes the current implementation and separates automated checks from flight
-evidence. Full indoor flight validation, recordings and noisy-sensor tests remain
-TODOs. Outdoor simulation flights have been visually tested and accepted by the
-developer; this is not validation on a physical vehicle.
+evidence. Mission recordings are ready according to the developer; the outdoor
+recordings are linked in Section 8. Simulation acceptance is distinct from
+quantitative sensor-robustness testing and validation on a physical vehicle.
+This is the current documentation; earlier specifications and development notes
+are archived in [doc/legacy](doc/legacy/).
 
 ## 1. System design
 
@@ -112,16 +114,15 @@ incremental-update complexity, at the expense of processing time on larger maps.
 
 Current `costmap.yaml` values are **0.30 + 0.10 + 0.25 = 0.65 m blocked clearance**
 and **0.0 m soft width**. Thus the current configuration has no traversable soft
-inflation band. Older comments describing 0.9 m clearance plus 0.8 m soft width do
-not match these values. These settings are engineering starting values, not a
+inflation band. These settings are engineering starting values, not a
 measured vehicle-envelope justification. The costmap's 0.10 m position allowance
 also differs from the indoor controller's 0.15 m hard tolerance; reconcile this
 against observed tracking error before claiming a guaranteed clearance.
 
 Inflation is intended to close narrow gaps in the rack point cloud. No explicit
-solid-shelf filling is implemented. **TODO: visually inspect planned routes against
-Gazebo rack collision volumes and confirm that the configured clearance closes
-unsafe shelf gaps.** Point-cloud collision freedom alone does not establish this.
+solid-shelf filling is implemented. Shelf clearance remains the developer's visual
+evaluation against Gazebo collision volumes; point-cloud collision freedom alone
+does not establish that the configured clearance closes unsafe shelf gaps.
 
 ## 3. Planning and path post-processing
 
@@ -157,8 +158,8 @@ Historical real-map pipeline measurements recorded during development were:
 
 These are individual measurements on the development machine at 0.2 m resolution,
 with the earlier 0.5 m clearance / 0.8 m absolute outer-radius configuration.
-Inflation semantics and tuning have since changed. **TODO: repeat both routes with
-the submitted settings and record hardware, build type and repeated-run timing.**
+Inflation semantics and tuning have since changed. These results remain historical
+until repeated with submitted settings, hardware/build details and repeated-run timing.
 The action exposes planning time, expanded nodes and raw/refined point counts.
 
 ## 4. Indoor mission execution and heading
@@ -174,11 +175,11 @@ attitude and motor-control loops. A soft waypoint completes within **0.50 m** wi
 a stopping requirement. A hard waypoint requires **0.15 m** position error and speed
 at most **0.15 m/s**, continuously for **1 second**. These values distinguish
 pass-through points from deliberate task stops; they remain to be justified against
-measured flight error. They are currently constructor values rather than ROS
-parameters, so changing them for the defence requires rebuilding.
+measured flight error. They are configurable through `hard_tolerance_m`, `soft_tolerance_m`,
+`hard_speed_limit_mps` and `hard_stable_time_s`.
 
 The A* result is transformed to MAVROS local coordinates and each straight segment
-is resampled with spacing at most 0.35 m. Intermediate targets advance on proximity,
+is resampled with default spacing at most 0.50 m (`task_path_resample_spacing_m`). Intermediate targets advance on proximity,
 without a zero-speed or dwell requirement. The default distance threshold is 0.20 m;
 original line-of-sight bends use at most 0.10 m to reduce corner shortcuts. Final
 mission waypoints use the hard/soft arrival policy. Dense targets do not constitute
@@ -200,229 +201,21 @@ ENU degrees. The prototype map-to-MAVROS transform is a fixed rotation
 This matches the current simulator convention and must be verified independently
 for another world or vehicle.
 
-### A1.2 — Spustenie a testovanie misie
+The indoor launch configures the existing MAVROS local-position plugin to label
+telemetry `mavros_local`, then publishes a zero-translation, −90° yaw transform
+from `map` to `mavros_local`. In RViz, Fixed Frame `map` therefore aligns odometry
+with the plan. The executor still converts target coordinates explicitly; TF is
+not a second rotation of the flight commands. Start MAVROS separately with the
+repository script before launching the mission.
 
-The `mission_executor` package implements **A1.2 — indoor mission execution** in
-ROS 2 Jazzy (C++). It reads waypoints from a CSV file and executes them using
-ArduPilot through MAVROS. The route **between CSV waypoints** is requested from
-the A1.1 3D A* planner (`/compute_path_3d`); intermediate path points are not
-additional mission tasks.
-
-Supported mission tasks: `takeoff`, `land`, `landtakeoff`, `yaw90`, `yaw180`
-(and other `yaw<angle>` values). `HARD` waypoints require close, stable arrival
-(0.15 m, speed <= 0.15 m/s for at least 1 s), whereas `SOFT` waypoints use a
-0.50 m acceptance radius. Waypoint yaw tasks are **absolute angles in MAVROS
-ENU**, and normal flight heading follows the direction of travel.
-
-#### Build
-
-```bash
-cd ~/LRS_Baculak_Rapcova
-source /opt/ros/jazzy/setup.bash
-colcon build --packages-up-to mission_executor
-source install/setup.bash
-ros2 pkg prefix mission_executor
-```
-
-The package path printed by the last command should point to this workspace.
-Use `source /opt/ros/jazzy/setup.bash` and `source
-~/LRS_Baculak_Rapcova/install/setup.bash` in **every new ROS 2 terminal**.
-
-#### Start the complete system (separate terminals)
-
-Start the components in this order; leave each process running:
-
-1. **Gazebo Sim** with the indoor/hangar world and UAV model.
-2. **ArduPilot SITL** connected to that Gazebo instance.
-3. **MAVROS** connected to the SITL autopilot.
-4. **A1.1 mapper**, **voxel costmap**, then **3D A* planner**.
-5. **Mission Executor**, only after the checks below pass.
-
-Use **three separate terminals** for these simulator processes, following
-the Gazebo hangar-world, SITL vehicle-model and MAVROS FCU connection settings
-of your existing simulation setup:
-
-- **Terminal 1:** `gz sim` with the configured indoor world/UAV model.
-- **Terminal 2:** ArduPilot `sim_vehicle.py` configured for that Gazebo vehicle.
-- **Terminal 3:** MAVROS connected to the SITL FCU endpoint.
-
-The exact world file, `sim_vehicle.py` model options and MAVROS `fcu_url` vary
-between checkouts and are **not supplied here as unverified commands**. Follow
-the simulation setup used for your repository. Starting Gazebo alone is not
-equivalent to starting a fresh SITL/MAVROS session; avoid leaving an earlier
-armed autopilot running after restarting only Gazebo.
-
-After MAVROS starts, check connection and ground state from another sourced
-terminal:
-
-```bash
-ros2 topic echo /mavros/state --once
-ros2 topic echo /mavros/extended_state --once
-```
-
-Before a *new ground-start mission*, require `connected: true`, `armed: false`
-and `landed_state: 1` (`ON_GROUND`). Verify a fresh pose and velocity as well:
-
-```bash
-ros2 topic echo /mavros/local_position/pose --once
-ros2 topic echo /mavros/local_position/velocity_local --once
-```
-
-#### MAVROS telemetry: required message interval in our SITL setup
-
-In previous Gazebo tests, `/mavros/extended_state` was sometimes too slow or
-stale, so the executor refused to arm with `A1.2 preflight blocked`. After
-**MAVROS and SITL are connected**, request the MAVLink `EXTENDED_SYS_STATE`
-message (ID **245**) at **5 Hz**:
-
-```bash
-ros2 service call /mavros/set_message_interval \
-  mavros_msgs/srv/MessageInterval \
-  "{message_id: 245, message_rate: 5.0}"
-```
-
-Confirm the response is successful and verify that the topic is updating:
-
-```bash
-ros2 topic hz /mavros/extended_state
-ros2 topic hz /mavros/local_position/pose
-ros2 topic hz /mavros/local_position/velocity_local
-```
-
-Run these `hz` checks one at a time (stop each with `Ctrl+C`). Message 245
-controls **extended state**, not the pose or velocity streams. If pose/velocity
-are stale, investigate their upstream MAVROS/SITL streams; do not assume the
-message-245 command fixes every topic. Repeat this service request after
-restarting SITL or MAVROS if the stream rate drops. The flight parameter
-`task_slow_sitl_telemetry:=true` only relaxes timing thresholds for slow SITL;
-it **does not disable preflight safety checks**.
-
-Start A1.1 in **three more terminals**, after sourcing ROS 2 and this workspace
-in each of them:
-
-```bash
-# Terminal 4: map provider
-ros2 launch mapper mapper_launch.py \
-  map_file:=$HOME/large_files/maps/FEI_LRS_PCD/map.pcd
-```
-
-```bash
-# Terminal 5: voxel costmap
-ros2 launch voxel_costmap costmap_launch.py
-```
-
-```bash
-# Terminal 6: A* planner
-ros2 launch astar_planner planner_launch.py
-```
-
-Check that the A* action server is available:
-
-```bash
-ros2 action list -t
-# Expected: /compute_path_3d [uav_navigation_msgs/action/ComputePath3D]
-```
-
-#### Run the seven-waypoint mission (WP1 ground start)
-
-The example file is [`missions/exam_example.csv`](missions/exam_example.csv).
-The first CSV task must be `takeoff` and the last `land`. Once the UAV is safely
-on the ground, disarmed, and the route/map/frame configuration has been checked,
-start the executor in **Terminal 7**:
-
-```bash
-cd ~/LRS_Baculak_Rapcova
-source /opt/ros/jazzy/setup.bash
-source install/setup.bash
-
-ros2 run mission_executor mission_executor_node --ros-args \
-  -p mission_file:=$HOME/LRS_Baculak_Rapcova/missions/exam_example.csv \
-  -p enable_task_flight:=true \
-  -p task_flight_confirmed:=true \
-  -p task_slow_sitl_telemetry:=true \
-  -p enable_task_planned_flight:=true \
-  -p task_planner_frame_confirmed:=true \
-  -p task_planned_max_z_m:=4.0 \
-  -p task_path_point_tolerance_m:=0.20
-```
-
-The confirmation parameters above apply **only to the previously checked
-Gazebo SITL setup**. They are not a way to bypass failed preflight checks.
-With dynamic start disabled (the default), the drone must begin close to WP1
-(approximately 0.45 m in horizontal distance).
-
-#### Optional: start the same mission from another ground position
-
-Recent versions of the executor include an **opt-in dynamic start**: the UAV
-first takes off vertically at its **current ground XY**, then A* plans a route
-to WP1, which is visited without performing a second takeoff. It then flies
-the remaining CSV mission. Use this only in the checked Gazebo configuration
-with the mapped area reachable and a **manually verified clear ascent column**.
-The vertical ascent itself is **not collision-checked by A***.
-
-Use this **complete command** in place of the preceding `ros2 run` command:
-
-```bash
-ros2 run mission_executor mission_executor_node --ros-args \
-  -p mission_file:=$HOME/LRS_Baculak_Rapcova/missions/exam_example.csv \
-  -p enable_task_flight:=true \
-  -p task_flight_confirmed:=true \
-  -p task_slow_sitl_telemetry:=true \
-  -p enable_task_planned_flight:=true \
-  -p task_planner_frame_confirmed:=true \
-  -p task_planned_max_z_m:=4.0 \
-  -p task_path_point_tolerance_m:=0.20 \
-  -p enable_dynamic_start:=true \
-  -p dynamic_start_clearance_confirmed:=true
-```
-
-The dynamic-start flags exist only in the newer implementation. Check the
-source before running this command after changing Git branches:
-
-```bash
-grep -n 'DYNAMIC START' src/mission_executor/src/mission_executor_node.cpp
-```
-
-**Dynamic start is not an airborne restart:** stopping `mission_executor_node`
-does not stop/reset ArduPilot. After `LAND -> DONE`, the next ground-start run
-requires `ON_GROUND`, `DISARMED`, fresh telemetry, and a clear ascent area.
-Never disarm an airborne UAV to reset the test.
-
-#### Non-flying CSV check and troubleshooting
-
-For validation **without issuing flight commands**, use:
-
-```bash
-ros2 run mission_executor mission_executor_node --ros-args \
-  -p mission_file:=$HOME/LRS_Baculak_Rapcova/missions/exam_example.csv \
-  -p enable_task_sequence_check:=true
-```
-
-A successful integrated flight ends with:
-
-```text
-LAND verified: ON_GROUND and DISARMED.
-State transition: LAND -> DONE
-```
-
-If the executor reports `A1.2 preflight blocked`, verify `armed: false`,
-`landed_state: 1`, current `/mavros/state`, pose/velocity message age/rate,
-and the extended-state interval above. A new run is intentionally blocked if
-the UAV is still flying or armed. If the node stays in `ARM`, check that you
-are executing the binary rebuilt from the expected source and workspace:
-
-```bash
-ros2 pkg prefix mission_executor
-```
-
-In this Gazebo/PCD configuration, the verified CSV/map to MAVROS ENU mapping is
-`(x_enu, y_enu, z_enu) = (-y_map, x_map, z_map)`. This is a setup-specific
-conversion, not a general TF transform. Planned-flight mode stops on A*
-failure rather than silently switching to an obstacle-crossing straight line.
-The earlier seven-waypoint example was completed in Gazebo SITL (including
-`yaw180`, `yaw90`, `landtakeoff` and final `LAND -> DONE`). Dynamic start and
-repeat flights should be recorded and verified against the **actual Git commit**
-being tested before describing them as fully accepted.
+An optional dynamic start performs a vertical ascent at measured ground XY, then
+plans to CSV waypoint 1 before continuing the mission. It is not an airborne
+restart, and A* does not check the vertical ascent column. It requires explicit
+`enable_dynamic_start` and `dynamic_start_clearance_confirmed` parameters in
+addition to confirmed planned flight. The default launch uses the normal WP1
+start. A previously completed seven-waypoint simulation included yaw tasks,
+landing/relaunch and final ground-confirmed disarm; repeat evidence should identify
+the exact revision and configuration used.
 
 ## 5. Outdoor reference, yaw and trajectory
 
@@ -437,8 +230,7 @@ can invalidate the alignment.
 
 Geodetic round-trip tests recover local points within 1e-7 m. This measures numerical
 consistency, not GPS accuracy or Earth-curvature modelling error. The tangent-plane
-curvature scale over 10 m is approximately `d²/(2R) ≈ 8 µm`, negligible beside sensor
-and tracking errors. Ellipsoid altitude is used for geographic conversion; AMSL and
+curvature scale over 10 m is approximately `d²/(2R) ≈ 8 µm`, negligible. Ellipsoid altitude is used for geographic conversion; AMSL and
 home/launch-relative altitude are not interchangeable.
 
 ROS-side positions and yaw use ENU: east, north, up; yaw zero east, positive
@@ -448,9 +240,14 @@ and returns FCU telemetry in ROS conventions. The `FRAME_LOCAL_NED` enum in
 `PositionTarget` does not require the application to swap its ROS ENU coordinates.
 We command fused local-pose yaw, not raw compass readings.
 
-The outdoor mission takes off to 5 m above launch, flies a 5 m square centred at
-POI **2.5 m east, 2.5 m north** of the mission origin, stops at each corner, then
-moves to the centre and aligns to the figure-eight's initial tangent. Square yaw
+The outdoor mission takes off to 5 m above launch, flies four configured square
+corners and returns to the first, stops at each corner, then moves above the POI
+and aligns to the figure-eight's initial tangent. GPS is the default coordinate
+mode: four ordered `[latitude, longitude]` corner pairs and an explicit GPS POI
+are converted once into the captured local reference. The POI also defines the
+figure-eight centre. Altitude remains launch-relative. ENU mode retains a 5 m
+square centred at offsets `poi_east=2.5`, `poi_north=2.5` metres. The envelope uses
+actual selected corners in either mode. Square yaw
 continuously faces the POI from measured position. Transfers interpolate position
 at 1 m/s; repeated final setpoints provide a settling hold.
 
@@ -470,7 +267,7 @@ gives continuous time-based position and tangent yaw without a stored waypoint l
 its limitation is that tracking is left to ArduPilot rather than optimized against
 vehicle dynamics or obstacles.
 
-For launch at the mission origin, a conservative horizontal bound is the greater
+For the original 5 m layout with launch at the mission origin, a conservative horizontal bound is the greater
 of the square's farthest corner (7.07 m) and the figure-eight bounding rectangle
 (6.80 m). Including the 0.5 m margin gives 7.57 m, inside the 10 m mission bound.
 The 5 m launch-relative height plus margin fits the 6 m vertical bound. The code
@@ -486,9 +283,10 @@ ROS time. The simulation launch bridges Gazebo `/clock` and enables simulation t
 service deadlines and the clock-stall watchdog use steady wall time. A backward
 clock reset releases active control. The indoor implementation still uses wall-time
 telemetry and arrival checks: slow Gazebo can fail preflight despite valid simulated
-motion. Its slow-SITL profile relaxes timing, but the observed approximately 0.79 Hz
-motion and 0.2 Hz state streams remain near its limits. Migrating indoor timing is
-pending and was not part of the outdoor integration.
+motion. Its slow-SITL profile relaxes timing, with a configurable motion-sample window.
+An earlier run at approximately 0.79 Hz motion and 0.2 Hz state demonstrated why
+telemetry rates and simulation speed must be checked. Indoor clock-policy changes
+are not required to reproduce the accepted outdoor behaviour.
 
 Outdoor explicit abort or navigation faults request LAND while connected and owning
 GUIDED. Connection loss or mode override stops setpoints and releases control rather
@@ -498,46 +296,192 @@ telemetry is requested once through MAVROS (message 245 at 2 Hz); rejection or r
 timeout prevents startup. GPS/local-position and compass/local-yaw disagreements
 are diagnostic information, not automatic mismatch-triggered landing commands.
 
-Actual sensor robustness remains unverified. A saved SITL parameter file showed
-`AHRS_EKF_TYPE=10` (simulator state) with EKF3 enabled; this is not proof of the
-running configuration during each earlier test. Therefore accepted simulation
-flights do not establish EKF3 performance on noisy GPS/compass/IMU data. Initial
-GPS-altitude (`SIM_GPS1_NOISE=2`) and barometer-noise tests produced no visible
-flight change; active estimator and quantitative errors were not verified for
-these tests. Magnetometer tests remain pending. The mission node adds no independent
-sensor fusion or covariance-based acceptance. See [the living review](OUTDOOR_REVIEW.md)
-for estimator, failsafe, noise, callback-timing and real-vehicle prefix questions.
+Sensor robustness remains only qualitatively tested. Earlier saved SITL settings
+selected simulator state (`AHRS_EKF_TYPE=10`); a later snapshot selected EKF3
+(`AHRS_EKF_TYPE=3`, `EK3_ENABLE=1`). Saved settings do not prove the estimator active
+in every recording. GPS-altitude disturbance (`SIM_GPS1_NOISE=2`) and barometer-noise
+tests produced no visible flight change; raw sensor changes and quantitative
+errors were not verified. Magnetometer disturbance testing remains unverified.
+The mission node adds no independent sensor fusion or covariance-based acceptance.
 
-## 7. Evidence and defence preparation
+The developer accepted these observed SITL responses: reducing satellite count
+below the configured minimum caused landing; stopping MAVROS caused
+`RELEASE_CONTROL` with the vehicle remaining airborne; stopping the mission node
+left the vehicle holding in the air. Automatic landing on mission-process exit is
+not required for this setup. Setpoint cadence was also checked and accepted,
+without recorded worst-case callback duration or jitter measurements. These results
+are not guarantees under complete link loss or estimator failure. Real-flight
+transport, calibration, frame alignment and onboard failsafes remain separate work.
 
-| Evidence | Current status |
+## 7. Build and run
+
+### Dependencies and build
+
+The workspace targets Ubuntu 24.04 and ROS 2 Jazzy. Simulation additionally needs
+Gazebo, a matching `ardupilot_gazebo` plugin build, ArduPilot SITL and MAVROS.
+C++ dependencies include GeographicLib and PCL; ROS runtime dependencies include
+`ros_gz_bridge` and `tf2_ros`. MAVROS also requires GeographicLib datasets. Keep
+MAVROS, `libmavconn` and `mavros_msgs` on compatible versions: a mixed installation
+previously caused a startup symbol-lookup failure. FlexBE is not required.
+
+From `ros2_ws`:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+rosdep install --from-paths src --ignore-src -r -y
+colcon build
+source install/setup.bash
+colcon test
+colcon test-result --verbose
+```
+
+Source ROS and this workspace's `install/setup.bash` in every ROS terminal. Use
+absolute mission/map paths when starting from another working directory. Repository
+simulation scripts are one level above this workspace, in `../scripts/`.
+
+### Indoor mission
+
+Start each long-running component in a separate terminal from `ros2_ws`:
+
+```bash
+../scripts/run_gazebo.sh
+../scripts/run_sitl.sh
+../scripts/run_mavros.sh
+```
+
+Then start mapper, costmap and planner in separate sourced terminals:
+
+```bash
+ros2 launch mapper mapper_launch.py map_file:=/absolute/path/to/map.pcd
+ros2 launch voxel_costmap costmap_launch.py
+ros2 launch astar_planner planner_launch.py
+```
+
+The mission is [missions/exam_example.csv](missions/exam_example.csv). With MAVROS
+connected and the UAV on ground/disarmed, preview its task sequence and frame setup:
+
+```bash
+ros2 launch mission_executor indoor.launch.py \
+  mission_file:="$PWD/missions/exam_example.csv"
+```
+
+This launch does not start MAVROS. It configures its local frame parameters before
+starting the executor and publishes the RViz alignment transform. No flight is
+commanded in preview mode. After verifying frames and the route, restart it with:
+
+```bash
+ros2 launch mission_executor indoor.launch.py \
+  mission_file:="$PWD/missions/exam_example.csv" \
+  enable_flight:=true \
+  task_flight_confirmed:=true \
+  task_planner_frame_confirmed:=true
+```
+
+For slow simulation, add `task_slow_sitl_telemetry:=true`. If landed-state telemetry
+is missing, request it after FCU connection:
+
+```bash
+ros2 service call /mavros/set_message_interval mavros_msgs/srv/MessageInterval \
+  '{message_id: 245, message_rate: 2.0}'
+```
+
+Use RViz Fixed Frame `map`, `/plan`, `/map_cloud`, `/costmap_cloud` and
+`/mavros/local_position/odom`. Initial pose must be close to the CSV takeoff point
+for the normal launch. Direct node runs use `mavros_frame=map` by default; after
+using the launch's `mavros_local` settings, either use that launch again or explicitly
+pass the matching frame parameter. Indoor automatic error-landing is an opt-in
+feature, disabled by default; it requires separate clearance confirmation.
+
+### Outdoor mission
+
+Use [config/outdoor.yaml](src/mission_executor/config/outdoor.yaml) to select
+coordinates and limits. The committed GPS corners/POI are near the hangar home
+**48.15084570555732, 17.072729745416016**, as used in the accepted runs. They must
+match the SITL geographic origin; the outdoor world file's example geographic
+location is different. From `ros2_ws`, in separate terminals:
+
+```bash
+../scripts/run_gazebo.sh fei_lrs_outdoor.world
+HOME_LOCATION=48.15084570555732,17.072729745416016,150,0 ../scripts/run_sitl.sh
+../scripts/run_mavros.sh
+```
+
+Restart/reconfigure MAVROS after an indoor run so the earlier frame-label settings
+do not carry over unintentionally. Preview and then explicitly enable flight:
+
+```bash
+ros2 launch mission_executor outdoor_sim.launch.py
+# After checking telemetry, GPS corners/POI and the reported envelope:
+ros2 launch mission_executor outdoor_sim.launch.py enable_flight:=true
+```
+
+Stop the preview launch before starting the flight launch. The simulation launch
+starts the Gazebo-to-ROS clock bridge and enables ROS simulation time. The mapper,
+costmap and planner are not needed for this analytic outdoor mission.
+
+```yaml
+coordinate_mode: gps  # Default; alternative: enu.
+poi_gps: [48.150868185, 17.072763300]
+square_corner_1_gps: [48.15089067, 17.07272970]
+square_corner_2_gps: [48.15089067, 17.07279690]
+square_corner_3_gps: [48.15084570, 17.07279690]
+square_corner_4_gps: [48.15084570, 17.07272970]
+```
+
+These are `ros__parameters` entries in the configuration file, not a standalone ROS
+parameter file. GPS coordinates are absolute WGS84 degrees, with no altitude in
+the pairs. ENU mode uses `poi_east`, `poi_north` and `square_side` instead. An
+out-of-envelope GPS configuration blocks readiness; increasing the envelope is not
+a substitute for correcting mismatched home/corner coordinates.
+
+All outdoor MAVROS topics and services share the configurable `mavros_prefix`,
+default `/mavros`. For another existing vehicle interface:
+
+```bash
+ros2 launch mission_executor outdoor_sim.launch.py mavros_prefix:=/drone01
+```
+
+This redirects the mission interfaces; it does not start or rename MAVROS. Mission
+state, diagnostics and abort retain their own names. Abort a running mission with:
+
+```bash
+ros2 service call /outdoor_mission/abort std_srvs/srv/Trigger '{}'
+```
+
+`execute_square:=false` selects takeoff/return only;
+`execute_figure_eight:=false` selects square-only flight. The real-flight launch is
+an explicitly unfinished hardware entry point, not a validated deployment.
+
+## 8. Evidence and defence preparation
+
+[Outdoor run recordings — Google Drive](https://drive.google.com/drive/folders/18p4L7dQqtNPm-RtJtOg_cNxpsdhLNMUm?usp=sharing).
+The developer reports the mission evidence ready. This document does not claim an
+independent audit of individual recordings or quantitative error plots.
+
+| Evidence | Status |
 |---|---|
-| Integrated `mission_executor` build | Passed on development machine after outdoor integration |
-| Outdoor geometry / indoor position-controller tests | Passed after integration |
-| Outdoor fake-MAVROS smoke test | Passed after integration; no physical flight |
-| Planner and coordinate tests, action tests | Passed during earlier development; repeat on submission revision |
-| Full outdoor simulation mission | Visually tested and accepted; quantitative recording TODO |
-| Full indoor CSV mission with A* | **TODO**; latest observed run stopped at preflight without arming |
-| Indoor/outdoor rosbag or video links | **TODO** |
-| Noisy-sensor and real-vehicle validation | **TODO**, not claimed |
+| Development-machine build | Passed after integration and GPS/ENU changes |
+| Outdoor geometry and indoor controller tests | Passed; includes GPS conversion and actual-corner envelope checks |
+| Outdoor fake-MAVROS integration | GPS/ENU reference capture, configurable prefix and full GPS mission passed |
+| Planner/coordinate/action tests | Passed during development; final-revision clean build remains to verify |
+| Indoor seven-waypoint mission | Completion reported in development notes; associate final evidence with tested revision |
+| Outdoor simulation mission | Accepted by developer; recordings linked above; GPS layout also accepted |
+| Fault-response/cadence checks | Satellite-count landing, MAVROS loss, node stop and setpoint cadence accepted |
+| Sensor robustness / physical flight | Quantitative noise, magnetometer and real-vehicle validation not claimed |
 
-Build and launch instructions are in [README.md](README.md); outdoor configuration,
-launch and diagnostics are detailed in [README_outdoor_mission.md](README_outdoor_mission.md).
-For the defence, demonstrate clearance changes in `costmap.yaml`, outdoor `omega`
-or `figure8_amplitude` changes in `outdoor.yaml`, and explain their effects on
-reachability, maximum speed and the envelope. Distinguish target tolerance from
-physical positioning accuracy when showing results.
+Remaining submission checks:
 
-- [ ] Rebuild from a fresh clone with `colcon build`; record revision and environment.
-- [ ] Repeat planning timings and raw/refined point counts with submitted parameters.
-- [ ] Justify clearance using vehicle dimensions and measured tracking error; inspect shelves.
-- [ ] Complete the full indoor mission after fixing SITL/telemetry readiness.
-- [ ] Record indoor and outdoor missions; link video or bags and commanded/actual track plots.
-- [ ] Measure outdoor position/yaw errors and repeat completion, abort and override runs.
-- [ ] Verify launch instructions on another machine with simulation terminals started manually.
-- [ ] Confirm mission/configuration files and both diagrams render in the submission revision.
-- [ ] Commit and push before the deadline; send the teacher the commit hash on Teams.
+- Build/test the final revision from a fresh clone and verify its launch commands.
+- Associate recordings with the tested revision, parameter files and mission file;
+  identify the indoor recording separately if it is not in the shared folder.
+- Repeat historical planning timings with final inflation settings if used as current
+  performance evidence; retain their historical label otherwise.
+- Verify rack clearance against simulator collision volumes and justify margins
+  from vehicle size and tracking error. This remains the developer's evaluation.
+- Check diagrams render, push the final revision and send its hash to the teacher.
 
-Each team member should be able to explain the entire pipeline and demonstrate a
-small parameter or code change. Unchecked items above remain required work rather
-than implied completed evidence.
+For the defence, explain the full pipeline and demonstrate a small parameter change:
+clearance in `costmap.yaml`, indoor arrival tolerances, or outdoor `omega`. Explain
+why the figure-eight speed/envelope and waypoint precision change with these values.
+Geometry constants enforced by assignment validation require corresponding code
+changes before an arbitrary amplitude/altitude can be demonstrated.
