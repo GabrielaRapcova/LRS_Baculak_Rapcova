@@ -8,6 +8,18 @@ from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
     return LaunchDescription([
+        # Matches the executor's map-to-local conversion: (-y, x, z).
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='indoor_map_to_mavros_local',
+            arguments=[
+                '--x', '0', '--y', '0', '--z', '0',
+                '--yaw', '-1.5707963267948966', '--pitch', '0', '--roll', '0',
+                '--frame-id', 'map', '--child-frame-id', 'mavros_local',
+            ],
+            output='screen',
+        ),
         Node(
             package='mission_executor',
             executable='mission_executor_node',
@@ -30,18 +42,6 @@ def generate_launch_description():
                     'enable_dynamic_start': True,
                     'dynamic_start_clearance_confirmed': True,
                 },
-            ],
-            output='screen',
-        ),
-        # Matches the executor's map-to-local conversion: (-y, x, z).
-        Node(
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            name='indoor_map_to_mavros_local',
-            arguments=[
-                '--x', '0', '--y', '0', '--z', '0',
-                '--yaw', '-1.5707963267948966', '--pitch', '0', '--roll', '0',
-                '--frame-id', 'map', '--child-frame-id', 'mavros_local',
             ],
             output='screen',
         ),
