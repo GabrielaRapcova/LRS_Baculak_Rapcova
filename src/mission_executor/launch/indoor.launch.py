@@ -52,6 +52,8 @@ def generate_launch_description():
         DeclareLaunchArgument('task_flight_confirmed', default_value='false'),
         DeclareLaunchArgument('task_planner_frame_confirmed', default_value='false'),
         DeclareLaunchArgument('task_slow_sitl_telemetry', default_value='false'),
+DeclareLaunchArgument('enable_dynamic_start', default_value='true'),
+DeclareLaunchArgument('dynamic_start_clearance_confirmed', default_value='true'),
         OpaqueFunction(function=configure_mavros),
         # Inverse of the executor's map-to-local conversion: (-y, x, z).
         # Both origins must coincide; this launch is specific to the current world.

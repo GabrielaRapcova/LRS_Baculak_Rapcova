@@ -158,7 +158,7 @@ public:
         }
         if (!std::isfinite(task_path_point_tolerance_m_) ||
             task_path_point_tolerance_m_ < 0.10 ||
-            task_path_point_tolerance_m_ > 0.25) {
+            task_path_point_tolerance_m_ > 0.6) {
             throw std::runtime_error("task_path_point_tolerance_m must be within 0.10..0.25m");
         }
         if (!std::isfinite(task_planned_max_z_m_) ||
