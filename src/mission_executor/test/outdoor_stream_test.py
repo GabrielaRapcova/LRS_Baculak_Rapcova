@@ -39,7 +39,7 @@ def run_case(outcome, flight):
     vehicle = StreamVehicle(outcome)
     process = subprocess.Popen([
         'ros2', 'run', 'mission_executor', 'outdoor_mission_node',
-        '--ros-args',
+        '--ros-args', '-p', 'coordinate_mode:=enu',
         '-p', f'enable_flight:={str(flight).lower()}',
         '-p', 'gps_ready_duration:=0.2',
         '-p', 'command_timeout:=0.3'],

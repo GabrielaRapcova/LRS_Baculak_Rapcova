@@ -501,8 +501,10 @@ are diagnostic information, not automatic mismatch-triggered landing commands.
 Actual sensor robustness remains unverified. A saved SITL parameter file showed
 `AHRS_EKF_TYPE=10` (simulator state) with EKF3 enabled; this is not proof of the
 running configuration during each earlier test. Therefore accepted simulation
-flights do not establish EKF3 performance on noisy GPS/compass/IMU data. Noisy-sensor
-testing is on hold while SITL is reinstalled. The mission node adds no independent
+flights do not establish EKF3 performance on noisy GPS/compass/IMU data. Initial
+GPS-altitude (`SIM_GPS1_NOISE=2`) and barometer-noise tests produced no visible
+flight change; active estimator and quantitative errors were not verified for
+these tests. Magnetometer tests remain pending. The mission node adds no independent
 sensor fusion or covariance-based acceptance. See [the living review](OUTDOOR_REVIEW.md)
 for estimator, failsafe, noise, callback-timing and real-vehicle prefix questions.
 

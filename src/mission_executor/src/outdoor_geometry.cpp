@@ -111,13 +111,12 @@ double calculateFigureEightPeakSpeed(double amplitude, double omega)
     return amplitude * omega * std::sqrt(2.0);
 }
 
-double calculateMissionHorizontalDistanceBound(Point3 poi, Point3 launch, double side, double amplitude)
+double calculateMissionHorizontalDistanceBound(Point3 poi, Point3 launch, const std::array<Point3, 5> &corners, double amplitude)
 {
     validatePositiveValue(amplitude);
     if (!isFinitePoint(launch)) {
         throw std::invalid_argument("Launch position must be finite");
     }
-    auto corners = calculateSquareCornerPositions(poi, side, launch.z);
     double bound = std::hypot(
         std::abs(poi.x - launch.x) + amplitude,
         std::abs(poi.y - launch.y) + amplitude / 2.0);

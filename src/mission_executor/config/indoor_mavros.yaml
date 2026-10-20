@@ -1,0 +1,7 @@
+# The planner's map axes differ from the FCU's local ENU axes.
+/**/local_position:
+  ros__parameters:
+    frame_id: mavros_local
+    tf.send: true
+    tf.frame_id: mavros_local
+    tf.child_frame_id: base_link

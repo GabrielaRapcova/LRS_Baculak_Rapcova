@@ -80,7 +80,41 @@ OutdoorMissionNode::OutdoorMissionNode()
 
 void OutdoorMissionNode::declareParameters()
 {
+  mavros_prefix_ = declare_parameter("mavros_prefix", std::string("/mavros"));
+  if (mavros_prefix_.empty()) {
+    throw std::invalid_argument("mavros_prefix must name a non-root namespace");
+  }
+  if (mavros_prefix_.front() != '/') {
+    mavros_prefix_.insert(0, "/");
+  }
+  while (mavros_prefix_.size() > 1 && mavros_prefix_.back() == '/') {
+    mavros_prefix_.pop_back();
+  }
+  if (mavros_prefix_ == "/") {
+    throw std::invalid_argument("mavros_prefix must name a non-root namespace");
+  }
   poi_ = {declare_parameter("poi_east", 2.5), declare_parameter("poi_north", 2.5), 0.0};
+  coordinate_mode_ = declare_parameter("coordinate_mode", std::string("gps"));
+  auto gps_poi = declare_parameter(
+    "poi_gps", std::vector<double>{48.15146692284, 17.07378359836});
+  if (gps_poi.size() != 2) {
+    throw std::invalid_argument("poi_gps must contain [latitude, longitude]");
+  }
+  gps_poi_ = {gps_poi[0], gps_poi[1], 0.0};
+  const std::array<GeodeticPosition, 4> default_corners{{
+    {48.15148940569, 17.07375000000, 0.0},
+    {48.15148940567, 17.07381719675, 0.0},
+    {48.15144443998, 17.07381719669, 0.0},
+    {48.15144444000, 17.07375000000, 0.0}}};
+  for (std::size_t i = 0; i < gps_square_corners_.size(); ++i) {
+    auto coordinates = declare_parameter(
+      "square_corner_" + std::to_string(i + 1) + "_gps",
+      std::vector<double>{default_corners[i].latitude, default_corners[i].longitude});
+    if (coordinates.size() != 2) {
+      throw std::invalid_argument("Each square_corner_N_gps must contain [latitude, longitude]");
+    }
+    gps_square_corners_[i] = {coordinates[0], coordinates[1], 0.0};
+  }
   altitude_ = declare_parameter("flight_altitude", 5.0);
   side_ = declare_parameter("square_side", 5.0);
   amplitude_ = declare_parameter("figure8_amplitude", 3.0);
@@ -118,48 +152,48 @@ void OutdoorMissionNode::configureTelemetryInterfaces()
 {
   auto sensor_qos = rclcpp::SensorDataQoS();
   state_sub_ = create_subscription<mavros_msgs::msg::State>(
-    "mavros/state", sensor_qos,
+    mavros_prefix_ + "/state", sensor_qos,
     std::bind(&OutdoorMissionNode::stateCallback, this, _1));
   extended_sub_ = create_subscription<mavros_msgs::msg::ExtendedState>(
-    "mavros/extended_state", sensor_qos,
+    mavros_prefix_ + "/extended_state", sensor_qos,
     std::bind(&OutdoorMissionNode::extendedStateCallback, this, _1));
   fix_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
-    "mavros/global_position/global", sensor_qos,
+    mavros_prefix_ + "/global_position/global", sensor_qos,
     std::bind(&OutdoorMissionNode::gpsFixCallback, this, _1));
   satellites_sub_ = create_subscription<std_msgs::msg::UInt32>(
-    "mavros/global_position/raw/satellites", sensor_qos,
+    mavros_prefix_ + "/global_position/raw/satellites", sensor_qos,
     std::bind(&OutdoorMissionNode::satellitesCallback, this, _1));
   home_sub_ = create_subscription<mavros_msgs::msg::HomePosition>(
-    "mavros/home_position/home", rclcpp::QoS(1).reliable().transient_local(),
+    mavros_prefix_ + "/home_position/home", rclcpp::QoS(1).reliable().transient_local(),
     std::bind(&OutdoorMissionNode::homeCallback, this, _1));
   heading_sub_ = create_subscription<std_msgs::msg::Float64>(
-    "mavros/global_position/compass_hdg", sensor_qos,
+    mavros_prefix_ + "/global_position/compass_hdg", sensor_qos,
     std::bind(&OutdoorMissionNode::headingCallback, this, _1));
   relative_altitude_sub_ = create_subscription<std_msgs::msg::Float64>(
-    "mavros/global_position/rel_alt", sensor_qos,
+    mavros_prefix_ + "/global_position/rel_alt", sensor_qos,
     std::bind(&OutdoorMissionNode::relativeAltitudeCallback, this, _1));
   pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
-    "mavros/local_position/pose", sensor_qos,
+    mavros_prefix_ + "/local_position/pose", sensor_qos,
     std::bind(&OutdoorMissionNode::poseCallback, this, _1));
   velocity_sub_ = create_subscription<geometry_msgs::msg::TwistStamped>(
-    "mavros/local_position/velocity_local", sensor_qos,
+    mavros_prefix_ + "/local_position/velocity_local", sensor_qos,
     std::bind(&OutdoorMissionNode::velocityCallback, this, _1));
   state_pub_ = create_publisher<std_msgs::msg::String>(
     "outdoor_mission/state", rclcpp::QoS(1).reliable().transient_local());
   diagnostics_pub_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
     "outdoor_mission/diagnostics", 10);
   interval_client_ = create_client<mavros_msgs::srv::MessageInterval>(
-    "mavros/set_message_interval");
+    mavros_prefix_ + "/set_message_interval");
 }
 
 void OutdoorMissionNode::configureFlightInterfaces()
 {
   if (enable_flight_) {
-    mode_client_ = create_client<mavros_msgs::srv::SetMode>("mavros/set_mode");
-    arm_client_ = create_client<mavros_msgs::srv::CommandBool>("mavros/cmd/arming");
-    takeoff_client_ = create_client<mavros_msgs::srv::CommandTOL>("mavros/cmd/takeoff");
+    mode_client_ = create_client<mavros_msgs::srv::SetMode>(mavros_prefix_ + "/set_mode");
+    arm_client_ = create_client<mavros_msgs::srv::CommandBool>(mavros_prefix_ + "/cmd/arming");
+    takeoff_client_ = create_client<mavros_msgs::srv::CommandTOL>(mavros_prefix_ + "/cmd/takeoff");
     setpoint_pub_ = create_publisher<mavros_msgs::msg::PositionTarget>(
-      "mavros/setpoint_raw/local",
+      mavros_prefix_ + "/setpoint_raw/local",
       10);
     abort_service_ = create_service<std_srvs::srv::Trigger>(
       "outdoor_mission/abort",
@@ -338,6 +372,19 @@ void OutdoorMissionNode::requestLandedStateStream()
 
 void OutdoorMissionNode::validateParameters()
 {
+  if (coordinate_mode_ != "gps" && coordinate_mode_ != "enu") {
+    throw std::invalid_argument("coordinate_mode must be gps or enu");
+  }
+  if (coordinate_mode_ == "gps") {
+    if (!isValidGeodeticPosition(gps_poi_)) {
+      throw std::invalid_argument("poi_gps requires valid latitude and longitude");
+    }
+    for (const auto & corner : gps_square_corners_) {
+      if (!isValidGeodeticPosition(corner)) {
+        throw std::invalid_argument("GPS square corners require valid latitude and longitude");
+      }
+    }
+  }
   for (double value : {omega_, max_speed_, max_distance_,
       max_altitude_, timeout_, readiness_duration_, sample_window_, position_tolerance_,
       altitude_tolerance_, velocity_tolerance_, yaw_tolerance_, settle_duration_, return_speed_,
@@ -485,12 +532,27 @@ void OutdoorMissionNode::captureMissionReference()
   launch_enu_ = reference_->convertLocalToMissionEnu(launch_local_);
   launch_relative_altitude_ = relative_altitude_;
   local_frame_ = pose_.header.frame_id;
-  envelope_bound_ = calculateMissionHorizontalDistanceBound(poi_, launch_enu_, side_, amplitude_);
-  envelope_ok_ = envelope_bound_ + envelope_margin_ <= max_distance_;
   double flight_height = launch_enu_.z + altitude_;
-  auto corners = calculateSquareCornerPositions(poi_, side_, flight_height);
-  for (std::size_t i = 0; i < corners.size(); ++i) {
-    auto geodetic = reference_->convertMissionEnuToGeodetic(corners[i]);
+  if (coordinate_mode_ == "gps") {
+    auto geodetic_poi = gps_poi_;
+    geodetic_poi.altitude_ellipsoid = origin_.altitude_ellipsoid;
+    poi_ = reference_->convertGeodeticToMissionEnu(geodetic_poi);
+    poi_.z = 0.0;
+    for (std::size_t i = 0; i < gps_square_corners_.size(); ++i) {
+      auto geodetic = gps_square_corners_[i];
+      geodetic.altitude_ellipsoid = origin_.altitude_ellipsoid;
+      square_corners_[i] = reference_->convertGeodeticToMissionEnu(geodetic);
+      square_corners_[i].z = flight_height;
+    }
+    square_corners_[4] = square_corners_[0];
+  } else {
+    square_corners_ = calculateSquareCornerPositions(poi_, side_, flight_height);
+  }
+  envelope_bound_ = calculateMissionHorizontalDistanceBound(
+    poi_, launch_enu_, square_corners_, amplitude_);
+  envelope_ok_ = envelope_bound_ + envelope_margin_ <= max_distance_;
+  for (std::size_t i = 0; i < square_corners_.size(); ++i) {
+    auto geodetic = reference_->convertMissionEnuToGeodetic(square_corners_[i]);
     auto round_trip = reference_->convertGeodeticToMissionEnu(geodetic);
     RCLCPP_INFO(
       get_logger(), "Square %zu: ENU [%.2f, %.2f, %.2f], lat/lon [%.8f, %.8f]",
@@ -751,8 +813,7 @@ bool OutdoorMissionNode::isSettledAtPosition(Point3 destination)
 
 Point3 OutdoorMissionNode::getCurrentSquareCornerPosition() const
 {
-  auto corners = calculateSquareCornerPositions(poi_, side_, launch_enu_.z + altitude_);
-  return reference_->convertMissionEnuToLocal(corners[square_corner_]);
+  return reference_->convertMissionEnuToLocal(square_corners_[square_corner_]);
 }
 
 Point3 OutdoorMissionNode::getFigureEightCentreEnuPosition() const
@@ -1093,6 +1154,7 @@ void OutdoorMissionNode::publishDiagnostics()
   addDiagnosticValue(
     status, "square_corner", flight_state_ == OutdoorState::SQUARE ?
     std::to_string(square_corner_ + 1) : "0");
+  addDiagnosticValue(status, "coordinate_mode", coordinate_mode_);
   addDiagnosticValue(status, "abort_reason", abort_reason_);
   addDiagnosticValue(status, "satellites", std::to_string(satellites_));
   addDiagnosticValue(status, "fix_status", std::to_string(fix_.status.status));

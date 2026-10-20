@@ -48,6 +48,10 @@ public:
           position_controller_(0.15, 0.50, 0.15, 1.0)
     {
         this->declare_parameter<std::string>("mission_file", "");
+        mavros_frame_ = this->declare_parameter<std::string>("mavros_frame", "map");
+        if (mavros_frame_.empty()) {
+            throw std::runtime_error("Parameter 'mavros_frame' must not be empty.");
+        }
         this->declare_parameter<bool>("enable_task_sequence_check", false);
         this->declare_parameter<bool>("enable_task_flight", false);
         this->declare_parameter<bool>("task_flight_confirmed", false);
@@ -230,6 +234,7 @@ public:
 
 private:
     Mission mission_;
+    std::string mavros_frame_;
     MissionState current_state_;
     PositionController position_controller_;
     std::atomic<std::size_t> current_waypoint_index_{0};
@@ -377,7 +382,7 @@ private:
             }
             if (i != 0) {
                 const auto &prev = mission_[i - 1];
-                if (!enable_task_planned_flight_ &&
+                if (task_flight_enabled_ && !enable_task_planned_flight_ &&
                     std::hypot(w.x - prev.x, w.y - prev.y) >
                         task_max_direct_leg_m_) {
                     throw std::runtime_error(
@@ -407,9 +412,9 @@ private:
     bool task_telemetry_ok(bool require_ground)
     {
         const auto now = std::chrono::steady_clock::now();
-        const auto state_timeout = task_slow_sitl_telemetry_ ? 6s : 2s;
-        const auto extended_timeout = task_slow_sitl_telemetry_ ? 4s : 2s;
-        const auto motion_timeout = task_slow_sitl_telemetry_ ? 2500ms : 500ms;
+        const auto state_timeout = task_slow_sitl_telemetry_ ? 10s : 2s;
+        const auto extended_timeout = task_slow_sitl_telemetry_ ? 8s : 2s;
+        const auto motion_timeout = task_slow_sitl_telemetry_ ? 5000ms : 500ms;
         {
             std::lock_guard<std::mutex> lock(mavros_mutex_);
             if (!mavros_state_received_ || !mavros_connected_ ||
@@ -431,7 +436,7 @@ private:
             now - last_velocity_time_ <= motion_timeout &&
             sample_rate_ok(pose_samples_, task_slow_sitl_telemetry_) &&
             sample_rate_ok(velocity_samples_, task_slow_sitl_telemetry_) &&
-            current_pose_.header.frame_id == "map" &&
+            current_pose_.header.frame_id == mavros_frame_ &&
             finite_point(p) &&
             std::isfinite(v.x) && std::isfinite(v.y) &&
             std::isfinite(v.z);
@@ -496,7 +501,7 @@ private:
             const auto &v = current_velocity_.twist.linear;
             const bool pose_ok = pose_received_ && pose_age <= motion_limit &&
                 sample_rate_ok(pose_samples_, task_slow_sitl_telemetry_) &&
-                current_pose_.header.frame_id == "map" && finite_point(p);
+                current_pose_.header.frame_id == mavros_frame_ && finite_point(p);
             const bool vel_ok = velocity_received_ && vel_age <= motion_limit &&
                 sample_rate_ok(velocity_samples_, task_slow_sitl_telemetry_) &&
                 std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
@@ -553,10 +558,10 @@ private:
         return measured + angular_error(target, measured);
     }
 
-    static bool yaw_from_enu_pose(
-        const geometry_msgs::msg::PoseStamped &pose, double &yaw)
+    bool yaw_from_enu_pose(
+        const geometry_msgs::msg::PoseStamped &pose, double &yaw) const
     {
-        if (pose.header.frame_id != "map") return false;
+        if (pose.header.frame_id != mavros_frame_) return false;
         const auto &q = pose.pose.orientation;
         if (!std::isfinite(q.x) || !std::isfinite(q.y) ||
             !std::isfinite(q.z) || !std::isfinite(q.w)) return false;
@@ -1470,7 +1475,7 @@ private:
     {
         mavros_msgs::msg::PositionTarget msg;
         msg.header.stamp = this->now();
-        msg.header.frame_id = "map";
+        msg.header.frame_id = mavros_frame_;
         msg.coordinate_frame =
             mavros_msgs::msg::PositionTarget::FRAME_LOCAL_NED;
         msg.type_mask =
