@@ -1,10 +1,12 @@
 #ifndef MISSION_EXECUTOR__OUTDOOR_MISSION_NODE_HPP_
 #define MISSION_EXECUTOR__OUTDOOR_MISSION_NODE_HPP_
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "diagnostic_msgs/msg/diagnostic_array.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
@@ -124,6 +126,11 @@ private:
   void publishDiagnostics();
 
   // Configuration.
+  std::string mavros_prefix_;
+  std::string coordinate_mode_;
+  GeodeticPosition gps_poi_;
+  std::array<GeodeticPosition, 4> gps_square_corners_;
+  std::array<Point3, 5> square_corners_;
   Point3 poi_;
   double altitude_;
   double side_;

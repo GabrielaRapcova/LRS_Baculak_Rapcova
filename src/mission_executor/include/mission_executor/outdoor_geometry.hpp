@@ -37,7 +37,7 @@ double calculatePoiFacingYaw(Point3 position, Point3 poi, double previous_yaw, d
 std::array<Point3, 5> calculateSquareCornerPositions(Point3 poi, double side, double flight_height);
 TrajectorySample calculateFigureEightSample(Point3 centre, double amplitude, double omega, double elapsed);
 double calculateFigureEightPeakSpeed(double amplitude, double omega);
-double calculateMissionHorizontalDistanceBound(Point3 poi, Point3 launch, double side, double amplitude);
+double calculateMissionHorizontalDistanceBound(Point3 poi, Point3 launch, const std::array<Point3, 5> &corners, double amplitude);
 
 // Mission ENU is anchored at the geodetic origin. local_anchor is that same
 // point in MAVROS local coordinates; yaw_offset rotates ENU axes into local axes.

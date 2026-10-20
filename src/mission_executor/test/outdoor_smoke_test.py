@@ -1,10 +1,10 @@
 """Test outdoor diagnostics using fake telemetry."""
 
+import argparse
 import math
 import os
 import signal
 import subprocess
-import sys
 import time
 
 from diagnostic_msgs.msg import DiagnosticArray
@@ -23,10 +23,28 @@ from std_msgs.msg import Float64, String, UInt32
 
 os.environ['ROS_DOMAIN_ID'] = '181'
 
-use_home = '--no-home' not in sys.argv
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--no-home', action='store_true')
+parser.add_argument('--mavros-prefix', default='/mavros')
+parser.add_argument('--coordinate-mode', choices=['enu', 'gps'], default='enu')
+args = parser.parse_args()
+use_home = not args.no_home
+prefix = '/' + args.mavros_prefix.strip('/')
+gps_parameters = []
+if args.coordinate_mode == 'gps':
+    # Same 5 m square and POI as the ENU fixture, at its GPS reference.
+    for index, coordinates in enumerate([
+            [48.15004496570, 17.07000000000],
+            [48.15004496568, 17.07006719486],
+            [48.14999999998, 17.07006719480],
+            [48.15000000000, 17.07000000000]], start=1):
+        gps_parameters.extend(['-p', f'square_corner_{index}_gps:={coordinates}'])
+    gps_parameters.extend(['-p', 'poi_gps:=[48.15002248285, 17.07003359742]'])
 process = subprocess.Popen(
     ['ros2', 'run', 'mission_executor', 'outdoor_mission_node', '--ros-args',
-     '-p', 'gps_ready_duration:=0.2', '-p', 'telemetry_timeout:=0.5'],
+     '-p', f'coordinate_mode:={args.coordinate_mode}',
+     '-p', f'mavros_prefix:={args.mavros_prefix}',
+     '-p', 'gps_ready_duration:=0.2', '-p', 'telemetry_timeout:=0.5'] + gps_parameters,
     start_new_session=True)
 rclpy.init()
 node = rclpy.create_node('outdoor_diagnostics_test')
@@ -41,7 +59,7 @@ def request_interval(request, response):
 
 
 interval_service = node.create_service(
-    MessageInterval, '/mavros/set_message_interval', request_interval)
+    MessageInterval, prefix + '/set_message_interval', request_interval)
 retained = QoSProfile(
     depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
     reliability=ReliabilityPolicy.RELIABLE)
@@ -91,11 +109,11 @@ telemetry = [
 ]
 publishers = []
 for topic, message_type, message in telemetry:
-    publisher = node.create_publisher(message_type, '/mavros/' + topic, 10)
+    publisher = node.create_publisher(message_type, prefix + '/' + topic, 10)
     publishers.append((publisher, message))
 if use_home:
     home_publisher = node.create_publisher(
-        HomePosition, '/mavros/home_position/home', retained)
+        HomePosition, prefix + '/home_position/home', retained)
     publishers.append((home_publisher, home))
 
 
@@ -143,12 +161,13 @@ try:
     assert math.isclose(
         float(values['horizontal_bound_with_margin']),
         math.sqrt(50) + 0.5, abs_tol=1e-6)
+    assert values['coordinate_mode'] == args.coordinate_mode
     original_latitude = values['origin_latitude']
-    assert node.count_publishers('/mavros/setpoint_raw/local') == 0
-    assert node.count_publishers('/mavros/setpoint_position/local') == 0
+    assert node.count_publishers(prefix + '/setpoint_raw/local') == 0
+    assert node.count_publishers(prefix + '/setpoint_position/local') == 0
     clients = node.get_client_names_and_types_by_node(
         'outdoor_mission_node', '/')
-    assert clients == [('/mavros/set_message_interval',
+    assert clients == [(prefix + '/set_message_interval',
                         ['mavros_msgs/srv/MessageInterval'])], clients
     assert interval_requests == [(245, 2.0)], interval_requests
     state.connected = False

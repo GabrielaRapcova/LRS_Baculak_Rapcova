@@ -12,6 +12,7 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     """Keep flight disabled unless explicitly requested."""
     return LaunchDescription([
+        DeclareLaunchArgument('mavros_prefix', default_value='/mavros'),
         DeclareLaunchArgument('enable_flight', default_value='false'),
         DeclareLaunchArgument('execute_square', default_value='true'),
         DeclareLaunchArgument('execute_figure_eight', default_value='true'),
@@ -25,6 +26,8 @@ def generate_launch_description():
             package='mission_executor', executable='outdoor_mission_node',
             name='outdoor_mission_node',
             parameters=[LaunchConfiguration('params_file'), {
+                'mavros_prefix': ParameterValue(
+                    LaunchConfiguration('mavros_prefix'), value_type=str),
                 'enable_flight': ParameterValue(
                     LaunchConfiguration('enable_flight'), value_type=bool),
                 'execute_square': ParameterValue(

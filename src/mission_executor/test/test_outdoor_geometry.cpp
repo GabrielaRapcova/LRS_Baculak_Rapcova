@@ -55,9 +55,23 @@ TEST(OutdoorGeometry, AgreedSquareAndEnvelope)
     EXPECT_DOUBLE_EQ(corners[3].y, 0.0);
     EXPECT_DOUBLE_EQ(corners[4].x, corners[0].x);
     EXPECT_DOUBLE_EQ(corners[4].z, 8.0);
-    EXPECT_NEAR(calculateMissionHorizontalDistanceBound({2.5, 2.5, 0.0}, {0.0, 0.0, 0.0}, 5.0, 3.0),
+    EXPECT_NEAR(calculateMissionHorizontalDistanceBound({2.5, 2.5, 0.0}, {0.0, 0.0, 0.0}, corners, 3.0),
         std::sqrt(50.0), 1e-12);
-    EXPECT_GT(calculateMissionHorizontalDistanceBound({2.5, 2.5, 0.0}, {-10.0, 0.0, 0.0}, 5.0, 3.0), 10.0);
+    EXPECT_GT(calculateMissionHorizontalDistanceBound({2.5, 2.5, 0.0}, {-10.0, 0.0, 0.0}, corners, 3.0), 10.0);
+}
+
+TEST(OutdoorGeometry, GpsCornersAndActualEnvelope)
+{
+    OutdoorReference reference({48.15144444, 17.07375, 150.0}, {10.0, 20.0, 3.0}, 0.0);
+    auto point = reference.convertGeodeticToMissionEnu({48.15148940567, 17.07381719675, 150.0});
+    EXPECT_NEAR(point.x, 5.0, 0.001);
+    EXPECT_NEAR(point.y, 5.0, 0.001);
+    auto poi = reference.convertGeodeticToMissionEnu({48.15146692284, 17.07378359836, 150.0});
+    EXPECT_NEAR(poi.x, 2.5, 0.001);
+    EXPECT_NEAR(poi.y, 2.5, 0.001);
+    auto corners = calculateSquareCornerPositions(poi, 5.0, 5.0);
+    corners[1] = {20.0, 0.0, 5.0};
+    EXPECT_DOUBLE_EQ(calculateMissionHorizontalDistanceBound(poi, {0.0, 0.0, 0.0}, corners, 3.0), 20.0);
 }
 
 TEST(OutdoorGeometry, FullFigureEightAndAnalyticVelocity)
