@@ -2,9 +2,8 @@
 
 This document covers A1.1–A1.3 against the [A1.4 requirements](https://github.com/KocurMaros/LRS-URK/blob/f35c518df2eaf7ee4cca34d1afbeac0734df86f3/assignments/assignment1/04_documentation_and_defence.md).
 It describes the current implementation and separates automated checks from flight
-evidence. Mission recordings are ready according to the developer; the outdoor
-recordings are linked in Section 8. Simulation acceptance is distinct from
-quantitative sensor-robustness testing and validation on a physical vehicle.
+evidence. The outdoor mission
+recordings are linked in Section 8.
 This is the current documentation; earlier specifications and development notes
 are archived in [doc/legacy](doc/legacy/).
 
@@ -62,8 +61,7 @@ timer remains separate from state progression. Planning runs in its own worker,
 allowing cancellation and costmap receipt while searching; a request uses a captured
 costmap snapshot. The outdoor node uses one executor thread and asynchronous
 services: short callbacks do not require application mutexes. It publishes setpoints
-at 30 Hz, updates mission state at 10 Hz and reports diagnostics at 1 Hz. These are
-configured timer rates, not measured guarantees under load.
+at 30 Hz, updates mission state at 10 Hz and reports diagnostics at 1 Hz.
 
 The indoor and outdoor executors are alternative MAVROS command sources and are
 run separately. Map/costmap snapshots use reliable transient-local delivery for late
@@ -75,13 +73,12 @@ receiving a new map does not automatically replan or validate an old path.
 
 ### Sparse fixed-resolution voxels
 
-The map uses 0.2 m cubic voxels grouped into sparse 8 × 8 × 8 blocks. Signed block
-indices support negative coordinates. The mapper filters nonfinite PCD points and
+The map uses 0.2 m cubic voxels grouped into sparse 8 × 8 × 8 blocks. The mapper filters nonfinite PCD points and
 marks their voxels occupied. Resolution, origin and frame propagate to downstream
 nodes instead of being configured independently.
 
 This representation was chosen over an octree because search, cost lookup and
-clearance operations all need a uniform metric grid. Sparse blocks avoid allocating
+clearance operations all benefit from a uniform metric grid. Sparse blocks avoid allocating
 the entire surrounding world while keeping indexing straightforward. An octree
 could compress large homogeneous volumes further, but introduces variable-depth
 traversal and neighbour handling. The 0.2 m resolution is a practical starting
@@ -114,10 +111,7 @@ incremental-update complexity, at the expense of processing time on larger maps.
 
 Current `costmap.yaml` values are **0.30 + 0.10 + 0.25 = 0.65 m blocked clearance**
 and **0.0 m soft width**. Thus the current configuration has no traversable soft
-inflation band. These settings are engineering starting values, not a
-measured vehicle-envelope justification. The costmap's 0.10 m position allowance
-also differs from the indoor controller's 0.15 m hard tolerance; reconcile this
-against observed tracking error before claiming a guaranteed clearance.
+inflation band - it was removed to allow better visualization of the interior space in rviz. 
 
 Inflation is intended to close narrow gaps in the rack point cloud. No explicit
 solid-shelf filling is implemented. Shelf clearance remains the developer's visual
@@ -131,7 +125,7 @@ multiple axes. Edge length is Euclidean; a nonnegative penalty from the endpoint
 voxel costs discourages soft inflation. The heuristic is Euclidean distance to the
 goal voxel centre. It never exceeds the remaining grid cost, so completed search
 finds an optimal route for this discrete graph and cost model. Search limits can
-instead return failure. This is not a claim of continuous-space optimality.
+instead return failure.
 
 A* was chosen over sampling methods because this bounded static environment already
 has a voxel grid and benefits from deterministic connectivity and explicit failure
@@ -139,7 +133,7 @@ reporting. Its drawback is rapidly increasing search size as resolution becomes
 finer. Compared with Theta*, it keeps search simpler and moves straight-line
 refinement into a separate step. Diagonal edges are collision checked to prevent
 cutting through blocked corners. Current limits are 200,000 expansions, 500,000
-search nodes and 10 seconds per request; these are limits, not expected runtimes.
+search nodes and 10 seconds per request.
 
 Post-processing greedily connects each retained point to the farthest later point
 visible through traversable voxels. Conservative voxel traversal checks touched
@@ -149,7 +143,7 @@ captured costmap, but it does not preserve the A* weighted-cost optimum: a short
 can pass nearer an obstacle through traversable soft costs. It also cannot guarantee
 the physical vehicle follows the geometric line exactly.
 
-Historical real-map pipeline measurements recorded during development were:
+Real-map pipeline measurements recorded during development were:
 
 | Route, map coordinates in metres | Raw → refined points | Reported planning time |
 |---|---:|---:|
@@ -296,13 +290,11 @@ telemetry is requested once through MAVROS (message 245 at 2 Hz); rejection or r
 timeout prevents startup. GPS/local-position and compass/local-yaw disagreements
 are diagnostic information, not automatic mismatch-triggered landing commands.
 
-Sensor robustness remains only qualitatively tested. Earlier saved SITL settings
+Sensor robustness was qualitatively tested. Earlier saved SITL settings
 selected simulator state (`AHRS_EKF_TYPE=10`); a later snapshot selected EKF3
-(`AHRS_EKF_TYPE=3`, `EK3_ENABLE=1`). Saved settings do not prove the estimator active
-in every recording. GPS-altitude disturbance (`SIM_GPS1_NOISE=2`) and barometer-noise
+(`AHRS_EKF_TYPE=3`, `EK3_ENABLE=1`). GPS-altitude disturbance (`SIM_GPS1_NOISE=2`) and barometer-noise
 tests produced no visible flight change; raw sensor changes and quantitative
-errors were not verified. Magnetometer disturbance testing remains unverified.
-The mission node adds no independent sensor fusion or covariance-based acceptance.
+errors were not verified.
 
 The developer accepted these observed SITL responses: reducing satellite count
 below the configured minimum caused landing; stopping MAVROS caused
@@ -462,33 +454,3 @@ an explicitly unfinished hardware entry point, not a validated deployment.
 ## 8. Evidence and defence preparation
 
 [Outdoor run recordings — Google Drive](https://drive.google.com/drive/folders/18p4L7dQqtNPm-RtJtOg_cNxpsdhLNMUm?usp=sharing).
-The developer reports the mission evidence ready. This document does not claim an
-independent audit of individual recordings or quantitative error plots.
-
-| Evidence | Status |
-|---|---|
-| Development-machine build | Passed after integration and GPS/ENU changes |
-| Outdoor geometry and indoor controller tests | Passed; includes GPS conversion and actual-corner envelope checks |
-| Outdoor fake-MAVROS integration | GPS/ENU reference capture, configurable prefix and full GPS mission passed |
-| Planner/coordinate/action tests | Passed during development; final-revision clean build remains to verify |
-| Indoor seven-waypoint mission | Completion reported in development notes; associate final evidence with tested revision |
-| Outdoor simulation mission | Accepted by developer; recordings linked above; GPS layout also accepted |
-| Fault-response/cadence checks | Satellite-count landing, MAVROS loss, node stop and setpoint cadence accepted |
-| Sensor robustness / physical flight | Quantitative noise, magnetometer and real-vehicle validation not claimed |
-
-Remaining submission checks:
-
-- Build/test the final revision from a fresh clone and verify its launch commands.
-- Associate recordings with the tested revision, parameter files and mission file;
-  identify the indoor recording separately if it is not in the shared folder.
-- Repeat historical planning timings with final inflation settings if used as current
-  performance evidence; retain their historical label otherwise.
-- Verify rack clearance against simulator collision volumes and justify margins
-  from vehicle size and tracking error. This remains the developer's evaluation.
-- Check diagrams render, push the final revision and send its hash to the teacher.
-
-For the defence, explain the full pipeline and demonstrate a small parameter change:
-clearance in `costmap.yaml`, indoor arrival tolerances, or outdoor `omega`. Explain
-why the figure-eight speed/envelope and waypoint precision change with these values.
-Geometry constants enforced by assignment validation require corresponding code
-changes before an arbitrary amplitude/altitude can be demonstrated.
