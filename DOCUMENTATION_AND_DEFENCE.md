@@ -1,4 +1,4 @@
-# A1 — Navigation stack: design and defence
+# A1 — Navigation stack: design and defense
 
 This document covers A1.1–A1.3 against the [A1.4 requirements](https://github.com/KocurMaros/LRS-URK/blob/f35c518df2eaf7ee4cca34d1afbeac0734df86f3/assignments/assignment1/04_documentation_and_defence.md).
 It describes the current implementation and separates automated checks from flight
@@ -38,21 +38,36 @@ flowchart TD
 ### ROS interfaces and execution
 
 ```mermaid
-flowchart LR
-    M[static_mapper: serial executor] -->|/map: VoxelMap| C[voxel_costmap: serial executor]
-    C -->|/costmap: VoxelCostmap| P[astar_planner: executor plus search worker]
-    I[mission_executor_node: 3 executor threads] -->|/compute_path_3d action| P
-    P -->|Action result: nav_msgs/Path| I
-    P -->|/plan: visualization| RV[RViz]
-    C -->|/costmap_cloud| RV
-    M -->|/map_cloud| RV
-    I -->|PositionTarget and mode/arm/takeoff/land services| V[MAVROS]
-    O[outdoor_mission_node: single-threaded executor] -->|PositionTarget and mode/arm/takeoff services| V
-    O -->|/mavros/set_message_interval| V
-    V -->|State, extended state, local pose and velocity| I
-    V -->|State, pose, velocity, GPS, home, heading and altitude| O
-    V <-->|MAVLink| AP[ArduPilot]
-    B[Gazebo clock bridge] -->|/clock| O
+flowchart TB
+    M["static_mapper"]
+    C["voxel_costmap"]
+    P["astar_planner"]
+    I["mission_executor_node"]
+    O["outdoor_mission_node"]
+    V["MAVROS"]
+    AP["ArduPilot"]
+    RV["RViz"]
+    B["Gazebo clock bridge"]
+
+    M -->|"/map:<br/>VoxelMap"| C
+    C -->|"/costmap:<br/>VoxelCostmap"| P
+
+    I -->|"/compute_path_3d"| P
+    P -->|"nav_msgs/Path"| I
+
+    M -->|"/map_cloud"| RV
+    C -->|"/costmap_cloud"| RV
+    P -->|"/plan"| RV
+
+    I -->|"PositionTarget<br/>mode/arm/takeoff/land"| V
+    V -->|"state, extended state<br/>pose, velocity"| I
+
+    O -->|"PositionTarget<br/>mode/arm/takeoff"| V
+    O -->|"/mavros/set_message_interval"| V
+    V -->|"state, pose, velocity<br/>GPS, home, heading, altitude"| O
+
+    V <-->|"MAVLink"| AP
+    B -->|"/clock"| O
 ```
 
 Indoor state-machine, setpoint and telemetry callbacks use separate callback groups
@@ -152,9 +167,7 @@ Real-map pipeline measurements recorded during development were:
 
 These are individual measurements on the development machine at 0.2 m resolution,
 with the earlier 0.5 m clearance / 0.8 m absolute outer-radius configuration.
-Inflation semantics and tuning have since changed. These results remain historical
-until repeated with submitted settings, hardware/build details and repeated-run timing.
-The action exposes planning time, expanded nodes and raw/refined point counts.
+Inflation semantics and tuning have since changed.
 
 ## 4. Indoor mission execution and heading
 
@@ -168,8 +181,7 @@ The position controller is an arrival supervisor; ArduPilot closes the position,
 attitude and motor-control loops. A soft waypoint completes within **0.50 m** without
 a stopping requirement. A hard waypoint requires **0.15 m** position error and speed
 at most **0.15 m/s**, continuously for **1 second**. These values distinguish
-pass-through points from deliberate task stops; they remain to be justified against
-measured flight error. They are configurable through `hard_tolerance_m`, `soft_tolerance_m`,
+pass-through points from deliberate task stops. They are configurable through `hard_tolerance_m`, `soft_tolerance_m`,
 `hard_speed_limit_mps` and `hard_stable_time_s`.
 
 The A* result is transformed to MAVROS local coordinates and each straight segment
@@ -224,7 +236,7 @@ can invalidate the alignment.
 
 Geodetic round-trip tests recover local points within 1e-7 m. This measures numerical
 consistency, not GPS accuracy or Earth-curvature modelling error. The tangent-plane
-curvature scale over 10 m is approximately `d²/(2R) ≈ 8 µm`, negligible. Ellipsoid altitude is used for geographic conversion; AMSL and
+curvature scale over 10 m is approximately `d²/(2R) ≈ 8 µm`, which is  negligible. Ellipsoid altitude is used for geographic conversion; AMSL and
 home/launch-relative altitude are not interchangeable.
 
 ROS-side positions and yaw use ENU: east, north, up; yaw zero east, positive
@@ -451,6 +463,6 @@ ros2 service call /outdoor_mission/abort std_srvs/srv/Trigger '{}'
 `execute_figure_eight:=false` selects square-only flight. The real-flight launch is
 an explicitly unfinished hardware entry point, not a validated deployment.
 
-## 8. Evidence and defence preparation
+## 8. Evidence and defense preparation
 
 [Outdoor run recordings — Google Drive](https://drive.google.com/drive/folders/18p4L7dQqtNPm-RtJtOg_cNxpsdhLNMUm?usp=sharing).
