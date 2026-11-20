@@ -215,3 +215,88 @@ TEST(Localizer, StationaryConvergence)
   EXPECT_NEAR(loc.ekf().x()(YAW), M_PI / 2.0, 0.05);
   EXPECT_EQ(loc.gps_stats().rejected, 0u);
 }
+
+// ---- VO updates -------------------------------------------------------------
+
+TEST(Ekf, BodyVelocityJacobianMatchesNumericalDerivative)
+{
+  std::mt19937 rng(5);
+  std::uniform_real_distribution<double> u(-1.0, 1.0);
+  for (int trial = 0; trial < 20; ++trial) {
+    StateVec x0;
+    for (int k = 0; k < kStateDim; ++k) {x0(k) = u(rng);}
+    x0(YAW) *= M_PI;
+    Eigen::Matrix<double, 3, kStateDim> H;
+    Ekf::body_velocity_model(x0, &H);
+    const double eps = 1e-6;
+    for (int j = 0; j < kStateDim; ++j) {
+      StateVec xp = x0, xm = x0;
+      xp(j) += eps;
+      xm(j) -= eps;
+      const Eigen::Vector3d numeric =
+        (Ekf::body_velocity_model(xp) - Ekf::body_velocity_model(xm)) / (2 * eps);
+      EXPECT_LT((numeric - H.col(j)).norm(), 1e-7) << "trial " << trial << " column " << j;
+    }
+  }
+}
+
+TEST(Ekf, BodyVelocityUpdateRotatesIntoWorld)
+{
+  // Facing north (yaw = pi/2), moving forward at 1 m/s in body x = +y in ENU.
+  StateVec x0 = StateVec::Zero();
+  x0(YAW) = M_PI / 2.0;
+  StateMat P0 = StateMat::Identity();
+  P0(YAW, YAW) = 1e-6;
+  Ekf ekf;
+  ekf.initialize(0.0, x0, P0);
+  for (int i = 0; i < 20; ++i) {
+    ekf.update_body_velocity(Eigen::Vector3d(1.0, 0.0, 0.0),
+      Eigen::Matrix3d::Identity() * 0.01, 0.0);
+  }
+  EXPECT_NEAR(ekf.x()(VX), 0.0, 0.02);
+  EXPECT_NEAR(ekf.x()(VY), 1.0, 0.02);
+}
+
+TEST(Ekf, YawUpdateWrapsInnovation)
+{
+  StateVec x0 = StateVec::Zero();
+  x0(YAW) = M_PI - 0.05;
+  Ekf ekf = make_ekf(x0, 0.1);
+  const auto r = ekf.update_yaw(-M_PI + 0.05, 0.01, 0.0);  // 0.1 rad away, across +-pi
+  ASSERT_TRUE(r.accepted);
+  EXPECT_LT(r.nis, 1.0);  // small innovation, not ~2 pi
+  EXPECT_GT(std::abs(ekf.x()(YAW)), M_PI - 0.05);
+}
+
+TEST(Localizer, RelativeVoYawEstimatesGyroBiasInFlight)
+{
+  LocalizerConfig cfg;
+  cfg.init_gps_samples = 5;
+  cfg.init_bias_from_gyro = false;  // force the filter to find the bias itself
+  Localizer loc(cfg);
+  std::mt19937 rng(3);
+  std::normal_distribution<double> n(0.0, 1.0);
+  const double bias = -0.017;
+  const Eigen::Matrix3d gps_cov = Eigen::Vector3d(0.36, 0.36, 0.81).asDiagonal();
+  double yaw = M_PI / 2.0;
+  for (int i = 1; i <= 6000; ++i) {  // 60 s, turning slowly
+    const double t = i * 0.01;
+    const double rate = 0.2 * std::sin(0.1 * t);
+    yaw = wrap_angle(yaw + rate * 0.01);
+    loc.on_imu(t, rate + bias + 0.004 * n(rng));
+    if (i % 20 == 0) {
+      loc.on_gps(t, Eigen::Vector3d(0.6 * n(rng), 0.6 * n(rng), 0.9 * n(rng)), gps_cov);
+    }
+    if (i % 3 == 0) {
+      loc.on_vo(t, wrap_angle(yaw + 0.005 * n(rng)),
+        Eigen::Vector3d(0.03 * n(rng), 0.03 * n(rng), 0.03 * n(rng)),
+        Eigen::Vector3d::Constant(0.0009));
+    }
+  }
+  ASSERT_TRUE(loc.initialized());
+  EXPECT_NEAR(loc.ekf().x()(BIAS), bias, 0.001);
+  EXPECT_GT(loc.vo_yaw_stats().accepted, 20u);
+  EXPECT_LT(std::abs(wrap_angle(loc.ekf().x()(YAW) - yaw)), 0.05);
+  // Velocity is now tightly constrained (drone is hovering).
+  EXPECT_LT(loc.ekf().x().segment<3>(VX).norm(), 0.1);
+}

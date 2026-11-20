@@ -8,7 +8,7 @@ increment; the full design document follows at the end.
 |---|---|
 | 1. Sensor acquisition and characterisation (§1) | **done** |
 | 2. EKF core: predict + GPS | **done** |
-| 3. Yaw, gyro bias, VO updates | – |
+| 3. Yaw, gyro bias, VO updates | **done** |
 | 4. ROS estimator node + evaluator | – |
 | 5. Outages, outlier gating (§3) | – |
 | 6. Flight on the estimate (§4), separate package | – |
@@ -202,3 +202,87 @@ GPS + gyro only, simulated §4 mission, five seeds:
 
 Yaw and bias are **unobservable** with GPS alone, so their uncertainty keeps
 growing. Increment 3 adds the VO yaw and body-velocity updates.
+
+## VO updates, yaw and gyro bias (increment 3)
+
+Each VO message (30 Hz) triggers two updates.
+
+**1. Body velocity, a genuine EKF update.** VO reports velocity in
+`base_link`, so the measurement model rotates the world velocity by the
+*estimated* yaw:
+
+```
+h(x) = [  cos(yaw)·vx + sin(yaw)·vy ]      ∂h/∂yaw = [ −sin·vx + cos·vy ]
+       [ −sin(yaw)·vx + cos(yaw)·vy ]                [ −cos·vx − sin·vy ]
+       [  vz                        ]                [  0               ]
+```
+
+The yaw column couples VO with GPS. While the drone moves horizontally, GPS
+says which way it travels in `map`, and VO says which way it travels in the
+body frame. Together they make **absolute yaw observable**. `test_ekf` checks
+the Jacobian against finite differences on 20 random states.
+
+R uses σ = max(message σ, **0.2 m/s**). That is far above the per-sample noise
+(0.03 m/s) on purpose. VO's velocity bias (about 0.01 m/s) and scale error are
+*correlated* over time, but the filter treats VO samples as independent. At
+σ = 0.05 the filter was overconfident (only about 55 % of position errors
+within 2σ) and *less* accurate, because VO's bias dragged the position. At 0.2
+it is both the most accurate setting and consistent.
+
+**2. VO yaw, used as a relative measurement of the gyro bias.** Every
+`vo_yaw_window` (2 s) the filter compares how far the gyro says the drone
+turned with how far VO saw it turn:
+
+```
+b_meas = ( ∫gyro dt − wrap(ψ_vo(t) − ψ_vo(t−T)) ) / T
+```
+
+This directly measures the bias, without involving the yaw state. Its variance
+is (√2·0.3°/T)² from VO pose noise, plus the gyro noise, plus a
+`vo_yaw_rate_sigma` (0.001 rad/s) allowance for VO's own yaw-rate drift. The
+gyro integral is evaluated exactly at the VO stamps.
+
+**Why absolute VO yaw is not fused (default off, `vo_yaw_absolute`).** The
+`vo_odom` frame starts aligned with `map`, but its yaw drifts (random walk
+plus a rate bias) from the moment the sensor simulator starts. The idle time
+before takeoff decides how far it has drifted. With 60 s of idle time, fusing
+it put the yaw error within 2σ only 48–69 % of the time. The relative form
+only needs VO to be good over 2 s, and that holds.
+
+**VO position is not fused either.** It is the integral of the same velocity
+signal (so it would repeat that information) and drifts about 0.6 m/min.
+
+### Observability, as seen in the data
+
+![seed 73](doc/inc3_seed73_yaw_follow.png)
+
+- **On the ground and hovering (first 75 s):** the relative update finds the
+  bias within about 0.0003 rad/s. Nothing observes absolute yaw yet, though, so
+  yaw creeps a few degrees off (VO's own yaw-rate drift leaks into the bias
+  measurement). The filter knows: the yaw 2σ band stays about ±15°.
+- **First horizontal leg:** the velocity coupling makes yaw observable. It
+  locks to within about 1°, and the band shrinks to about ±3°.
+- The **worst-case yaw error, about 8–10°**, comes from this pre-flight creep,
+  just before the first leg corrects it.
+
+### Results (simulated §4 mission, 8 seeds, 60 s idle, bias *not* known)
+
+| metric | GPS only | **GPS + VO + gyro** |
+|---|---|---|
+| horizontal RMS (in flight) | 0.49 m | **0.13–0.15 m** (max 0.49 m) |
+| z RMS | 0.45 m | **0.12–0.13 m** |
+| velocity RMS | 0.57 m/s | **0.045 m/s** |
+| yaw RMS in flight | — (bias unknown: 53–71°) | **1.5–2.1°** |
+| gyro bias error at end | not observable | **0.0003 rad/s** |
+| errors within 2σ (x,y / z / yaw) | | **0.95–0.97 / 0.94 / 0.94–1.00** |
+
+"Bias not known" means `init_bias_from_gyro=0`, the hardest case. The default
+(bias from the ground gyro mean) only shortens the transient.
+
+Reproduce with:
+
+```bash
+ros2 run drone_localization evaluate_replay.py --sim 42 --sim 73 --yaw-follow
+ros2 run drone_localization evaluate_replay.py --sim 42 --sensors imu,gps        # GPS-only baseline
+ros2 run drone_localization evaluate_replay.py --sim 42 vo_velocity_sigma=0.05   # overconfident
+```

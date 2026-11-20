@@ -69,6 +69,10 @@ void Localizer::on_imu(double t, double gyro_z)
   }
 
   // A gyro sample stamped t describes the rate over the interval ending at t.
+  if (t > gyro_integral_stamp_ && gyro_integral_stamp_ > 0.0) {
+    gyro_integral_ += gyro_z * (t - gyro_integral_stamp_);
+  }
+  gyro_integral_stamp_ = t;
   ekf_.predict(t, gyro_z);
   last_gyro_ = gyro_z;
   have_gyro_ = true;
@@ -131,6 +135,88 @@ void Localizer::on_gps(double t, const Eigen::Vector3d & position, const Eigen::
       "GPS rejected at t=%.2f: NIS %.1f > %.1f, innovation (%.2f, %.2f, %.2f) m",
       t, r.nis, config_.gps_gate_chi2, d.x(), d.y(), d.z()));
   }
+}
+
+double Localizer::gyro_integral_at(double t) const
+{
+  return gyro_integral_ + last_gyro_ * (t - gyro_integral_stamp_);
+}
+
+void Localizer::on_vo(
+  double t, double vo_yaw, const Eigen::Vector3d & body_velocity,
+  const Eigen::Vector3d & velocity_var)
+{
+  ++vo_vel_.received;
+  ++vo_yaw_.received;
+  if (!ekf_.initialized()) {return;}
+  if (!align_to(t, vo_vel_, "VO")) {return;}
+
+  if (config_.vo_velocity_enabled) {
+    Eigen::Matrix3d R = Eigen::Matrix3d::Zero();
+    const double floor = config_.vo_velocity_sigma * config_.vo_velocity_sigma;
+    for (int i = 0; i < 3; ++i) {R(i, i) = std::max(velocity_var(i), floor);}
+    const UpdateResult r = ekf_.update_body_velocity(
+      body_velocity, R, config_.vo_velocity_gate_chi2);
+    vo_vel_.last_nis = r.nis;
+    vo_vel_.last_stamp = t;
+    if (r.accepted) {
+      ++vo_vel_.accepted;
+    } else {
+      ++vo_vel_.rejected;
+      log(LogLevel::Debug, format("VO velocity rejected at t=%.2f: NIS %.1f", t, r.nis));
+    }
+  }
+  vo_yaw_updates(t, vo_yaw);
+}
+
+void Localizer::vo_yaw_updates(double t, double vo_yaw)
+{
+  vo_yaw_.last_stamp = t;
+
+  if (config_.vo_yaw_absolute && t - last_abs_yaw_t_ >= config_.vo_yaw_period) {
+    last_abs_yaw_t_ = t;
+    const UpdateResult r = ekf_.update_yaw(
+      vo_yaw, config_.vo_yaw_sigma * config_.vo_yaw_sigma, config_.vo_yaw_gate_chi2);
+    vo_yaw_.last_nis = r.nis;
+    r.accepted ? ++vo_yaw_.accepted : ++vo_yaw_.rejected;
+  }
+
+  if (!config_.vo_yaw_relative) {return;}
+  const double g = gyro_integral_at(t);
+  if (!have_vo_anchor_) {
+    have_vo_anchor_ = true;
+    vo_anchor_t_ = t;
+    vo_anchor_yaw_ = vo_yaw;
+    vo_anchor_gyro_ = g;
+    return;
+  }
+  const double dt = t - vo_anchor_t_;
+  if (dt < config_.vo_yaw_window) {return;}
+
+  // Over [anchor, t]: gyro turned (g - g0) = (true turn + b*dt); VO saw the
+  // true turn (plus its small drift), so their difference per second is b.
+  const double vo_turn = wrap_angle(vo_yaw - vo_anchor_yaw_);
+  const double gyro_turn = g - vo_anchor_gyro_;
+  const double bias_meas = (gyro_turn - vo_turn) / dt;
+  const double endpoint = std::sqrt(2.0) * config_.vo_pose_yaw_sigma / dt;
+  const double gyro_noise = config_.noise.gyro_noise *
+    std::sqrt(dt / config_.noise.gyro_rate) / dt;
+  const double var = endpoint * endpoint + gyro_noise * gyro_noise +
+    config_.vo_yaw_rate_sigma * config_.vo_yaw_rate_sigma;
+
+  const UpdateResult r = ekf_.update_bias(bias_meas, var, config_.vo_yaw_gate_chi2);
+  vo_yaw_.last_nis = r.nis;
+  if (r.accepted) {
+    ++vo_yaw_.accepted;
+  } else {
+    ++vo_yaw_.rejected;
+    log(LogLevel::Warn, format(
+      "VO yaw-rate bias measurement rejected at t=%.2f: %.4f rad/s, NIS %.1f",
+      t, bias_meas, r.nis));
+  }
+  vo_anchor_t_ = t;
+  vo_anchor_yaw_ = vo_yaw;
+  vo_anchor_gyro_ = g;
 }
 
 void Localizer::try_initialize()
