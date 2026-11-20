@@ -44,6 +44,30 @@ struct LocalizerConfig
   std::array<double, 3> gps_sigma{0.6, 0.6, 0.9};  // used if the message has none
   double gps_sigma_scale = 1.0;       // multiplies the GPS standard deviation
   double gps_gate_chi2 = 16.27;       // chi2(3 dof) at 99.9 %; <= 0 disables
+
+  // VO body velocity (nonlinear in yaw).
+  bool vo_velocity_enabled = true;
+  // [m/s] floor on the per-axis sigma. Deliberately much larger than the
+  // per-sample noise (0.03): the VO bias and scale error are correlated in
+  // time, and fusing them at 30 Hz as white noise made the filter
+  // overconfident (tuned offline: 0.2 gives the lowest error *and* ~95 % 2-sigma
+  // consistency).
+  double vo_velocity_sigma = 0.2;
+  double vo_velocity_gate_chi2 = 16.27;
+
+  // VO yaw. The message covariance (0.3 deg) only describes per-sample noise,
+  // not the slow vo_odom drift, so it is not used for the absolute update.
+  // Off by default: vo_odom yaw drifts away from map (random walk + rate bias)
+  // from the moment the sensor simulator starts, so it is a biased heading;
+  // fusing it made yaw inconsistent after an idle period.
+  bool vo_yaw_absolute = false;       // fuse VO yaw as absolute heading
+  double vo_yaw_sigma = 0.05;         // [rad] absolute: must cover accumulated drift
+  double vo_yaw_period = 1.0;         // [s] decimation of the absolute update
+  bool vo_yaw_relative = true;        // bias from (gyro integral - VO yaw change)
+  double vo_yaw_window = 2.0;         // [s] baseline of the relative measurement
+  double vo_pose_yaw_sigma = 0.0052;  // [rad] VO per-sample yaw noise (0.3 deg)
+  double vo_yaw_rate_sigma = 0.001;   // [rad/s] VO yaw-rate drift allowance
+  double vo_yaw_gate_chi2 = 10.83;    // chi2(1 dof) at 99.9 %
 };
 
 struct SensorStats
@@ -71,11 +95,18 @@ public:
   void on_imu(double t, double gyro_z);
   // `cov` is the 3x3 position covariance from the message (may be zero).
   void on_gps(double t, const Eigen::Vector3d & position, const Eigen::Matrix3d & cov);
+  // `vo_yaw` in vo_odom, `body_velocity` in base_link, `velocity_var` per axis
+  // from the message twist covariance (may be zero).
+  void on_vo(
+    double t, double vo_yaw, const Eigen::Vector3d & body_velocity,
+    const Eigen::Vector3d & velocity_var);
 
   bool initialized() const {return ekf_.initialized();}
   const Ekf & ekf() const {return ekf_;}
   const SensorStats & gps_stats() const {return gps_;}
   const SensorStats & imu_stats() const {return imu_;}
+  const SensorStats & vo_velocity_stats() const {return vo_vel_;}
+  const SensorStats & vo_yaw_stats() const {return vo_yaw_;}
 
 private:
   void log(LogLevel level, const std::string & msg) const;
@@ -88,7 +119,17 @@ private:
   Ekf ekf_;
   LogFn log_;
 
-  SensorStats gps_, imu_;
+  // Integral of the raw gyro over IMU stamps, evaluated at any time t by
+  // extending the last sample (aligns the gyro with VO stamps).
+  double gyro_integral_at(double t) const;
+  void vo_yaw_updates(double t, double vo_yaw);
+
+  SensorStats gps_, imu_, vo_vel_, vo_yaw_;
+  double gyro_integral_ = 0.0;
+  double gyro_integral_stamp_ = 0.0;
+  bool have_vo_anchor_ = false;
+  double vo_anchor_t_ = 0.0, vo_anchor_yaw_ = 0.0, vo_anchor_gyro_ = 0.0;
+  double last_abs_yaw_t_ = -1e9;
   double last_gyro_ = 0.0;
   bool have_gyro_ = false;
 

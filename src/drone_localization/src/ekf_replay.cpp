@@ -3,6 +3,7 @@
 // Input (CSV, one event per line, in arrival order):
 //   imu,t,gyro_z
 //   gps,t,x,y,z,var_x,var_y,var_z
+//   vo,t,yaw,vbx,vby,vbz,var_vx,var_vy,var_vz
 //   # comments and blank lines are ignored
 //
 // Output (CSV to stdout), one row per accepted IMU step after initialisation
@@ -44,6 +45,11 @@ bool apply_override(LocalizerConfig & c, const std::string & key, double v)
     {"init_bias_sigma", &c.init_bias_sigma},
     {"max_measurement_lag", &c.max_measurement_lag},
     {"gps_sigma_scale", &c.gps_sigma_scale}, {"gps_gate_chi2", &c.gps_gate_chi2},
+    {"vo_velocity_sigma", &c.vo_velocity_sigma},
+    {"vo_velocity_gate_chi2", &c.vo_velocity_gate_chi2},
+    {"vo_yaw_sigma", &c.vo_yaw_sigma}, {"vo_yaw_period", &c.vo_yaw_period},
+    {"vo_yaw_window", &c.vo_yaw_window}, {"vo_pose_yaw_sigma", &c.vo_pose_yaw_sigma},
+    {"vo_yaw_rate_sigma", &c.vo_yaw_rate_sigma}, {"vo_yaw_gate_chi2", &c.vo_yaw_gate_chi2},
   };
   if (auto it = doubles.find(key); it != doubles.end()) {
     *it->second = v;
@@ -52,6 +58,9 @@ bool apply_override(LocalizerConfig & c, const std::string & key, double v)
   if (key == "init_gps_samples") {c.init_gps_samples = static_cast<int>(v); return true;}
   if (key == "init_bias_from_gyro") {c.init_bias_from_gyro = v != 0.0; return true;}
   if (key == "gps_use_message_covariance") {c.gps_use_message_covariance = v != 0.0; return true;}
+  if (key == "vo_velocity_enabled") {c.vo_velocity_enabled = v != 0.0; return true;}
+  if (key == "vo_yaw_absolute") {c.vo_yaw_absolute = v != 0.0; return true;}
+  if (key == "vo_yaw_relative") {c.vo_yaw_relative = v != 0.0; return true;}
   return false;
 }
 
@@ -123,10 +132,15 @@ int main(int argc, char ** argv)
     } else if (kind == "gps" && v.size() >= 7) {
       Eigen::Matrix3d cov = Eigen::Vector3d(v[4], v[5], v[6]).asDiagonal();
       loc.on_gps(v[0], Eigen::Vector3d(v[1], v[2], v[3]), cov);
+    } else if (kind == "vo" && v.size() >= 8) {
+      loc.on_vo(v[0], v[1], Eigen::Vector3d(v[2], v[3], v[4]),
+        Eigen::Vector3d(v[5], v[6], v[7]));
     }
   }
 
   print_stats("IMU", loc.imu_stats());
   print_stats("GPS", loc.gps_stats());
+  print_stats("VOv", loc.vo_velocity_stats());
+  print_stats("VOy", loc.vo_yaw_stats());
   return 0;
 }

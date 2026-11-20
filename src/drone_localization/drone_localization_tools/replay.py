@@ -17,6 +17,7 @@ from drone_localization_tools import analysis as an
 EST_COLUMNS = ['t', 'x', 'y', 'z', 'vx', 'vy', 'vz', 'yaw', 'bias',
                'sx', 'sy', 'sz', 'svx', 'svy', 'svz', 'syaw', 'sbias']
 GPS_VAR = (0.36, 0.36, 0.81)
+VO_VEL_VAR = 0.03 ** 2  # what the sensor simulator puts in the twist covariance
 
 
 def find_binary(explicit=None):
@@ -35,7 +36,7 @@ def find_binary(explicit=None):
     raise FileNotFoundError('ekf_replay not found; build the package or set EKF_REPLAY')
 
 
-def to_events(data, sensors=('imu', 'gps'), jitter=0.0, seed=0):
+def to_events(data, sensors=('imu', 'gps', 'vo'), jitter=0.0, seed=0):
     """Return event lines sorted by arrival (``recv`` column, plus optional jitter)."""
     rng = np.random.default_rng(seed)
     events = []
@@ -48,11 +49,17 @@ def to_events(data, sensors=('imu', 'gps'), jitter=0.0, seed=0):
             recv = recv + abs(rng.normal(0.0, jitter)) if jitter > 0 else recv
             events.append((recv, f'gps,{t:.6f},{x:.6f},{y:.6f},{z:.6f},'
                                  f'{GPS_VAR[0]},{GPS_VAR[1]},{GPS_VAR[2]}'))
+    if 'vo' in sensors and 'vo' in data:
+        for row in data['vo']:
+            t, yaw, vb, recv = row[0], row[4], row[5:8], row[8]
+            recv = recv + abs(rng.normal(0.0, jitter)) if jitter > 0 else recv
+            events.append((recv, f'vo,{t:.6f},{yaw:.8f},{vb[0]:.6f},{vb[1]:.6f},{vb[2]:.6f},'
+                                 f'{VO_VEL_VAR},{VO_VEL_VAR},{VO_VEL_VAR}'))
     events.sort(key=lambda e: e[0])
     return [e[1] for e in events]
 
 
-def run(data, sensors=('imu', 'gps'), overrides=None, binary=None, every=1, jitter=0.0):
+def run(data, sensors=('imu', 'gps', 'vo'), overrides=None, binary=None, every=1, jitter=0.0):
     """Run the replay and return (estimate array, stderr text)."""
     binary = find_binary(binary)
     with tempfile.NamedTemporaryFile('w', suffix='.csv', delete=False) as f:

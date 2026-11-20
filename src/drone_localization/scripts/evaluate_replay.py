@@ -37,7 +37,7 @@ def main():
     p.add_argument('--sim', type=int, action='append', default=[], metavar='SEED')
     p.add_argument('--profile', choices=('mission', 'characterisation'), default='mission')
     p.add_argument('--yaw-follow', action='store_true', help='simulated drone faces each leg')
-    p.add_argument('--sensors', default='imu,gps')
+    p.add_argument('--sensors', default='imu,gps,vo')
     p.add_argument('--binary', help='path to ekf_replay')
     p.add_argument('--out', default='replay_plots')
     p.add_argument('overrides', nargs='*', help='filter parameters as key=value')

@@ -71,6 +71,20 @@ public:
   UpdateResult update_position(
     const Eigen::Vector3d & z, const Eigen::Matrix3d & R, double gate_chi2);
 
+  // VO body-frame velocity: h(x) = Rz(yaw)^T [vx vy vz] (nonlinear in yaw).
+  UpdateResult update_body_velocity(
+    const Eigen::Vector3d & z, const Eigen::Matrix3d & R, double gate_chi2);
+
+  // VO measurement model h(x) and, optionally, its Jacobian H = dh/dx.
+  static Eigen::Vector3d body_velocity_model(
+    const StateVec & x, Eigen::Matrix<double, 3, kStateDim> * H = nullptr);
+
+  // Absolute yaw measurement (innovation wrapped).
+  UpdateResult update_yaw(double z, double variance, double gate_chi2);
+
+  // Direct measurement of the gyro bias.
+  UpdateResult update_bias(double z, double variance, double gate_chi2);
+
   const StateVec & x() const {return x_;}
   const StateMat & P() const {return P_;}
   double time() const {return t_;}
