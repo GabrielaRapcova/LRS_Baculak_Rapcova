@@ -1,7 +1,8 @@
 // §1 Sensor acquisition and characterisation.
 //
 // Subscribes to the three public localisation sensors with sensor-data QoS and
-// reports, every `report_period_s` of wall time:
+// reports, every `window_s` of *simulation* time (taken from IMU header
+// stamps, so the window holds the same amount of data at any real-time factor):
 //   * rate measured from header stamps (simulation time) and from arrival;
 //   * frame_id / child_frame_id checks against the sensor contract;
 //   * duplicate and out-of-order stamps;
@@ -132,8 +133,9 @@ public:
     map_frame_ = declare_parameter<std::string>("map_frame", "map");
     vo_frame_ = declare_parameter<std::string>("vo_frame", "vo_odom");
     body_frame_ = declare_parameter<std::string>("body_frame", "base_link");
-    const double report_period =
-      declare_parameter<double>("report_period_s", 5.0);
+    window_s_ = declare_parameter<double>("window_s", 10.0);
+    const double stall_period =
+      declare_parameter<double>("stall_warning_s", 10.0);
 
     const auto qos = rclcpp::SensorDataQoS();
     gps_sub_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
@@ -146,9 +148,9 @@ public:
       imu_topic_, qos,
       [this](sensor_msgs::msg::Imu::ConstSharedPtr m) {on_imu(*m);});
 
-    // Wall timer so a report appears even when /clock stalls.
-    report_timer_ = create_wall_timer(
-      std::chrono::duration<double>(report_period), [this]() {report();});
+    // Wall timer only to complain when no sensor data arrives at all.
+    stall_timer_ = create_wall_timer(
+      std::chrono::duration<double>(stall_period), [this]() {check_stall();});
 
     RCLCPP_INFO(get_logger(),
       "sensor_check: GPS=%s VO=%s IMU=%s (use_sim_time=%s)",
@@ -202,10 +204,25 @@ private:
   {
     std::lock_guard<std::mutex> lock(mutex_);
     check_frame("IMU", "frame_id", m.header.frame_id, body_frame_, imu_);
-    if (!imu_.add(stamp_seconds(m.header.stamp), steady_clock_.now())) {return;}
+    const double stamp = stamp_seconds(m.header.stamp);
+    if (!imu_.add(stamp, steady_clock_.now())) {return;}
     gyro_z_.add(m.angular_velocity.z);
     gyro_var_ = m.angular_velocity_covariance[8];
     imu_orientation_flag_ = m.orientation_covariance[0];
+    ++total_imu_;
+    if (stamp - imu_.first_stamp >= window_s_) {
+      report(stamp - imu_.first_stamp);
+    }
+  }
+
+  void check_stall()
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (total_imu_ == last_total_imu_) {
+      RCLCPP_WARN(get_logger(),
+        "no IMU data in the last wall-clock period: is the sensor simulator running?");
+    }
+    last_total_imu_ = total_imu_;
   }
 
   void report_stream(const char * name, const StreamStats & s)
@@ -217,10 +234,13 @@ private:
       s.duplicates, s.out_of_order, s.frame_errors);
   }
 
-  void report()
+  // Called with mutex_ held.
+  void report(double sim_span)
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    RCLCPP_INFO(get_logger(), "---- sensor window (stamps are simulation time) ----");
+    const double wall_span = (imu_.last_arrival - imu_.first_arrival).seconds();
+    RCLCPP_INFO(get_logger(),
+      "---- sensor window: %.1f s sim time in %.1f s wall (real-time factor %.2f) ----",
+      sim_span, wall_span, wall_span > 0.0 ? sim_span / wall_span : 0.0);
     report_stream("GPS", gps_);
     report_stream("VO", vo_);
     report_stream("IMU", imu_);
@@ -266,7 +286,9 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr gps_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr vo_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
-  rclcpp::TimerBase::SharedPtr report_timer_;
+  rclcpp::TimerBase::SharedPtr stall_timer_;
+  double window_s_ = 10.0;
+  std::size_t total_imu_ = 0, last_total_imu_ = 0;
 
   // Arrival is measured on a steady wall clock, independent of /clock.
   rclcpp::Clock steady_clock_{RCL_STEADY_TIME};

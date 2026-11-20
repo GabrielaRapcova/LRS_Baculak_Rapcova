@@ -51,7 +51,8 @@ DEFAULT_CONFIG = {
 }
 
 # Gazebo world IMU (fei_lrs_gazebo_localization.world): z noise 0.004, bias mean
-# 0.02 with stddev 0.004, drawn once per run.
+# 0.02 with stddev 0.004, drawn once per run. Gazebo flips the bias sign at
+# random (a real seed-42 run measured about -0.017 rad/s).
 GYRO_NOISE_STD = 0.004
 GYRO_BIAS_MEAN = 0.02
 GYRO_BIAS_STD = 0.004
@@ -134,6 +135,8 @@ def simulate(truth, seed=42, gyro_seed=None, config=None, events=(), sensor_mode
     corruptor = sm.SensorCorruptor(seed, cfg)
     grng = np.random.default_rng(seed + 1000 if gyro_seed is None else gyro_seed)
     gyro_bias = GYRO_BIAS_MEAN + grng.normal(0.0, GYRO_BIAS_STD)
+    if grng.uniform() < 0.5:
+        gyro_bias = -gyro_bias
 
     events = sorted(events)
     ev_i = 0
