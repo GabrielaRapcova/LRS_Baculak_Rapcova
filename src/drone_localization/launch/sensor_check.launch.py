@@ -8,7 +8,7 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     return LaunchDescription([
-        DeclareLaunchArgument('report_period_s', default_value='5.0'),
+        DeclareLaunchArgument('window_s', default_value='10.0'),
         Node(
             package='drone_localization',
             executable='sensor_check_node',
@@ -16,7 +16,7 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'use_sim_time': True,
-                'report_period_s': LaunchConfiguration('report_period_s'),
+                'window_s': LaunchConfiguration('window_s'),
             }],
         ),
     ])
