@@ -6,7 +6,8 @@ The arrays use one row per message and these columns:
     vo    : t, x, y, z, yaw, vbx, vby, vbz, recv
     imu   : t, wz, recv
     truth : t, x, y, z, yaw, vx, vy, vz, wz, recv
-    est   : t, x, y, z, yaw, vx, vy, vz, recv      (estimator output, optional)
+    est   : t, x, y, z, vx, vy, vz, yaw, bias, 8 sigmas
+            (from /localization/estimate_state, same layout as ekf_replay output)
 
 ``t`` is the header stamp (simulation time) and ``recv`` the bag receive time,
 both in seconds. Only this module depends on ROS, so the analysis functions can
@@ -22,7 +23,7 @@ TOPICS = {
     'vo': '/localization/vo',
     'imu': '/localization/imu',
     'truth': '/evaluation/ground_truth',
-    'est': '/localization/estimate',
+    'est': '/localization/estimate_state',
 }
 
 
@@ -41,6 +42,8 @@ def _row(kind, msg, recv):
         return [_stamp(msg.header), p.x, p.y, p.z, recv]
     if kind == 'imu':
         return [_stamp(msg.header), msg.angular_velocity.z, recv]
+    if kind == 'est':
+        return list(msg.data[:17]) if len(msg.data) >= 17 else None
     # Odometry-based streams.
     p = msg.pose.pose.position
     v = msg.twist.twist.linear
@@ -76,6 +79,8 @@ def read_bag(path, topics=None):
         if name not in msg_types:
             continue
         msg = deserialize_message(data, msg_types[name])
-        rows[wanted[name]].append(_row(wanted[name], msg, recv_ns * 1e-9))
+        row = _row(wanted[name], msg, recv_ns * 1e-9)
+        if row is not None:
+            rows[wanted[name]].append(row)
 
     return {kind: np.asarray(r, dtype=float) for kind, r in rows.items() if r}

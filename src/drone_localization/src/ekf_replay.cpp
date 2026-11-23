@@ -43,6 +43,7 @@ bool apply_override(LocalizerConfig & c, const std::string & key, double v)
     {"init_yaw", &c.init_yaw}, {"init_yaw_sigma", &c.init_yaw_sigma},
     {"init_velocity_sigma", &c.init_velocity_sigma},
     {"init_bias_sigma", &c.init_bias_sigma},
+    {"init_bias_min_sigma", &c.init_bias_min_sigma},
     {"max_measurement_lag", &c.max_measurement_lag},
     {"gps_sigma_scale", &c.gps_sigma_scale}, {"gps_gate_chi2", &c.gps_gate_chi2},
     {"vo_velocity_sigma", &c.vo_velocity_sigma},
@@ -50,17 +51,30 @@ bool apply_override(LocalizerConfig & c, const std::string & key, double v)
     {"vo_yaw_sigma", &c.vo_yaw_sigma}, {"vo_yaw_period", &c.vo_yaw_period},
     {"vo_yaw_window", &c.vo_yaw_window}, {"vo_pose_yaw_sigma", &c.vo_pose_yaw_sigma},
     {"vo_yaw_rate_sigma", &c.vo_yaw_rate_sigma}, {"vo_yaw_gate_chi2", &c.vo_yaw_gate_chi2},
+    {"gps_timeout", &c.gps_timeout}, {"vo_timeout", &c.vo_timeout},
+    {"imu_timeout", &c.imu_timeout},
+    {"zaru_window", &c.zaru_window}, {"zaru_rate_sigma", &c.zaru_rate_sigma},
+    {"rest_enter_height", &c.rest_enter_height}, {"rest_exit_height", &c.rest_exit_height},
+    {"rest_enter_speed", &c.rest_enter_speed}, {"rest_exit_speed", &c.rest_exit_speed},
+    {"rest_enter_time", &c.rest_enter_time}, {"zupt_sigma", &c.zupt_sigma},
+    {"zupt_gate_chi2", &c.zupt_gate_chi2},
   };
   if (auto it = doubles.find(key); it != doubles.end()) {
     *it->second = v;
     return true;
   }
   if (key == "init_gps_samples") {c.init_gps_samples = static_cast<int>(v); return true;}
+  if (key == "gps_max_consecutive_rejections") {
+    c.gps_max_consecutive_rejections = static_cast<int>(v);
+    return true;
+  }
   if (key == "init_bias_from_gyro") {c.init_bias_from_gyro = v != 0.0; return true;}
   if (key == "gps_use_message_covariance") {c.gps_use_message_covariance = v != 0.0; return true;}
   if (key == "vo_velocity_enabled") {c.vo_velocity_enabled = v != 0.0; return true;}
   if (key == "vo_yaw_absolute") {c.vo_yaw_absolute = v != 0.0; return true;}
   if (key == "vo_yaw_relative") {c.vo_yaw_relative = v != 0.0; return true;}
+  if (key == "zaru_enabled") {c.zaru_enabled = v != 0.0; return true;}
+  if (key == "zupt_enabled") {c.zupt_enabled = v != 0.0; return true;}
   return false;
 }
 
@@ -142,5 +156,7 @@ int main(int argc, char ** argv)
   print_stats("GPS", loc.gps_stats());
   print_stats("VOv", loc.vo_velocity_stats());
   print_stats("VOy", loc.vo_yaw_stats());
+  print_stats("ZARU", loc.zaru_stats());
+  print_stats("ZUPT", loc.zupt_stats());
   return 0;
 }

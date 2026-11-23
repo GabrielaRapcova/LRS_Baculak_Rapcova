@@ -18,9 +18,10 @@ find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 
 # --- Estimator core: plain C++/Eigen, no ROS (shared by node, replay, tests) -
-add_library(drone_localization_core
+add_library(drone_localization_core STATIC
   src/ekf.cpp
   src/localizer.cpp)
+set_target_properties(drone_localization_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(drone_localization_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
@@ -35,9 +36,19 @@ add_executable(sensor_check_node src/sensor_check_node.cpp)
 ament_target_dependencies(sensor_check_node
   rclcpp geometry_msgs nav_msgs sensor_msgs)
 
-install(TARGETS sensor_check_node ekf_replay DESTINATION lib/${PROJECT_NAME})
-install(TARGETS drone_localization_core
+# --- §2/§3 estimator node ----------------------------------------------------
+add_executable(estimator_node src/estimator_node.cpp)
+target_link_libraries(estimator_node drone_localization_core)
+ament_target_dependencies(estimator_node
+  rclcpp geometry_msgs nav_msgs sensor_msgs std_msgs)
+
+install(TARGETS sensor_check_node estimator_node ekf_replay
+  DESTINATION lib/${PROJECT_NAME})
+install(TARGETS drone_localization_core EXPORT export_drone_localization
   ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
+# Exported so localization_flight's closed-loop test can link the same filter.
+ament_export_targets(export_drone_localization HAS_LIBRARY_TARGET)
+ament_export_dependencies(eigen3_cmake_module Eigen3)
 install(DIRECTORY include/ DESTINATION include)
 
 # --- Python tooling (bag analysis, characterisation flight) ----------------
@@ -45,11 +56,12 @@ ament_python_install_package(drone_localization_tools)
 install(PROGRAMS
   scripts/characterize_sensors.py
   scripts/evaluate_replay.py
+  scripts/estimate_evaluator.py
   scripts/characterisation_flight.py
   scripts/record_characterisation.sh
   DESTINATION lib/${PROJECT_NAME})
 
-install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
+install(DIRECTORY launch config DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)

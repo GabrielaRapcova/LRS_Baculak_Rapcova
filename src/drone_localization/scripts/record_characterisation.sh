@@ -1,5 +1,5 @@
 #!/bin/bash
-# Record the localisation sensors (and truth, for offline plots only).
+# Record sensors, estimate and logs (truth is recorded for offline plots only).
 # Usage: record_characterisation.sh [output_name]   (default: char_<date>)
 set -euo pipefail
 
@@ -11,4 +11,8 @@ exec ros2 bag record -s mcap -o "$NAME" \
   /localization/vo \
   /localization/imu \
   /evaluation/ground_truth \
-  /localization/estimate
+  /localization/estimate \
+  /localization/estimate_state \
+  /evaluation/estimate_error \
+  /mavros/state \
+  /rosout

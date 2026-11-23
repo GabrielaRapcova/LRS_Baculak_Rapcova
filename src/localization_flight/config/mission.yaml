@@ -1,0 +1,37 @@
+# §4 flight on the estimate (localization_flight/estimated_mission_node).
+estimated_mission:
+  ros__parameters:
+    use_sim_time: true
+    estimate_topic: /localization/estimate   # the ONLY position/yaw feedback
+    mavros_ns: /mavros
+
+    # Route: relative ENU offsets (x, y) from the captured origin, flat list.
+    route: [0.0, 0.0, 0.0, -4.0, 2.5, -4.0, 2.5, 0.0, 0.0, 0.0]
+    laps: 2
+    altitude: 2.0                 # [m] above the origin
+    accept_xy: 0.3                # [m] waypoint reached (on the estimate)
+    accept_z: 0.35                # [m]
+    final_hold_s: 3.0             # hover above the origin before LAND
+
+    # Origin capture: first estimate with sigma_xy below this
+    origin_max_sigma: 0.3         # [m]
+
+    # Takeoff: MAVROS takeoff service, then estimate-driven climb
+    takeoff_reached_fraction: 0.7 # switch to our control at 70 % of altitude
+    takeoff_timeout_s: 60.0
+    climb_tolerance: 0.25         # [m]
+
+    # Controller (saturated P on estimated position / yaw)
+    kp_xy: 0.8                    # [1/s]
+    max_speed_xy: 0.5             # [m/s] spec: ~0.5 m/s
+    kp_z: 0.8
+    max_speed_z: 0.4
+    kp_yaw: 1.0                   # holds the origin heading
+    max_yaw_rate: 0.3             # [rad/s]
+    setpoint_rate_hz: 20.0        # sim-time timer
+
+    # Watchdogs
+    estimate_timeout_s: 0.5       # stale estimate -> zero velocity
+    estimate_lost_land_s: 3.0     # lost estimate -> LAND
+    max_position_sigma: 2.0       # [m] diverged covariance -> LAND
+    status_period_s: 2.0

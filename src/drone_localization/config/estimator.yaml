@@ -1,0 +1,87 @@
+# Eight-state localisation EKF parameters (drone_localization/estimator_node).
+# State x = [px py pz vx vy vz yaw b] in ENU `map`; b = gyro Z bias.
+# Values were chosen from the §1 characterisation and tuned offline with
+# evaluate_replay.py over 8 seeds (see README).
+localization_estimator:
+  ros__parameters:
+    use_sim_time: true
+
+    # ---- topics / frames -----------------------------------------------------
+    gps_topic: /localization/gps
+    vo_topic: /localization/vo
+    imu_topic: /localization/imu
+    estimate_topic: /localization/estimate   # also <topic>_state (Float64MultiArray)
+    map_frame: map
+    body_frame: base_link
+    vo_frame: vo_odom
+    publish_every_n_imu: 1       # 100 Hz output
+    status_period_s: 5.0         # sim seconds between status lines
+    time_jump_reset_s: 1.0       # re-initialise if sim time jumps back further
+
+    # ---- process noise Q -------------------------------------------------------
+    accel_xy: 0.1                # white acceleration PSD, horizontal [m^2/s^3]; 0.1 keeps a
+                                 # 3 s VO dropout to ~0.55 m (0.5 gave ~0.75 m)
+    accel_z: 0.1                 # vertical [m^2/s^3]; 0.3 let GPS z noise (0.9 m) drive vz
+                                 # during VO dropouts
+    gyro_noise: 0.004            # gyro Z noise per sample [rad/s] (IMU message: var 1.6e-5)
+    gyro_rate: 100.0             # [Hz] converts gyro_noise to a PSD
+    bias_walk: 2.0e-5            # gyro bias random walk [rad/s/sqrt(s)]; Gazebo bias is constant
+
+    # ---- initialisation (P0) -------------------------------------------------
+    init_gps_samples: 10         # median of the first N GPS fixes -> position
+    init_yaw: 1.5707963267948966 # known initial ENU yaw (Gazebo yaw 0 -> ENU pi/2)
+    init_yaw_sigma: 0.052        # [rad] 3 deg: the spawn heading is known
+    init_velocity_sigma: 0.2     # [m/s] drone at rest
+    init_bias_sigma: 0.03        # [rad/s] used only if init_bias_from_gyro is false
+    init_bias_from_gyro: true    # gyro mean while waiting for GPS (drone at rest)
+    init_bias_min_sigma: 0.003   # [rad/s] floor on that first estimate's sigma
+
+    # ---- timing --------------------------------------------------------------
+    max_measurement_lag: 0.05    # [s] measurements older than this are dropped
+
+    # ---- GPS R and gate --------------------------------------------------------
+    gps_use_message_covariance: true
+    gps_sigma: [0.6, 0.6, 0.9]   # [m] fallback if the message carries no covariance
+    gps_sigma_scale: 1.0
+    gps_gate_chi2: 16.27         # chi2, 3 DOF, 99.9 %: 1-in-1000 false rejection.
+                                 # Smallest injected-outlier NIS seen offline: 22.5 (60 outliers),
+                                 # so 21.11 (99.99 %) would leave too little margin.
+    gps_max_consecutive_rejections: 5  # then inflate position covariance (never reset)
+
+    # ---- VO body velocity R and gate ------------------------------------------
+    vo_velocity_enabled: true
+    vo_velocity_sigma: 0.2       # [m/s] floor; >> 0.03 sample noise because the VO
+                                 # bias/scale error is time-correlated
+    vo_velocity_gate_chi2: 16.27 # chi2, 3 DOF, 99.9 %
+
+    # ---- VO yaw ------------------------------------------------------------------
+    vo_yaw_relative: true        # bias measurement from (gyro turn - VO turn) / T
+    vo_yaw_window: 2.0           # T [s]
+    vo_pose_yaw_sigma: 0.0052    # [rad] VO per-sample yaw noise (0.3 deg)
+    vo_yaw_rate_sigma: 0.005     # [rad/s] VO's own yaw-rate drift (constant over a flight,
+                                 # so not averaged away) -> weak fallback measurement
+    vo_yaw_absolute: false       # absolute VO yaw is biased by vo_odom drift
+    vo_yaw_sigma: 0.05           # [rad] used only if vo_yaw_absolute
+    vo_yaw_period: 1.0           # [s]  used only if vo_yaw_absolute
+    vo_yaw_gate_chi2: 10.83      # chi2, 1 DOF, 99.9 % (also used for ZARU)
+
+    # ---- sensor timeouts (logging + VO yaw baseline restart only) -------------
+    gps_timeout: 1.0             # [s] 5 missed fixes
+    vo_timeout: 0.3              # [s] ~9 missed frames
+    imu_timeout: 0.1             # [s] 10 missed samples
+
+    # ---- resting on the ground: ZARU (bias) + ZUPT (velocity) -------------------
+    # Resting is judged from the estimate only, with hysteresis. While resting
+    # the true yaw rate and velocity are 0: each window's gyro mean measures the
+    # bias, and v = 0 is fused (gated, so a real takeoff rejects it and ends rest).
+    zaru_enabled: true
+    zupt_enabled: true
+    zaru_window: 1.0             # [s] update period / gyro averaging window
+    rest_enter_height: 0.3       # [m] above the ground-height estimate
+    rest_exit_height: 0.4        # [m]
+    rest_enter_speed: 0.1        # [m/s]
+    rest_exit_speed: 0.25        # [m/s]
+    rest_enter_time: 1.0         # [s] conditions must hold this long to enter
+    zaru_rate_sigma: 2.0e-4      # [rad/s] allowance for residual true rotation
+    zupt_sigma: 0.03             # [m/s]
+    zupt_gate_chi2: 16.27        # chi2, 3 DOF, 99.9 %

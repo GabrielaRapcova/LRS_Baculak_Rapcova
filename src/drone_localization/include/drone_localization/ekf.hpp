@@ -31,16 +31,17 @@ double wrap_angle(double a);
 
 struct ProcessNoise
 {
-  double accel_xy = 0.5;     // white acceleration spectral density, horizontal [m^2/s^3]
-  double accel_z = 0.3;      // vertical [m^2/s^3]
+  double accel_xy = 0.1;     // white acceleration spectral density, horizontal [m^2/s^3]
+  double accel_z = 0.1;      // vertical [m^2/s^3]
   double gyro_noise = 0.004; // gyro white noise per sample [rad/s]
   double gyro_rate = 100.0;  // nominal gyro rate used to scale gyro_noise [Hz]
-  double bias_walk = 1e-4;   // bias random walk [rad/s/sqrt(s)]
+  double bias_walk = 2e-5;   // bias random walk [rad/s/sqrt(s)]; Gazebo bias is constant
 };
 
 struct UpdateResult
 {
   bool accepted = false;
+  bool numerical_failure = false;  // S not positive definite or result non-finite
   double nis = 0.0;  // normalised innovation squared, d^2 = y' S^-1 y
   int dof = 0;
 };
@@ -123,8 +124,15 @@ UpdateResult Ekf::update(
   }
 
   const Eigen::Matrix<double, M, M> S = H * P_ * H.transpose() + R;
+  if (!y.allFinite() || !S.allFinite()) {
+    result.numerical_failure = true;
+    return result;
+  }
   const Eigen::LDLT<Eigen::Matrix<double, M, M>> S_ldlt(S);
-  if (S_ldlt.info() != Eigen::Success) {return result;}
+  if (S_ldlt.info() != Eigen::Success || !S_ldlt.isPositive()) {
+    result.numerical_failure = true;
+    return result;
+  }
 
   result.nis = y.dot(S_ldlt.solve(y));
   if (gate_chi2 > 0.0 && result.nis > gate_chi2) {return result;}
@@ -133,11 +141,16 @@ UpdateResult Ekf::update(
   const Eigen::Matrix<double, kStateDim, M> K =
     S_ldlt.solve(H * P_).transpose();
 
-  x_ += K * y;
-  x_(YAW) = wrap_angle(x_(YAW));
-
+  StateVec x_new = x_ + K * y;
+  x_new(YAW) = wrap_angle(x_new(YAW));
   const StateMat I_KH = StateMat::Identity() - K * H;
-  P_ = I_KH * P_ * I_KH.transpose() + K * R * K.transpose();  // Joseph form
+  StateMat P_new = I_KH * P_ * I_KH.transpose() + K * R * K.transpose();  // Joseph form
+  if (!x_new.allFinite() || !P_new.allFinite()) {
+    result.numerical_failure = true;  // keep the previous, valid state
+    return result;
+  }
+  x_ = x_new;
+  P_ = P_new;
   enforce_symmetry();
 
   result.accepted = true;

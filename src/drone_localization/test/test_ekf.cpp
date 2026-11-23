@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -299,4 +300,251 @@ TEST(Localizer, RelativeVoYawEstimatesGyroBiasInFlight)
   EXPECT_LT(std::abs(wrap_angle(loc.ekf().x()(YAW) - yaw)), 0.05);
   // Velocity is now tightly constrained (drone is hovering).
   EXPECT_LT(loc.ekf().x().segment<3>(VX).norm(), 0.1);
+}
+
+// Regression: live run started at sim time ~493 s and the first relative VO yaw
+// measurement integrated the gyro from stamp 0 (2.96 rad/s, NIS 375641).
+TEST(Localizer, RelativeVoYawAtLargeSimTimeHasNoStartupSpike)
+{
+  LocalizerConfig cfg;
+  cfg.init_gps_samples = 3;
+  Localizer loc(cfg);
+  std::vector<std::string> warnings;
+  loc.set_logger([&](LogLevel l, const std::string & m) {
+      if (l == LogLevel::Warn) {warnings.push_back(m);}
+    });
+  const double t0 = 493.0;
+  const Eigen::Matrix3d cov = Eigen::Matrix3d::Identity() * 0.36;
+  for (int i = 1; i <= 1000; ++i) {
+    const double t = t0 + i * 0.01;
+    // GPS and VO arrive in the same instant as initialisation, before the next IMU.
+    if (i % 20 == 0) {loc.on_gps(t, Eigen::Vector3d::Zero(), cov);}
+    if (i % 3 == 0) {
+      loc.on_vo(t, M_PI / 2.0, Eigen::Vector3d::Zero(), Eigen::Vector3d::Constant(0.0009));
+    }
+    loc.on_imu(t, -0.017);
+  }
+  ASSERT_TRUE(loc.initialized());
+  EXPECT_EQ(loc.vo_yaw_stats().rejected, 0u);
+  EXPECT_GT(loc.vo_yaw_stats().accepted, 2u);
+  EXPECT_NEAR(loc.ekf().x()(BIAS), -0.017, 0.001);
+  EXPECT_TRUE(warnings.empty()) << warnings.front();
+}
+
+TEST(Localizer, ZeroRateUpdateKeepsYawStillDuringLongGroundWait)
+{
+  LocalizerConfig cfg;
+  cfg.init_gps_samples = 3;  // short ground mean -> poor first bias estimate
+  Localizer loc(cfg);
+  std::mt19937 rng(11);
+  std::normal_distribution<double> n(0.0, 1.0);
+  const double bias = 0.0185;
+  const Eigen::Matrix3d cov = Eigen::Vector3d(0.36, 0.36, 0.81).asDiagonal();
+  for (int i = 1; i <= 50000; ++i) {  // 500 s on the ground
+    const double t = 100.0 + i * 0.01;
+    loc.on_imu(t, bias + 0.004 * n(rng));
+    if (i % 20 == 0) {
+      loc.on_gps(t, Eigen::Vector3d(0.6 * n(rng), 0.6 * n(rng), 0.9 * n(rng)), cov);
+    }
+    if (i % 3 == 0) {
+      // VO with a 0.0015 rad/s yaw-rate drift, as measured live.
+      loc.on_vo(t, wrap_angle(M_PI / 2.0 + 0.0015 * i * 0.01),
+        Eigen::Vector3d(0.03 * n(rng), 0.03 * n(rng), 0.03 * n(rng)),
+        Eigen::Vector3d::Constant(0.0009));
+    }
+  }
+  EXPECT_TRUE(loc.resting());
+  EXPECT_GT(loc.zaru_stats().accepted, 400u);
+  EXPECT_NEAR(loc.ekf().x()(BIAS), bias, 3e-4);
+  EXPECT_NEAR(loc.ekf().x()(YAW), M_PI / 2.0, 0.035);  // < 2 deg after 500 s
+}
+
+// ---- §3: outages, outliers, robustness ----------------------------------------
+
+namespace
+{
+
+struct Sim
+{
+  Localizer loc;
+  std::mt19937 rng{21};
+  std::normal_distribution<double> n{0.0, 1.0};
+  std::vector<std::string> logs;
+  Eigen::Vector3d p{0.0, 0.0, 2.0};
+  Eigen::Vector3d v{0.5, 0.0, 0.0};
+  double t = 0.0;
+  const Eigen::Matrix3d gps_cov = Eigen::Vector3d(0.36, 0.36, 0.81).asDiagonal();
+
+  explicit Sim(LocalizerConfig cfg = {})
+  : loc(cfg)
+  {
+    loc.set_logger([this](LogLevel, const std::string & m) {logs.push_back(m);});
+  }
+
+  // Advance 10 ms of straight flight east at 0.5 m/s (yaw 0).
+  void step(bool gps = true, bool vo = true, bool outlier = false)
+  {
+    t += 0.01;
+    p += v * 0.01;
+    const int i = static_cast<int>(std::lround(t * 100.0));
+    loc.on_imu(t, 0.01 + 0.004 * n(rng));
+    if (gps && i % 20 == 0) {
+      Eigen::Vector3d z = p + Eigen::Vector3d(0.6 * n(rng), 0.6 * n(rng), 0.9 * n(rng));
+      if (outlier) {z += Eigen::Vector3d(0.0, 0.0, 5.0);}  // hardest case: vertical 5 m
+      loc.on_gps(t, z, gps_cov);
+    }
+    if (vo && i % 3 == 0) {
+      loc.on_vo(t, 0.0, v + 0.03 * Eigen::Vector3d(n(rng), n(rng), n(rng)),
+        Eigen::Vector3d::Constant(0.0009));
+    }
+  }
+
+  bool logged(const std::string & needle) const
+  {
+    for (const auto & l : logs) {
+      if (l.find(needle) != std::string::npos) {return true;}
+    }
+    return false;
+  }
+};
+
+LocalizerConfig flying_config()
+{
+  LocalizerConfig c;
+  c.init_yaw = 0.0;
+  c.init_gps_samples = 5;
+  c.zaru_enabled = false;
+  return c;
+}
+
+}  // namespace
+
+TEST(Section3, FifteenSecondGpsOutageStaysFiniteAndRecoversWithoutReset)
+{
+  Sim s(flying_config());
+  for (int i = 0; i < 2000; ++i) {s.step();}  // 20 s nominal
+  const double sigma_before = std::sqrt(s.loc.ekf().P()(PX, PX));
+
+  for (int i = 0; i < 1500; ++i) {  // 15 s without GPS
+    s.step(false, true);
+    ASSERT_TRUE(s.loc.ekf().x().allFinite());
+    ASSERT_TRUE(s.loc.ekf().P().allFinite());
+  }
+  EXPECT_TRUE(s.loc.gps_link().lost);
+  EXPECT_TRUE(s.logged("GPS LOST"));
+  const double sigma_outage = std::sqrt(s.loc.ekf().P()(PX, PX));
+  EXPECT_GT(sigma_outage, sigma_before);  // uncertainty grows honestly
+  EXPECT_LT((s.loc.ekf().x().head<3>() - s.p).norm(), 1.0);  // VO carried it
+
+  // Recovery: largest single-step change of the estimate stays small.
+  double max_jump = 0.0;
+  Eigen::Vector3d prev = s.loc.ekf().x().head<3>();
+  for (int i = 0; i < 500; ++i) {
+    s.step();
+    const Eigen::Vector3d cur = s.loc.ekf().x().head<3>();
+    max_jump = std::max(max_jump, (cur - prev).norm());
+    prev = cur;
+  }
+  EXPECT_FALSE(s.loc.gps_link().lost);
+  EXPECT_TRUE(s.logged("GPS RECOVERED"));
+  EXPECT_LT(max_jump, 0.5);
+  EXPECT_LT(std::sqrt(s.loc.ekf().P()(PX, PX)), sigma_outage);
+  EXPECT_LT((s.loc.ekf().x().head<3>() - s.p).norm(), 0.6);
+  EXPECT_EQ(s.loc.numerical_failures(), 0u);
+}
+
+TEST(Section3, VoDropoutCarriedByGps)
+{
+  Sim s(flying_config());
+  for (int i = 0; i < 2000; ++i) {s.step();}
+  for (int i = 0; i < 300; ++i) {s.step(true, false);}  // 3 s without VO
+  EXPECT_TRUE(s.loc.vo_link().lost);
+  EXPECT_TRUE(s.logged("VO LOST"));
+  EXPECT_LT((s.loc.ekf().x().head<3>() - s.p).norm(), 1.0);
+  for (int i = 0; i < 300; ++i) {s.step();}
+  EXPECT_FALSE(s.loc.vo_link().lost);
+  EXPECT_TRUE(s.logged("VO RECOVERED"));
+  EXPECT_LT((s.loc.ekf().x().segment<3>(VX) - s.v).norm(), 0.15);
+}
+
+TEST(Section3, VerticalFiveMetreOutlierRejectedEvenRightAfterOutage)
+{
+  Sim s(flying_config());
+  for (int i = 0; i < 2000; ++i) {s.step();}
+  for (int i = 0; i < 1500; ++i) {s.step(false, true);}
+  const auto rejected_before = s.loc.gps_stats().rejected;
+  // First fix after the outage carries the outlier (pending service request).
+  bool sent = false;
+  while (!sent) {
+    const int next = static_cast<int>(std::lround((s.t + 0.01) * 100.0));
+    const bool is_gps = next % 20 == 0;
+    s.step(true, true, is_gps);
+    sent = is_gps;
+  }
+  EXPECT_EQ(s.loc.gps_stats().rejected, rejected_before + 1);
+  EXPECT_TRUE(s.logged("first fix after outage"));
+  EXPECT_LT(std::abs(s.loc.ekf().x()(PZ) - s.p.z()), 0.6);  // not pulled 5 m up
+}
+
+TEST(Section3, ConsecutiveRejectionsInflateCovarianceInsteadOfLockingOut)
+{
+  LocalizerConfig cfg = flying_config();
+  Sim s(cfg);
+  for (int i = 0; i < 2000; ++i) {s.step();}
+  // Teleport the truth 4 m north: the estimate is now wrong, GPS is right.
+  s.p.y() += 4.0;
+  for (int i = 0; i < 1000; ++i) {s.step();}
+  EXPECT_TRUE(s.logged("consecutive GPS rejections"));
+  EXPECT_LT((s.loc.ekf().x().head<2>() - s.p.head<2>()).norm(), 0.6);  // re-acquired
+}
+
+TEST(Section3, NonFiniteInputsAreIgnored)
+{
+  Sim s(flying_config());
+  for (int i = 0; i < 500; ++i) {s.step();}
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  s.loc.on_gps(s.t + 0.001, Eigen::Vector3d(nan, 0, 0), s.gps_cov);
+  s.loc.on_vo(s.t + 0.001, nan, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+  s.loc.on_imu(s.t + 0.002, nan);
+  s.loc.on_imu(nan, 0.0);
+  EXPECT_TRUE(s.loc.ekf().x().allFinite());
+  EXPECT_TRUE(s.loc.ekf().P().allFinite());
+  for (int i = 0; i < 100; ++i) {s.step();}
+  EXPECT_TRUE(s.loc.ekf().x().allFinite());
+}
+
+TEST(Localizer, ZeroVelocityUpdateDoesNotPinTakeoff)
+{
+  LocalizerConfig cfg;
+  cfg.init_gps_samples = 5;
+  Localizer loc(cfg);
+  std::vector<std::string> logs;
+  loc.set_logger([&](LogLevel, const std::string & m) {logs.push_back(m);});
+  std::mt19937 rng(4);
+  std::normal_distribution<double> n(0.0, 1.0);
+  const Eigen::Matrix3d cov = Eigen::Vector3d(0.36, 0.36, 0.81).asDiagonal();
+  double z = 0.0, vz = 0.0;
+  for (int i = 1; i <= 4000; ++i) {  // 20 s on the ground, then climb at 0.5 m/s
+    const double t = i * 0.01;
+    if (t > 20.0) {vz = 0.5;}
+    z += vz * 0.01;
+    loc.on_imu(t, 0.01 + 0.004 * n(rng));
+    if (i % 20 == 0) {loc.on_gps(t, Eigen::Vector3d(0.6 * n(rng), 0.6 * n(rng), z + 0.9 * n(rng)), cov);}
+    if (i % 3 == 0) {
+      loc.on_vo(t, M_PI / 2.0, Eigen::Vector3d(0.03 * n(rng), 0.03 * n(rng), vz + 0.03 * n(rng)),
+        Eigen::Vector3d::Constant(0.0009));
+    }
+    if (std::abs(t - 19.9) < 0.005) {
+      EXPECT_TRUE(loc.resting());
+      EXPECT_GT(loc.zupt_stats().accepted, 10u);
+    }
+  }
+  EXPECT_FALSE(loc.resting());
+  EXPECT_NEAR(loc.ekf().x()(VZ), 0.5, 0.1);  // climb seen, not clamped to 0
+  EXPECT_NEAR(loc.ekf().x()(PZ), z, 0.4);
+  int transitions = 0;
+  for (const auto & l : logs) {
+    if (l.find("RESTING") != std::string::npos || l.find("MOVING") != std::string::npos) {++transitions;}
+  }
+  EXPECT_EQ(transitions, 2);  // rest once, leave once: no flapping
 }
