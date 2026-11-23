@@ -333,8 +333,8 @@ private:
 
       case Phase::ARM:
         if (state_.armed) {go(Phase::TAKEOFF); break;}
-        if (phase_time() > 90.0) {
-          RCLCPP_ERROR(get_logger(), "arming timed out");
+        if (phase_time() > 300.0) {
+          RCLCPP_ERROR(get_logger(), "arming timed out after 300 s sim time");
           go(Phase::DONE);
           break;
         }
@@ -343,7 +343,11 @@ private:
           auto req = std::make_shared<mavros_msgs::srv::CommandBool::Request>();
           req->value = true;
           call<mavros_msgs::srv::CommandBool>(arm_cli_, req, [this](bool ok) {
-              if (!ok) {RCLCPP_WARN(get_logger(), "arming rejected, retrying");}
+              if (!ok) {
+                RCLCPP_WARN(get_logger(),
+                  "arming rejected by the FCU (usually pre-arm checks: ArduPilot's own EKF "
+                  "is not using GPS yet, see 'Arm: ...' in the MAVROS/SITL console); retrying");
+              }
             });
         }
         break;
