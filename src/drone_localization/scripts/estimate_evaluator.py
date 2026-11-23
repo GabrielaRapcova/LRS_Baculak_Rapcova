@@ -14,6 +14,7 @@ It never publishes anything the estimator or controller subscribes to.
 import bisect
 import math
 import os
+import signal
 
 import numpy as np
 import rclpy
@@ -140,6 +141,9 @@ def main():
     except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
     finally:
+        # A second Ctrl-C must not interrupt writing the CSV and plot.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        node.get_logger().info('saving evaluation (CSV + plot), please wait...')
         node.save()
         node.destroy_node()
         if rclpy.ok():

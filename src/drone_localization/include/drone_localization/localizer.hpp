@@ -55,9 +55,9 @@ struct LocalizerConfig
   // [m/s] floor on the per-axis sigma. Deliberately much larger than the
   // per-sample noise (0.03): the VO bias and scale error are correlated in
   // time, and fusing them at 30 Hz as white noise made the filter
-  // overconfident (tuned offline: 0.2 gives the lowest error *and* ~95 % 2-sigma
-  // consistency).
-  double vo_velocity_sigma = 0.2;
+  // overconfident. Tuned offline to 0.2, raised to 0.3 after a live run 900 s
+  // after simulator start, when the VO bias random walk had grown to ~0.025 m/s.
+  double vo_velocity_sigma = 0.3;
   double vo_velocity_gate_chi2 = 16.27;
 
   // VO yaw. The message covariance (0.3 deg) only describes per-sample noise,

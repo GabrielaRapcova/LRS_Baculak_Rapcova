@@ -498,3 +498,32 @@ ros2 service call /localization/inject_gps_outlier std_srvs/srv/Trigger
 ros2 service call /localization/set_vo_enabled std_srvs/srv/SetBool "{data: false}"
 ros2 service call /localization/set_vo_enabled std_srvs/srv/SetBool "{data: true}"
 ```
+
+## First live flight and follow-up (increment 6)
+
+The first live mission, launched about 875 s after simulator start, showed:
+
+- **The flight node aborted at takeoff** with `FCU left GUIDED (mode )`.
+  MAVROS had briefly published an **empty** mode (a missed heartbeat at 0.09×
+  real time). ArduPilot itself stayed in GUIDED and completed the climb.
+  Fixed in `localization_flight`: an empty mode or a lost link is "unknown"
+  and the node keeps flying; only a real other mode held for 1.5 s aborts.
+  Every MAVROS state change is now logged.
+- **Only 1 s on the ground before arming**, so the gyro bias rested on about
+  2 s of gyro data. While hovering (yaw unobservable) yaw drifted about 2° in
+  2 min. The flight node now **settles ≥ 15 s on the ground**, until the
+  estimator's bias σ (published in `twist.covariance[35]`) is below
+  2.5e-4 rad/s, before it captures the origin and arms.
+- **The estimator behaved as designed through the teacher-style test.** GPS
+  was lost, recovered after 12.8 s, and the 6.8 m outlier on the first fix
+  afterwards was rejected (NIS 118 > 16.27). The error grew 0.38 → 0.68 m
+  during the outage: VO's velocity bias after about 900 s of simulator uptime
+  is around 0.025 m/s. Raising **`vo_velocity_sigma` 0.2 → 0.3** restores
+  covariance consistency in that regime. Simulated with 900 s idle, the 2D 95 %
+  region held 85 → 96 % of errors, and accuracy improved slightly (flight
+  horizontal RMS 0.20 → 0.19 m). With 60 s idle it is equal or better (within
+  2σ xy 0.96 → 0.99).
+
+**Tip for the defence:** VO's hidden biases random-walk from the moment the
+sensor simulator starts. Start the sensor launch shortly before the mission,
+rather than leaving it running for a long time, to get the best estimate.

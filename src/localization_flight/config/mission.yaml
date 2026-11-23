@@ -15,6 +15,9 @@ estimated_mission:
 
     # Origin capture: first estimate with sigma_xy below this
     origin_max_sigma: 0.3         # [m]
+    ground_settle_s: 10.0         # [s] sim time on the ground before origin capture/arming,
+                                  # lets the estimator's zero-rate updates pin the gyro bias
+    settle_max_bias_sigma: 2.5e-4 # [rad/s] ...and until bias sigma is below this (max 4x settle)
 
     # Takeoff: MAVROS takeoff service, then estimate-driven climb
     takeoff_reached_fraction: 0.7 # switch to our control at 70 % of altitude
@@ -35,3 +38,5 @@ estimated_mission:
     estimate_lost_land_s: 3.0     # lost estimate -> LAND
     max_position_sigma: 2.0       # [m] diverged covariance -> LAND
     status_period_s: 2.0
+    mode_abort_after_s: 1.5       # a real non-GUIDED mode for this long = takeover -> stop
+                                  # (empty mode / lost link = unknown, keep flying)
