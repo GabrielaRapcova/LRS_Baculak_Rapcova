@@ -7,7 +7,8 @@
 //             /mavros/setpoint_raw/local (ENU in, MAVROS converts to NED).
 //
 // Sequence (no manual input after start):
-//   WAIT_READY  FCU connected and a valid estimate (sigma_xy small)
+//   WAIT_READY  FCU connected and a valid estimate (sigma_xy small), then
+//               settle on the ground (ground_settle_s, bias sigma small)
 //               -> capture mission origin (x, y, z, yaw) from the estimate
 //   SET_GUIDED, ARM
 //   TAKEOFF     MAVROS takeoff service; done when the *estimated* height
@@ -89,6 +90,9 @@ public:
     takeoff_timeout_ = declare_parameter<double>("takeoff_timeout_s", 60.0);
     climb_tolerance_ = declare_parameter<double>("climb_tolerance", 0.25);
     origin_max_sigma_ = declare_parameter<double>("origin_max_sigma", 0.3);
+    ground_settle_ = declare_parameter<double>("ground_settle_s", 10.0);
+    settle_max_bias_sigma_ = declare_parameter<double>("settle_max_bias_sigma", 2.5e-4);
+    mode_abort_after_ = declare_parameter<double>("mode_abort_after_s", 1.5);
     laps_ = static_cast<int>(declare_parameter<int64_t>("laps", 2));
     const auto flat = declare_parameter<std::vector<double>>(
       "route", {0.0, 0.0, 0.0, -4.0, 2.5, -4.0, 2.5, 0.0, 0.0, 0.0});
@@ -114,7 +118,7 @@ public:
     est_sub_ = create_subscription<nav_msgs::msg::Odometry>(
       est_topic, 10, [this](nav_msgs::msg::Odometry::ConstSharedPtr m) {on_estimate(*m);});
     state_sub_ = create_subscription<mavros_msgs::msg::State>(
-      ns + "/state", 10, [this](mavros_msgs::msg::State::ConstSharedPtr m) {state_ = *m;});
+      ns + "/state", 10, [this](mavros_msgs::msg::State::ConstSharedPtr m) {on_state(*m);});
     sp_pub_ = create_publisher<mavros_msgs::msg::PositionTarget>(ns + "/setpoint_raw/local", 10);
     mode_cli_ = create_client<mavros_msgs::srv::SetMode>(ns + "/set_mode");
     arm_cli_ = create_client<mavros_msgs::srv::CommandBool>(ns + "/cmd/arming");
@@ -133,6 +137,16 @@ public:
 
 private:
   // ---- inputs -----------------------------------------------------------------
+  void on_state(const mavros_msgs::msg::State & m)
+  {
+    if (m.connected != state_.connected || m.armed != state_.armed || m.mode != state_.mode) {
+      RCLCPP_INFO(get_logger(), "MAVROS state: connected=%d armed=%d mode='%s' (was %d/%d/'%s')",
+        m.connected, m.armed, m.mode.c_str(), state_.connected, state_.armed,
+        state_.mode.c_str());
+    }
+    state_ = m;
+  }
+
   void on_estimate(const nav_msgs::msg::Odometry & m)
   {
     const auto & p = m.pose.pose.position;
@@ -140,6 +154,8 @@ private:
     est_yaw_ = yaw_from_quaternion(m.pose.pose.orientation);
     est_sigma_xy_ = std::sqrt(std::max(m.pose.covariance[0], m.pose.covariance[7]));
     est_stamp_ = rclcpp::Time(m.header.stamp, get_clock()->get_clock_type());
+    // drone_localization puts the gyro-bias variance in twist.covariance[35].
+    est_bias_sigma_ = std::sqrt(std::max(m.twist.covariance[35], 0.0));
     have_estimate_ = std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z) &&
       std::isfinite(est_yaw_);
   }
@@ -238,12 +254,29 @@ private:
   // ---- state machine ----------------------------------------------------------------
   void tick()
   {
+    // Pilot/FCU takeover detection. An empty mode or a lost link is *unknown*
+    // (MAVROS emits those on missed heartbeats, frequent at low real-time
+    // factor), not a takeover: keep flying. Only a real other mode, held for
+    // mode_abort_after_s, aborts.
     const bool airborne_phase = phase_ == Phase::CLIMB || phase_ == Phase::ROUTE ||
       phase_ == Phase::FINAL_HOLD || phase_ == Phase::TAKEOFF;
-    if (airborne_phase && state_.mode != "GUIDED" && phase_time() > 2.0) {
-      RCLCPP_ERROR(get_logger(),
-        "FCU left GUIDED (mode %s): stopping setpoints, mission aborted", state_.mode.c_str());
-      go(Phase::DONE);
+    const bool known_other_mode = state_.connected && !state_.mode.empty() &&
+      state_.mode != "GUIDED";
+    if (airborne_phase && known_other_mode && phase_time() > 2.0) {
+      if (mode_bad_since_.nanoseconds() == 0) {mode_bad_since_ = now();}
+      if ((now() - mode_bad_since_).seconds() > mode_abort_after_) {
+        RCLCPP_ERROR(get_logger(),
+          "FCU in mode '%s' for %.1f s (not GUIDED): pilot/FCU takeover, stopping setpoints",
+          state_.mode.c_str(), mode_abort_after_);
+        go(Phase::DONE);
+      }
+    } else {
+      mode_bad_since_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+      if (airborne_phase && (!state_.connected || state_.mode.empty())) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "MAVROS state unknown (connected=%d, mode='%s'): continuing", state_.connected,
+          state_.mode.c_str());
+      }
     }
 
     switch (phase_) {
@@ -260,13 +293,31 @@ private:
             estimate_age(), est_sigma_xy_, origin_max_sigma_);
           break;
         }
+        // Let the estimator settle on the ground (zero-rate/zero-velocity
+        // updates refine the gyro bias, so yaw holds while hovering).
+        if (settle_start_.nanoseconds() == 0) {
+          settle_start_ = now();
+          RCLCPP_INFO(get_logger(),
+            "estimate valid; settling on the ground (>= %.0f s, until bias sigma < %.5f rad/s)",
+            ground_settle_, settle_max_bias_sigma_);
+        }
+        {
+          const double settled = (now() - settle_start_).seconds();
+          const bool bias_ok = est_bias_sigma_ > 0.0 && est_bias_sigma_ < settle_max_bias_sigma_;
+          if (settled < ground_settle_ || (!bias_ok && settled < 4.0 * ground_settle_)) {
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+              "settling on the ground: %.1f / %.0f s sim time, gyro bias sigma %.5f rad/s "
+              "(need < %.5f)", settled, ground_settle_, est_bias_sigma_, settle_max_bias_sigma_);
+            break;
+          }
+        }
         origin_ = est_pos_;
         origin_yaw_ = est_yaw_;
         mission_.emplace(build_route(origin_, altitude_, laps_, offsets_), accept_xy_, accept_z_);
         RCLCPP_INFO(get_logger(),
-          "MISSION ORIGIN from estimate: (%.2f, %.2f, %.2f) m, yaw %.1f deg (sigma_xy %.2f m); "
-          "%zu waypoints", origin_.x(), origin_.y(), origin_.z(), origin_yaw_ * 180.0 / M_PI,
-          est_sigma_xy_, mission_->size());
+          "MISSION ORIGIN from estimate: (%.2f, %.2f, %.2f) m, yaw %.1f deg (sigma_xy %.2f m, "
+          "bias sigma %.5f rad/s); %zu waypoints", origin_.x(), origin_.y(), origin_.z(),
+          origin_yaw_ * 180.0 / M_PI, est_sigma_xy_, est_bias_sigma_, mission_->size());
         go(state_.mode == "GUIDED" ? Phase::ARM : Phase::SET_GUIDED);
         break;
 
@@ -401,6 +452,7 @@ private:
   double altitude_, takeoff_reached_fraction_, takeoff_timeout_, climb_tolerance_;
   double origin_max_sigma_, accept_xy_, accept_z_, final_hold_;
   double estimate_timeout_, estimate_lost_land_, max_position_sigma_, status_period_;
+  double ground_settle_, settle_max_bias_sigma_, mode_abort_after_;
   int laps_;
   std::vector<Eigen::Vector2d> offsets_;
   RouteController controller_;
@@ -410,6 +462,7 @@ private:
   Eigen::Vector3d est_pos_ = Eigen::Vector3d::Zero();
   double est_yaw_ = 0.0;
   double est_sigma_xy_ = 1e9;
+  double est_bias_sigma_ = 0.0;
   rclcpp::Time est_stamp_;
 
   // mission
@@ -418,6 +471,8 @@ private:
   rclcpp::Time mission_start_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_status_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_request_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time settle_start_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time mode_bad_since_{0, 0, RCL_ROS_TIME};
   Eigen::Vector3d origin_ = Eigen::Vector3d::Zero();
   double origin_yaw_ = 0.0;
   std::optional<Mission> mission_;

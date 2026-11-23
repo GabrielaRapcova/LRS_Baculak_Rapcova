@@ -50,8 +50,10 @@ localization_estimator:
 
     # ---- VO body velocity R and gate ------------------------------------------
     vo_velocity_enabled: true
-    vo_velocity_sigma: 0.2       # [m/s] floor; >> 0.03 sample noise because the VO
-                                 # bias/scale error is time-correlated
+    vo_velocity_sigma: 0.3       # [m/s] floor; >> 0.03 sample noise because the VO
+                                 # bias/scale error is time-correlated and its random
+                                 # walk grows with simulator uptime (0.2 -> 0.3 after a
+                                 # live run at t~900 s: 2D 95 % consistency 0.85 -> 0.96)
     vo_velocity_gate_chi2: 16.27 # chi2, 3 DOF, 99.9 %
 
     # ---- VO yaw ------------------------------------------------------------------

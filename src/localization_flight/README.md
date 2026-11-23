@@ -38,8 +38,9 @@ feedback.
 ## Sequence (unattended after launch)
 
 1. **WAIT_READY**: FCU connected, and an estimate fresher than 0.5 s with
-   σ_xy < 0.3 m. The first such estimate becomes the **mission origin**
-   (x, y, z, yaw).
+   σ_xy < 0.3 m. The node then **settles on the ground** for at least 10 s of sim time (about 2 min of wall time at a 0.09 real-time factor; progress is logged every 2 s),
+   until the estimator's gyro-bias σ is below 2.5e-4 rad/s. That estimate
+   becomes the **mission origin** (x, y, z, yaw).
 2. **SET_GUIDED → ARM**: retried until accepted (ArduPilot rejects arming
    while its EKF settles).
 3. **TAKEOFF**: MAVROS takeoff service to 2 m. The phase ends when the
@@ -56,7 +57,10 @@ feedback.
 - Estimate older than 0.5 s: zero-velocity hover.
 - Estimate older than 3 s, or σ_xy > 2 m: LAND.
 - If the FCU leaves GUIDED during flight (pilot takeover), the node stops
-  sending setpoints.
+  sending setpoints. That means a *real* other mode held for 1.5 s. An empty
+  mode or a lost link (MAVROS emits those on missed heartbeats, common at low
+  real-time factor) is treated as unknown, and the node keeps flying. The
+  first live flight aborted on exactly that before this fix.
 
 **The GPS outage** needs nothing special here. The estimator carries the
 position on VO, and the controller keeps flying the estimate.
