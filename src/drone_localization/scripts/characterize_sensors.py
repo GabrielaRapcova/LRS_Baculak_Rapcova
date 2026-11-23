@@ -135,7 +135,7 @@ def plot_trajectory(data, out):
     if 'vo' in data:
         ax.plot(data['vo'][:, 1], data['vo'][:, 2], lw=1.0, label='VO')
     if 'est' in data:
-        ax.plot(data['est'][:, 1], data['est'][:, 2], lw=1.2, label='estimate')
+        ax.plot(data['est'][:, 1], data['est'][:, 2], lw=1.2, label='estimate (recorded)')
     ax.set_aspect('equal')
     ax.set_xlabel('x ENU [m]')
     ax.set_ylabel('y ENU [m]')

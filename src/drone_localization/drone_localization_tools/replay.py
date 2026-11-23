@@ -111,7 +111,7 @@ def score(est, truth, gyro_bias=None, skip_s=0.0):
     return out
 
 
-def plot(est, truth, s, path, title=''):
+def plot(est, truth, s, path, title='', spans=(), marks=()):
     """Error-vs-time figure with the filter's own 2-sigma bounds."""
     import matplotlib
     matplotlib.use('Agg')
@@ -142,10 +142,18 @@ def plot(est, truth, s, path, title=''):
         axes[4].plot(t, s['e_bias'], lw=0.8)
         axes[4].fill_between(t, -2 * est[:, 16], 2 * est[:, 16], alpha=0.15)
         axes[4].set_ylabel('bias err [rad/s]')
+    t0 = s['t'][0]
     for ax in axes:
+        for a, b, label in spans:  # e.g. sensor outages
+            ax.axvspan(a - t0, b - t0, color='0.85', zorder=0)
+        for m, label in marks:  # e.g. injected outliers
+            ax.axvline(m - t0, color='r', lw=0.8, ls=':')
         ax.axhline(0, color='k', lw=0.5)
         if ax.get_legend_handles_labels()[0]:
             ax.legend(fontsize=8, loc='upper right')
+    for a, b, label in spans:
+        axes[0].text(0.5 * (a + b) - t0, axes[0].get_ylim()[1] * 0.85, label,
+                     ha='center', fontsize=8)
     axes[-1].set_xlabel('time since initialisation [s]')
     fig.tight_layout()
     fig.savefig(path, dpi=120)

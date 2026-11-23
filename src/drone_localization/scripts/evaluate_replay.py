@@ -3,6 +3,7 @@
 
 Two data sources:
     evaluate_replay.py --bag BAG              recorded run (needs /evaluation/ground_truth)
+    evaluate_replay.py --bag BAG --recorded   score the estimate the live node published
     evaluate_replay.py --sim 42 [--sim 73 …]  course sensor model on a synthetic mission
 
 The sensor stream goes through the C++ ``ekf_replay`` binary, i.e. the same
@@ -37,6 +38,8 @@ def main():
     p.add_argument('--sim', type=int, action='append', default=[], metavar='SEED')
     p.add_argument('--profile', choices=('mission', 'characterisation'), default='mission')
     p.add_argument('--yaw-follow', action='store_true', help='simulated drone faces each leg')
+    p.add_argument('--recorded', action='store_true',
+                   help='score /localization/estimate_state from the bag instead of replaying')
     p.add_argument('--sensors', default='imu,gps,vo')
     p.add_argument('--binary', help='path to ekf_replay')
     p.add_argument('--out', default='replay_plots')
@@ -66,7 +69,15 @@ def main():
         if 'truth' not in data:
             print(f'{name}: no ground truth in bag, cannot score')
             continue
-        est, log = replay.run(data, sensors=sensors, overrides=overrides, binary=args.binary)
+        if args.recorded:
+            if 'est' not in data:
+                print(f'{name}: no /localization/estimate_state in bag')
+                continue
+            est, log = data['est'], ''
+            name += '_recorded'
+        else:
+            est, log = replay.run(data, sensors=sensors, overrides=overrides,
+                                  binary=args.binary)
         s = replay.score(est, data['truth'], gyro_bias)
         describe(name, s)
         for line in log.strip().splitlines():

@@ -29,7 +29,8 @@ void Ekf::initialize(double t, const StateVec & x0, const StateMat & P0)
 bool Ekf::predict(double t, double gyro_z)
 {
   const double dt = t - t_;
-  if (!initialized_ || dt <= 0.0) {return false;}
+  if (!initialized_ || !(dt > 0.0) || !std::isfinite(gyro_z)) {return false;}
+  const StateVec x_prev = x_;
 
   // State transition.
   x_.segment<3>(PX) += x_.segment<3>(VX) * dt;
@@ -56,7 +57,12 @@ bool Ekf::predict(double t, double gyro_z)
   Q(YAW, YAW) = noise_.gyro_noise * noise_.gyro_noise / noise_.gyro_rate * dt;
   Q(BIAS, BIAS) = noise_.bias_walk * noise_.bias_walk * dt;
 
-  P_ = F * P_ * F.transpose() + Q;
+  const StateMat P_new = F * P_ * F.transpose() + Q;
+  if (!x_.allFinite() || !P_new.allFinite()) {
+    x_ = x_prev;  // never let NaN/Inf into the filter
+    return false;
+  }
+  P_ = P_new;
   enforce_symmetry();
   t_ = t;
   return true;

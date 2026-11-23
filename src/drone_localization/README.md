@@ -1,5 +1,11 @@
 # drone_localization — Assignment 2, drone localisation
 
+> **Estimate output:** `/localization/estimate` (`nav_msgs/Odometry`), frame
+> **`map`** (ENU), child `base_link`. It carries x, y, z, a yaw quaternion,
+> covariance from P, and a body-frame twist. The full state with standard
+> deviations is on `/localization/estimate_state` (`std_msgs/Float64MultiArray`:
+> `[t, px, py, pz, vx, vy, vz, yaw, b, σ_px … σ_b]`, ENU).
+
 An eight-state EKF that fuses noisy GPS, drifting visual odometry and a biased
 yaw-rate gyro from `localization_sensor_sim`. This README grows with each
 increment; the full design document follows at the end.
@@ -9,9 +15,9 @@ increment; the full design document follows at the end.
 | 1. Sensor acquisition and characterisation (§1) | **done** |
 | 2. EKF core: predict + GPS | **done** |
 | 3. Yaw, gyro bias, VO updates | **done** |
-| 4. ROS estimator node + evaluator | – |
-| 5. Outages, outlier gating (§3) | – |
-| 6. Flight on the estimate (§4), separate package | – |
+| 4. ROS estimator node + evaluator | **done** |
+| 5. Outages, outlier gating (§3) | **done** |
+| 6. Flight on the estimate (§4): separate package `localization_flight` | **done** (sim-tested) |
 | 7. Documentation | – |
 
 ## Build
@@ -285,4 +291,210 @@ Reproduce with:
 ros2 run drone_localization evaluate_replay.py --sim 42 --sim 73 --yaw-follow
 ros2 run drone_localization evaluate_replay.py --sim 42 --sensors imu,gps        # GPS-only baseline
 ros2 run drone_localization evaluate_replay.py --sim 42 vo_velocity_sigma=0.05   # overconfident
+```
+
+## ROS estimator node (increment 4)
+
+```bash
+ros2 launch drone_localization localization.launch.py                  # estimator only
+ros2 launch drone_localization localization.launch.py evaluator:=true  # + truth evaluator
+```
+
+### `estimator_node`, node name `localization_estimator`
+
+| | |
+|---|---|
+| subscribes | `/localization/gps`, `/localization/vo`, `/localization/imu`, with `SensorDataQoS`. **Nothing else.** |
+| publishes | `/localization/estimate` (Odometry, `map` → `base_link`, 100 Hz, stamped with the filter time) and `/localization/estimate_state` |
+| parameters | `config/estimator.yaml`: every Q, R, P0, gate and timing value, each commented |
+| executor | single-threaded, so the callbacks never touch the filter concurrently |
+
+- **Thin wrapper.** The node only converts messages and calls the `Localizer`.
+  The ROS node, `ekf_replay` and the gtests therefore all run the same filter
+  code.
+- **Frame checks.** A message with an unexpected `frame_id` or
+  `child_frame_id` is ignored, with a throttled warning.
+- **Odometry twist** follows the ROS convention, so it is in `base_link`.
+  `angular.z` = gyro − estimated bias.
+- **Logging is rate-limited.** A status line appears every 5 s of sim time:
+  state ± σ, bias, and accepted/rejected counts per sensor. Every rejection
+  and every lifecycle event is also logged, but nothing is logged at sensor
+  rate.
+- **A Gazebo reset is detected.** If sim time jumps back more than 1 s, the
+  filter is re-initialised. That is the only case in which it ever restarts.
+- **No TF is broadcast**, because MAVROS already publishes `map → base_link`.
+
+### Truth-only evaluator (separate process)
+
+`estimate_evaluator.py` subscribes to `/evaluation/ground_truth` and
+`/localization/estimate_state`. It logs errors every 5 s and publishes
+`/evaluation/estimate_error` (`[t, ex, ey, ez, evx, evy, evz, eyaw]`, for
+rqt_plot or PlotJuggler). On Ctrl-C it writes `evaluation/estimate.csv`,
+`truth.csv` and `errors.png`. It publishes nothing the estimator or
+controller subscribes to:
+
+```bash
+ros2 node info /localization_estimator      # proves the estimator's inputs
+ros2 topic info -v /evaluation/ground_truth # only the evaluator subscribes
+```
+
+### Live check (no flight needed)
+
+With Gazebo, SITL, MAVROS and the sensor launch running:
+
+```bash
+ros2 launch drone_localization localization.launch.py evaluator:=true
+```
+
+Expect `initialised at t=…` about 2 s of sim time after start, then a status
+line every 5 s of sim time.
+
+### Replaying a bag into the live node (no Gazebo or ArduPilot)
+
+```bash
+ros2 launch drone_localization localization.launch.py evaluator:=true
+ros2 bag play rosbags/char_seed42 --clock \
+  --topics /localization/gps /localization/vo /localization/imu /evaluation/ground_truth
+```
+
+### Scoring a recorded run
+
+`record_characterisation.sh` also records the estimate. Afterwards:
+
+```bash
+ros2 run drone_localization evaluate_replay.py --bag rosbags/run1 --recorded  # what the node published
+ros2 run drone_localization evaluate_replay.py --bag rosbags/run1             # replay through ekf_replay
+```
+
+The two should agree, which is a check that the node and the offline replay
+behave the same.
+
+## Changes after the first live run (increment 4 → 5)
+
+The live run on seed 42 (estimator started about 490 s of sim time after the
+simulator) showed horizontal RMS 0.14 m with 92–100 % of errors within 2σ. It
+also exposed two problems.
+
+1. **A startup spike in the relative VO yaw measurement (bug).** The gyro
+   integral had stamp 0 until the first IMU sample after initialisation, so the
+   first measurement extended the integral over 493 s (2.96 rad/s, NIS 375 641;
+   rejected by the gate). It is fixed, and a regression test
+   (`RelativeVoYawAtLargeSimTimeHasNoStartupSpike`) now starts at t = 493 s.
+2. **Yaw crept about 2.5° in 45 s on the ground.** VO's yaw-rate drift is a
+   random walk that starts with the simulator, so after about 490 s it was
+   about 0.0015 rad/s. It is *constant* over a flight and does not average out,
+   and the relative measurement had pulled the bias by exactly that much.
+   Three changes:
+   - **Zero-angular-rate update (ZARU).** While the *estimate* says the drone
+     rests on the ground (within 0.25 m of the initial height, speed
+     < 0.15 m/s), the true yaw rate is 0. Each 1 s gyro mean is then a direct
+     bias measurement (σ = 0.004/√100 ⊕ 2e-4 rad/s). This uses only estimator
+     inputs: MAVROS "landed" state is off-limits to the estimator.
+   - `vo_yaw_rate_sigma` 0.001 → **0.005**: the relative VO measurement is now
+     a weak fallback, for when there is no ground phase.
+   - `init_yaw_sigma` 10° → **3°**: the spawn heading is known. With a loose
+     prior, the first noisy velocity comparisons on leg 1 pushed yaw around by
+     up to 9°.
+
+   Effect (simulated, 12 runs): **500 s idle** before takeoff, yaw error at
+   takeoff **17° → 0.2°**, yaw within 2σ 0.68 → 0.99. **60 s idle**, worst
+   in-flight yaw 9.8° → 3.1°.
+
+The evaluator also gets 30 s to save on Ctrl-C (`sigterm_timeout`), and
+matplotlib is imported at start-up so saving is quick.
+
+### Second live run (after the ZARU fix)
+
+Live on seed 42, about 690 s after simulator start: yaw held at 90.1°, with
+bias −0.0170 ± 0.0001 rad/s. The §3 services behaved as designed: `GPS LOST`,
+then `GPS RECOVERED after 12.6 s`, then the outlier on the first fix after
+recovery was rejected (`NIS 62.0 > gate 16.27 … 5.51 m [first fix after
+outage]`). Two refinements followed:
+
+- **The resting detector flapped** (6 transitions in 5 s). The initial height
+  came from noisy GPS z (+0.32 m), right at the old 0.25 m threshold. It now
+  has **hysteresis**: enter after 1 s with height < 0.3 m and speed < 0.1 m/s;
+  leave at > 0.4 m or > 0.25 m/s. Its height reference follows the converged
+  estimate while resting. Simulated: exactly 3 transitions per run (rest,
+  takeoff, landing).
+- **About 0.25 m horizontal offset at rest.** VO's *velocity* bias is also a
+  random walk from simulator start (≈ 0.02 m/s after 690 s) and drags the
+  position. While resting, a **zero-velocity update (ZUPT)** fuses v = 0
+  (σ 0.03 m/s), gated at χ²(3) 99.9 %. A real takeoff fails the gate, which
+  ends "resting" immediately, so the ZUPT can never pin a climb (unit test
+  `ZeroVelocityUpdateDoesNotPinTakeoff`; takeoff is detected 0.5–0.7 s after
+  the climb starts). In flight the VO velocity bias cannot be separated
+  without extra states (the state is fixed at 8), and the σ = 0.2 m/s VO
+  weighting keeps its effect at 0.13–0.17 m RMS.
+
+## Missing and bad measurements (§3, increment 5)
+
+### Behaviour
+
+| event | what the filter does | log (once per transition, never at sensor rate) |
+|---|---|---|
+| GPS stops | keeps predicting; position comes from VO velocity + motion model, P grows | `GPS LOST at t=…: no fix for 1.0 s …` |
+| GPS returns | the first fix goes through the normal gate; correction through the Kalman gain, never a reset | `GPS RECOVERED … after 15.2 s` / `GPS re-acquired: first fix innovation …` |
+| GPS outlier | χ² gate on `r' S⁻¹ r`, with `S = H P Hᵀ + R` | `GPS REJECTED at t=…: NIS 66.8 > gate 16.27 (chi2, 3 DOF), innovation … = 5.64 m` |
+| 5 consecutive GPS rejections | the *estimate* is assumed to have drifted: position covariance is inflated to the disagreement, so the next fixes pass and pull it back gradually | `5 consecutive GPS rejections: … inflated position covariance …` |
+| VO stops | velocity comes from GPS + motion model; the relative-yaw baseline restarts after the gap | `VO LOST …` / `VO RECOVERED …` |
+| IMU gap | measurements predict with the last gyro rate | `IMU LOST …` / `IMU RECOVERED …` |
+| NaN/Inf input or result | input ignored; a non-finite or non-positive-definite update is refused, and the previous valid state is kept | `… kept the previous valid state` |
+
+Timeouts are in sim time (`gps_timeout` 1.0 s, `vo_timeout` 0.3 s,
+`imu_timeout` 0.1 s). They only drive logging and the VO yaw baseline. The
+filter itself never freezes or resets.
+
+### Gate threshold
+
+`gps_gate_chi2 = 16.27` is χ² with 3 DOF at 99.9 %: a correct fix is rejected
+1 time in 1000, about once per flight, and the cost is one skipped fix. The
+injected outlier is 5–8 m in a **random 3D direction**. The hardest case is
+vertical, where GPS σ is 0.9 m. Over 60 simulated outliers, including ones
+arriving as the first fix after a 15 s outage, the **smallest NIS was 22.5**
+(5th percentile 31.8, median 73). 99.99 % (21.11) would leave almost no
+margin, so 99.9 % it is.
+
+### Simulated §3 scenario (16 runs: 8 seeds × fixed/turning heading)
+
+GPS off for 15 s during lap 2, an outlier requested **during** the outage (so
+it lands on the first fix after recovery, as the sensor simulator does), an
+outlier mid-lap 1, and VO off for 3 s:
+
+![§3 scenario](doc/inc5_outage_outlier_seed42.png)
+
+| | mean | worst |
+|---|---|---|
+| horizontal error before the outage | 0.18 m | 0.25 m |
+| horizontal error during the 15 s GPS outage | 0.28 m | 0.57 m |
+| largest 10 ms step of the estimate at GPS recovery | 0.11 m | 0.15 m |
+| horizontal error during the 3 s VO dropout | 0.55 m | 0.69 m |
+| outliers rejected | **32 / 32** (16 mid-flight, 16 first-after-outage) | |
+| false GPS rejections | 10 in 16 runs, about 0.6 per flight | |
+| whole-run horizontal RMS | 0.17 m | 0.24 m |
+
+`accel_xy` 0.5 → **0.1** and `accel_z` 0.3 → **0.1** came from this scenario.
+With VO gone, a loose motion model let GPS noise drive the velocity. Worst
+horizontal error in the dropout fell from 0.91 to 0.69 m, vertical from 0.84 to
+0.64 m. Nominal accuracy was unchanged or slightly better.
+
+Nominal flight with the final defaults (16 runs, 60 s idle): horizontal RMS
+**0.14 m**, z RMS **0.12 m**, yaw RMS **0.9°** (worst 4.1°), velocity RMS
+**0.04 m/s**, bias error **7e-5 rad/s**; within 2σ: xy 0.96, z 0.94, yaw 0.96.
+
+Unit tests for §3 (`test_ekf`, `Section3.*`): a 15 s GPS outage stays finite
+and recovers without a jump; a VO dropout is carried by GPS; a vertical 5 m
+outlier is rejected even as the first fix after an outage; consecutive
+rejections re-acquire GPS; NaN inputs are ignored. **22/22 pass** (including
+the resting-detector test).
+
+### Testing it live (teacher's services)
+
+```bash
+ros2 service call /localization/set_gps_enabled std_srvs/srv/SetBool "{data: false}"
+# … 15 s of sim time …
+ros2 service call /localization/set_gps_enabled std_srvs/srv/SetBool "{data: true}"
+ros2 service call /localization/inject_gps_outlier std_srvs/srv/Trigger
+ros2 service call /localization/set_vo_enabled std_srvs/srv/SetBool "{data: false}"
+ros2 service call /localization/set_vo_enabled std_srvs/srv/SetBool "{data: true}"
 ```
