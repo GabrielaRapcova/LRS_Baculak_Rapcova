@@ -1,0 +1,4 @@
+geometry_msgs/Point point
+---
+bool collision
+uint8 cost
