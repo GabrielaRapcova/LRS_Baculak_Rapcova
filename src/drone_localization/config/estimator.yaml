@@ -1,0 +1,63 @@
+# Eight-state localisation EKF (drone_localization/estimator_node).
+# State x = [px py pz vx vy vz yaw bias] in ENU `map`; bias = gyro-Z bias.
+# Values come from the §1 characterisation and offline tuning (see README).
+localization_estimator:
+  ros__parameters:
+    use_sim_time: true
+
+    # Topics and frames.
+    gps_topic: /localization/gps
+    vo_topic: /localization/vo
+    imu_topic: /localization/imu
+    estimate_topic: /localization/estimate   # also <topic>_state (Float64MultiArray)
+    map_frame: map
+    body_frame: base_link
+    vo_frame: vo_odom
+    status_period_s: 5.0         # sim seconds between status lines
+
+    # Process noise Q.
+    accel_xy: 0.1                # horizontal white-acceleration density [m^2/s^3]
+    accel_z: 0.1                 # vertical white-acceleration density [m^2/s^3]
+    gyro_noise: 0.004            # gyro noise per sample [rad/s] (IMU variance 1.6e-5)
+    gyro_rate: 100.0             # [Hz] converts gyro_noise to a density
+    bias_walk: 2.0e-5            # gyro bias random walk [rad/s/sqrt(s)]; Gazebo bias is constant
+
+    # Initialisation P0 (drone at rest on the ground).
+    init_gps_samples: 10         # position = median of the first N GPS fixes
+    init_yaw: 1.5707963267948966 # known spawn heading in ENU [rad]
+    init_yaw_sigma: 0.052        # [rad] 3 deg
+    init_velocity_sigma: 0.2     # [m/s]
+    init_bias_sigma: 0.03        # [rad/s] if fewer than 10 gyro samples arrived before init
+    init_bias_min_sigma: 0.003   # [rad/s] floor on the gyro-mean bias sigma
+
+    # Timing and chi-square gates (99.9 %).
+    max_measurement_lag: 0.05    # [s] older measurements are dropped
+    gate_chi2_1dof: 10.83        # gyro-bias measurements (VO yaw, ZARU)
+    gate_chi2_3dof: 16.27        # GPS, VO velocity, ZUPT. Smallest injected-outlier
+                                 # NIS seen offline was 22.5, so 99.99 % (21.11) is too loose.
+    gps_max_consecutive_rejections: 5   # then widen the position covariance (never reset)
+
+    # VO body velocity: sigma floor well above the 0.03 m/s sample noise because
+    # the VO bias/scale error is correlated in time and grows with simulator uptime.
+    vo_velocity_sigma: 0.3       # [m/s]
+
+    # Gyro bias from VO yaw: (gyro turn - VO turn) / window.
+    vo_yaw_window: 2.0           # [s]
+    vo_pose_yaw_sigma: 0.0052    # [rad] VO per-sample yaw noise (0.3 deg)
+    vo_yaw_rate_sigma: 0.005     # [rad/s] VO's own yaw-rate drift -> weak fallback
+
+    # Resting on the ground: ZARU (gyro mean = bias) and ZUPT (v = 0).
+    # Detected from the estimate only, with hysteresis; a rejected ZUPT = takeoff.
+    rest_enter_height: 0.3       # [m] above the ground-height estimate
+    rest_exit_height: 0.4        # [m]
+    rest_enter_speed: 0.1        # [m/s]
+    rest_exit_speed: 0.25        # [m/s]
+    rest_enter_time: 1.0         # [s]
+    rest_update_period: 1.0      # [s] ZARU/ZUPT period
+    zaru_rate_sigma: 2.0e-4      # [rad/s] allowance for residual true rotation
+    zupt_sigma: 0.03             # [m/s]
+
+    # A sensor is reported LOST after this long without data (sim time).
+    gps_timeout: 1.0             # [s]
+    vo_timeout: 0.3              # [s]
+    imu_timeout: 0.1             # [s]

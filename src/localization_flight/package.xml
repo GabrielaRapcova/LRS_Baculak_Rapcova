@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>localization_flight</name>
+  <version>0.1.0</version>
+  <description>
+    Assignment 2 §4: standalone flight node that flies the two-lap route using
+    only the drone_localization estimate as position/yaw feedback.
+  </description>
+  <maintainer email="user@todo.todo">user</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>eigen3_cmake_module</buildtool_depend>
+  <build_depend>eigen</build_depend>
+
+  <depend>rclcpp</depend>
+  <depend>nav_msgs</depend>
+  <depend>mavros_msgs</depend>
+  <depend>angles</depend>
+  <depend>tf2</depend>
+  <depend>tf2_geometry_msgs</depend>
+
+  <exec_depend>drone_localization</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>drone_localization</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
