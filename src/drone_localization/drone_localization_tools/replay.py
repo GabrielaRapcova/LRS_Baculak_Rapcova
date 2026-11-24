@@ -36,45 +36,38 @@ def find_binary(explicit=None):
     raise FileNotFoundError('ekf_replay not found; build the package or set EKF_REPLAY')
 
 
-def to_events(data, sensors=('imu', 'gps', 'vo'), jitter=0.0, seed=0):
-    """Return event lines sorted by arrival (``recv`` column, plus optional jitter)."""
-    rng = np.random.default_rng(seed)
+def to_events(data, sensors=('imu', 'gps', 'vo')):
+    """Return ekf_replay event lines, sorted by arrival time (the ``recv`` column)."""
     events = []
     if 'imu' in sensors and 'imu' in data:
         for t, wz, recv in data['imu']:
             events.append((recv, f'imu,{t:.6f},{wz:.8f}'))
     if 'gps' in sensors and 'gps' in data:
-        for row in data['gps']:
-            t, x, y, z, recv = row[:5]
-            recv = recv + abs(rng.normal(0.0, jitter)) if jitter > 0 else recv
+        for t, x, y, z, recv in data['gps'][:, :5]:
             events.append((recv, f'gps,{t:.6f},{x:.6f},{y:.6f},{z:.6f},'
                                  f'{GPS_VAR[0]},{GPS_VAR[1]},{GPS_VAR[2]}'))
     if 'vo' in sensors and 'vo' in data:
         for row in data['vo']:
             t, yaw, vb, recv = row[0], row[4], row[5:8], row[8]
-            recv = recv + abs(rng.normal(0.0, jitter)) if jitter > 0 else recv
             events.append((recv, f'vo,{t:.6f},{yaw:.8f},{vb[0]:.6f},{vb[1]:.6f},{vb[2]:.6f},'
                                  f'{VO_VEL_VAR},{VO_VEL_VAR},{VO_VEL_VAR}'))
-    events.sort(key=lambda e: e[0])
-    return [e[1] for e in events]
+    events.sort(key=lambda event: event[0])
+    return [line for _, line in events]
 
 
-def run(data, sensors=('imu', 'gps', 'vo'), overrides=None, binary=None, every=1, jitter=0.0):
-    """Run the replay and return (estimate array, stderr text)."""
-    binary = find_binary(binary)
-    with tempfile.NamedTemporaryFile('w', suffix='.csv', delete=False) as f:
-        f.write('\n'.join(to_events(data, sensors, jitter)) + '\n')
-        path = f.name
+def run(data, sensors=('imu', 'gps', 'vo'), overrides=None, binary=None, every=1):
+    """Run ekf_replay on ``data``; return (estimate rows, every ``every``-th; stderr text)."""
+    with tempfile.NamedTemporaryFile('w', suffix='.csv', delete=False) as events:
+        events.write('\n'.join(to_events(data, sensors)) + '\n')
     try:
-        args = [binary, path, '--every', str(every)]
-        args += [f'{k}={v}' for k, v in (overrides or {}).items()]
-        proc = subprocess.run(args, capture_output=True, text=True, check=True)
+        args = [find_binary(binary), events.name]
+        args += [f'{key}={value}' for key, value in (overrides or {}).items()]
+        result = subprocess.run(args, capture_output=True, text=True, check=True)
     finally:
-        os.unlink(path)
-    lines = proc.stdout.strip().splitlines()[1:]
-    est = np.array([[float(v) for v in ln.split(',')] for ln in lines]) if lines else \
-        np.zeros((0, len(EST_COLUMNS)))
-    return est, proc.stderr
+        os.unlink(events.name)
+    rows = [[float(v) for v in line.split(',')] for line in result.stdout.splitlines()[1:]]
+    estimate = np.array(rows) if rows else np.zeros((0, len(EST_COLUMNS)))
+    return estimate[::every], result.stderr
 
 
 def score(est, truth, gyro_bias=None, skip_s=0.0):

@@ -20,6 +20,41 @@ increment; the full design document follows at the end.
 | 6. Flight on the estimate (§4): separate package `localization_flight` | **done** (sim-tested) |
 | 7. Documentation | – |
 
+## Code structure
+
+```
+drone_localization/
+  include/drone_localization/ekf.hpp   Ekf: 8-state EKF. predict(), one generic gated
+                                       Joseph-form update() and the four measurement
+                                       models (position, velocity, body velocity, bias)
+  include/.../localizer.hpp            Localizer: initialisation, measurement timing,
+                                       GPS / VO / ZARU / ZUPT updates, sensor-loss logging
+  src/estimator_node.cpp               ROS wrapper: parameters, subscriptions, publishing
+  src/sensor_check_node.cpp            §1 live sensor check
+  src/ekf_replay.cpp                   offline replay of a CSV event stream (same Localizer)
+  test/test_ekf.cpp                    unit tests (EKF maths, timing, §3 robustness)
+  config/estimator.yaml                every parameter, commented
+  drone_localization_tools/            Python: bag reading, analysis, simulation, replay
+  scripts/                             characterisation, evaluation, recording, flight
+```
+
+The core reuses library code instead of local helpers:
+
+- logging: `rclcpp::Logger` with `RCLCPP_*`;
+- angle wrapping: `angles::normalize_angle` and `shortest_angular_distance`;
+- quaternions: `tf2::getYaw`, `tf2::Quaternion` and `tf2::toMsg`;
+- message stamps: `rclcpp::Time`;
+- linear algebra: Eigen (`LDLT`).
+
+The numerics are unchanged by the simplification: Joseph-form covariance
+update, LDLT solve of S, symmetrised P, and non-finite results refused (the
+previous state is kept). A regression replay of 8 simulated runs (343,000
+filter steps, with outages and outliers) gave bit-identical output before and
+after the rewrite.
+
+All χ² gates use 99.9 %: `gate_chi2_1dof` (10.83) for the gyro-bias
+measurements, `gate_chi2_3dof` (16.27) for GPS, VO velocity and ZUPT.
+
 ## Build
 
 From the workspace root (`ros2_ws`):
@@ -146,8 +181,12 @@ src/ekf_replay.cpp                        CSV replay of a sensor stream through 
 test/test_ekf.cpp                         gtests
 ```
 
-The core is plain C++17/Eigen with no ROS, so the ROS node, the offline replay
-and the unit tests all run the same code.
+The core is C++17/Eigen (it uses only `rclcpp` logging and `angles` from ROS),
+so the ROS node, the offline replay and the unit tests all run the same code.
+
+*This section and the following ones are a development log: values quoted
+there are the ones tuned at that step. The current values are in
+`config/estimator.yaml` and in "Code structure" at the top.*
 
 **State** (ENU `map`): `x = [px py pz vx vy vz yaw b]`, where `b` is the gyro Z
 bias (true yaw rate = `gyro_z − b`).
@@ -169,8 +208,8 @@ the Joseph form and a χ² gate: 16.27 = 3 DOF at 99.9 %.
 **Timing.** Every measurement is applied at its own header stamp. When a stamp
 is ahead of the filter, the filter is predicted to that stamp with the last
 gyro rate, then updated. A stamp up to `max_measurement_lag` (0.05 s) behind
-the filter is applied at the filter time and counted as `late`. Anything older
-is dropped and counted as `stale`. An IMU sample at or before the filter time
+the filter is applied at the filter time. Anything older is dropped and
+counted as `dropped`. An IMU sample at or before the filter time
 is never integrated twice.
 
 **Initialisation** uses data only, never truth:
@@ -248,7 +287,7 @@ is (√2·0.3°/T)² from VO pose noise, plus the gyro noise, plus a
 `vo_yaw_rate_sigma` (0.001 rad/s) allowance for VO's own yaw-rate drift. The
 gyro integral is evaluated exactly at the VO stamps.
 
-**Why absolute VO yaw is not fused (default off, `vo_yaw_absolute`).** The
+**Why absolute VO yaw is not fused** (tested during development, then removed). The
 `vo_odom` frame starts aligned with `map`, but its yaw drifts (random walk
 plus a rate bias) from the moment the sensor simulator starts. The idle time
 before takeoff decides how far it has drifted. With 60 s of idle time, fusing
@@ -282,8 +321,9 @@ signal (so it would repeat that information) and drifts about 0.6 m/min.
 | gyro bias error at end | not observable | **0.0003 rad/s** |
 | errors within 2σ (x,y / z / yaw) | | **0.95–0.97 / 0.94 / 0.94–1.00** |
 
-"Bias not known" means `init_bias_from_gyro=0`, the hardest case. The default
-(bias from the ground gyro mean) only shortens the transient.
+"Bias not known" means the filter started without the ground gyro mean (no
+gyro data before initialisation), the hardest case. The default (bias from the
+ground gyro mean) only shortens the transient.
 
 Reproduce with:
 
@@ -447,7 +487,7 @@ filter itself never freezes or resets.
 
 ### Gate threshold
 
-`gps_gate_chi2 = 16.27` is χ² with 3 DOF at 99.9 %: a correct fix is rejected
+`gate_chi2_3dof = 16.27` is χ² with 3 DOF at 99.9 %: a correct fix is rejected
 1 time in 1000, about once per flight, and the cost is one skipped fix. The
 injected outlier is 5–8 m in a **random 3D direction**. The hardest case is
 vertical, where GPS σ is 0.9 m. Over 60 simulated outliers, including ones

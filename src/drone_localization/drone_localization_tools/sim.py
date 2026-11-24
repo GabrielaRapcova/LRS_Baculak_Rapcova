@@ -16,22 +16,18 @@ import sys
 import numpy as np
 
 
-def _import_sensor_model(path=None):
-    """Import the course sensor model from the installed package or a source path."""
+def _import_sensor_model():
+    """The course sensor model: installed with colcon, or from $LOCALIZATION_SENSOR_SIM_DIR."""
     try:
-        from localization_sensor_sim import sensor_model  # installed via colcon
-        return sensor_model
+        from localization_sensor_sim import sensor_model
     except ImportError:
-        candidates = [path, os.environ.get('LOCALIZATION_SENSOR_SIM_DIR')]
-        here = os.path.dirname(os.path.abspath(__file__))
-        for up in range(2, 7):  # walk up to find <repo>/localization_sensor_sim
-            candidates.append(os.path.join(here, *(['..'] * up), 'localization_sensor_sim'))
-        for c in candidates:
-            if c and os.path.isfile(os.path.join(c, 'localization_sensor_sim', 'sensor_model.py')):
-                sys.path.insert(0, os.path.abspath(c))
-                from localization_sensor_sim import sensor_model
-                return sensor_model
-    raise ImportError('localization_sensor_sim not found; set LOCALIZATION_SENSOR_SIM_DIR')
+        source = os.environ.get('LOCALIZATION_SENSOR_SIM_DIR')
+        if not source:
+            raise ImportError('localization_sensor_sim not found: build it with colcon or set '
+                              'LOCALIZATION_SENSOR_SIM_DIR to <repo>/localization_sensor_sim')
+        sys.path.insert(0, source)
+        from localization_sensor_sim import sensor_model
+    return sensor_model
 
 
 DEFAULT_CONFIG = {
@@ -123,14 +119,14 @@ def truth_trajectory(segments, rate=100.0, tau=0.4, t0=100.0):
     return np.asarray(rows)
 
 
-def simulate(truth, seed=42, gyro_seed=None, config=None, events=(), sensor_model_path=None):
+def simulate(truth, seed=42, gyro_seed=None, config=None, events=()):
     """Run the course corruption model over ``truth``.
 
     ``events`` is a list of ``(time, action)`` with actions
     ``'gps_off'``, ``'gps_on'``, ``'vo_off'``, ``'vo_on'``, ``'gps_outlier'`` —
     the same controls the teacher's services provide.
     """
-    sm = _import_sensor_model(sensor_model_path)
+    sm = _import_sensor_model()
     cfg = dict(DEFAULT_CONFIG, **(config or {}))
     corruptor = sm.SensorCorruptor(seed, cfg)
     grng = np.random.default_rng(seed + 1000 if gyro_seed is None else gyro_seed)

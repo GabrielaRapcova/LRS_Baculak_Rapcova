@@ -157,7 +157,8 @@ def print_summary(name, summary):
     if 'vo' in summary:
         v = summary['vo']
         print(f"  VO    drift {v['final_drift_m']:.3f} m in {v['duration_s']:.0f} s "
-              f"({v['drift_rate_m_per_min']:.3f} m/min), yaw drift {v['final_yaw_drift_deg']:+.2f} deg")
+              f"({v['drift_rate_m_per_min']:.3f} m/min), "
+              f"yaw drift {v['final_yaw_drift_deg']:+.2f} deg")
         print('        body-vel (scale, bias): '
               + ', '.join(f'({s:.3f}, {b:+.4f})' for s, b in v['body_velocity_scale_bias']))
     if 'gyro' in summary:
@@ -201,7 +202,8 @@ def main():
         if 'truth' in data and 'truth' in data_b:
             rep = an.reproducibility(data, data_b)
             print(f"\n  GPS error sequence, first {rep['samples']} samples: "
-                  f"correlation {rep['correlation']:+.3f}, max |diff| {rep['max_abs_diff_m']:.3f} m")
+                  f"correlation {rep['correlation']:+.3f}, "
+                  f"max |diff| {rep['max_abs_diff_m']:.3f} m")
             print('  (same seed -> correlation ~1 and identical hidden biases; '
                   'different seed -> ~0 and different biases)')
             result['reproducibility'] = rep

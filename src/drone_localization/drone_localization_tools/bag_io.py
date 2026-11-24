@@ -27,27 +27,29 @@ TOPICS = {
 }
 
 
-def _stamp(header):
-    return header.stamp.sec + 1e-9 * header.stamp.nanosec
+def stamp_seconds(header):
+    """Header stamp in seconds."""
+    from rclpy.time import Time
+    return Time.from_msg(header.stamp).nanoseconds * 1e-9
 
 
-def _yaw(q):
-    return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
-                      1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+def yaw_from_quaternion(q):
+    """Heading of a yaw-only (or near-level) orientation quaternion."""
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
 
 def _row(kind, msg, recv):
     if kind == 'gps':
         p = msg.pose.pose.position
-        return [_stamp(msg.header), p.x, p.y, p.z, recv]
+        return [stamp_seconds(msg.header), p.x, p.y, p.z, recv]
     if kind == 'imu':
-        return [_stamp(msg.header), msg.angular_velocity.z, recv]
+        return [stamp_seconds(msg.header), msg.angular_velocity.z, recv]
     if kind == 'est':
         return list(msg.data[:17]) if len(msg.data) >= 17 else None
     # Odometry-based streams.
     p = msg.pose.pose.position
     v = msg.twist.twist.linear
-    row = [_stamp(msg.header), p.x, p.y, p.z, _yaw(msg.pose.pose.orientation),
+    row = [stamp_seconds(msg.header), p.x, p.y, p.z, yaw_from_quaternion(msg.pose.pose.orientation),
            v.x, v.y, v.z]
     if kind == 'truth':
         row.append(msg.twist.twist.angular.z)

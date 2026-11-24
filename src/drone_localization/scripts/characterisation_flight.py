@@ -63,99 +63,103 @@ class CharacterisationFlight(Node):
         self.takeoff_cli = self.create_client(CommandTOL, f'{ns}/cmd/takeoff')
 
         self.phase = 'wait_connection'
-        self.phase_start = self.get_clock().now()
+        self.phase_start = self.now()
+        self.last_request = None
         self.leg_index = 0
-        self.pending = None
-        self.create_timer(0.05, self._tick)
+        self.create_timer(0.05, self.tick)
         self.get_logger().info(
             f'characterisation flight: {self.ground_s:.0f} s ground, takeoff to '
             f'{self.takeoff_alt:.1f} m, {self.hover_s:.0f} s hover, square at '
             f'{speed:.2f} m/s, yaw turns at {math.degrees(yaw_rate):.0f} deg/s')
 
+    def now(self):
+        return self.get_clock().now().nanoseconds * 1e-9
+
     def _on_state(self, msg):
         self.state = msg
 
-    def _elapsed(self):
-        return (self.get_clock().now() - self.phase_start).nanoseconds * 1e-9
+    def time_in_phase(self):
+        return self.now() - self.phase_start
 
-    def _goto(self, phase):
+    def enter(self, phase):
         self.get_logger().info(f'phase: {self.phase} -> {phase}')
         self.phase = phase
-        self.phase_start = self.get_clock().now()
-        self.pending = None
+        self.phase_start = self.now()
+        self.last_request = None
 
-    def _call(self, client, request):
-        if self.pending is None and client.service_is_ready():
-            self.pending = client.call_async(request)
+    def request(self, client, request, period):
+        """Send a service request, repeated every `period` s until the phase changes.
 
-    def _done(self):
-        if self.pending is not None and self.pending.done():
-            result = self.pending.result()
-            self.pending = None
-            return result
-        return None
+        The outcome is read from /mavros/state (mode, armed), so the response
+        itself is not awaited.
+        """
+        if not client.service_is_ready():
+            return
+        if self.last_request is not None and self.now() - self.last_request < period:
+            return
+        self.last_request = self.now()
+        client.call_async(request)
 
-    def _send_velocity(self, vx, vy, vz, yaw_rate):
-        sp = PositionTarget()
-        sp.header.stamp = self.get_clock().now().to_msg()
-        sp.coordinate_frame = PositionTarget.FRAME_LOCAL_NED  # ENU in, MAVROS converts
-        sp.type_mask = VELOCITY_YAW_RATE_MASK
-        sp.velocity.x, sp.velocity.y, sp.velocity.z = vx, vy, vz
-        sp.yaw_rate = yaw_rate
-        self.setpoint_pub.publish(sp)
+    def send_velocity(self, vx, vy, vz, yaw_rate):
+        setpoint = PositionTarget()
+        setpoint.header.stamp = self.get_clock().now().to_msg()
+        setpoint.coordinate_frame = PositionTarget.FRAME_LOCAL_NED  # ENU in, MAVROS converts
+        setpoint.type_mask = VELOCITY_YAW_RATE_MASK
+        setpoint.velocity.x, setpoint.velocity.y, setpoint.velocity.z = vx, vy, vz
+        setpoint.yaw_rate = yaw_rate
+        self.setpoint_pub.publish(setpoint)
 
-    def _tick(self):
-        p = self.phase
-        if p == 'wait_connection':
+    def known_disarmed(self):
+        """MAVROS reports connected=False, mode='' on a missed heartbeat: unknown, not disarmed."""
+        return self.state.connected and self.state.mode != '' and not self.state.armed
+
+    def tick(self):
+        phase = self.phase
+        if phase == 'wait_connection':
             if self.state.connected:
-                self._goto('ground')
-        elif p == 'ground':
-            if self._elapsed() >= self.ground_s:
-                self._goto('guided')
-        elif p == 'guided':
+                self.enter('ground')
+        elif phase == 'ground':
+            if self.time_in_phase() >= self.ground_s:
+                self.enter('guided')
+        elif phase == 'guided':
             if self.state.mode == 'GUIDED':
-                self._goto('arm')
+                self.enter('arm')
             else:
-                self._call(self.mode_cli, SetMode.Request(custom_mode='GUIDED'))
-                self._done()
-        elif p == 'arm':
+                self.request(self.mode_cli, SetMode.Request(custom_mode='GUIDED'), 2.0)
+        elif phase == 'arm':
             if self.state.armed:
-                self._goto('takeoff')
+                self.enter('takeoff')
             else:
-                self._call(self.arm_cli, CommandBool.Request(value=True))
-                res = self._done()
-                if res is not None and not res.success:
-                    self.get_logger().warn('arming rejected, retrying (EKF still settling?)')
-        elif p == 'takeoff':
-            if self.pending is None and self._elapsed() < 0.5:
-                self._call(self.takeoff_cli, CommandTOL.Request(altitude=float(self.takeoff_alt)))
-            self._done()
-            if self._elapsed() >= self.takeoff_wait_s:
-                self._goto('hover')
-        elif p == 'hover':
-            self._send_velocity(0.0, 0.0, 0.0, 0.0)
-            if self._elapsed() >= self.hover_s:
-                self._goto('legs')
-        elif p == 'legs':
+                self.request(self.arm_cli, CommandBool.Request(value=True), 3.0)
+        elif phase == 'takeoff':
+            if self.last_request is None:
+                self.request(self.takeoff_cli,
+                             CommandTOL.Request(altitude=float(self.takeoff_alt)), 0.0)
+            if self.time_in_phase() >= self.takeoff_wait_s:
+                self.enter('hover')
+        elif phase == 'hover':
+            self.send_velocity(0.0, 0.0, 0.0, 0.0)
+            if self.time_in_phase() >= self.hover_s:
+                self.enter('legs')
+        elif phase == 'legs':
             label, duration, vx, vy, vz, wz = self.legs[self.leg_index]
-            self._send_velocity(vx, vy, vz, wz)
-            if self._elapsed() >= duration:
+            self.send_velocity(vx, vy, vz, wz)
+            if self.time_in_phase() >= duration:
                 self.leg_index += 1
-                if self.leg_index >= len(self.legs):
-                    self._goto('land')
+                if self.leg_index == len(self.legs):
+                    self.enter('land')
                 else:
-                    self.phase_start = self.get_clock().now()
+                    self.phase_start = self.now()
                     self.get_logger().info(f'leg: {self.legs[self.leg_index][0]}')
-        elif p == 'land':
+        elif phase == 'land':
             if self.state.mode == 'LAND':
-                self._goto('wait_disarm')
+                self.enter('wait_disarm')
             else:
-                self._call(self.mode_cli, SetMode.Request(custom_mode='LAND'))
-                self._done()
-        elif p == 'wait_disarm':
-            if not self.state.armed:
-                self.get_logger().info('landed and disarmed — stop the recording now')
-                self._goto('done')
+                self.request(self.mode_cli, SetMode.Request(custom_mode='LAND'), 2.0)
+        elif phase == 'wait_disarm':
+            if self.known_disarmed():
+                self.get_logger().info('landed and disarmed: stop the recording now')
+                self.enter('done')
 
 
 def main():

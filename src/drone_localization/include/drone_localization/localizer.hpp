@@ -1,212 +1,165 @@
-// Sensor-handling layer around the EKF (no ROS).
+// Sensor handling around the EKF: initialisation, message timing, the
+// individual measurement updates and sensor-loss logging.
 //
-// Responsibilities:
-//   * deliberate initialisation from data (median of the first GPS fixes,
-//     configured initial ENU yaw, gyro mean on the ground as the first bias guess);
-//   * time ordering: every measurement is applied at its own header stamp. The
-//     filter is predicted forward to a measurement's stamp with the latest gyro
-//     rate; a measurement slightly older than the filter time (arrival jitter)
-//     is applied at the filter time, and anything older is dropped and counted;
-//   * per-sensor statistics and log messages through a pluggable callback so the
-//     ROS node, the offline replay and the unit tests share the same code.
+// Timing rule: every measurement is applied at its own header stamp. The filter
+// is predicted forward to that stamp with the latest gyro rate. A measurement
+// at most `max_measurement_lag` older than the filter is applied at the filter
+// time; anything older is dropped.
 #pragma once
 
-#include <array>
 #include <cmath>
-#include <functional>
 #include <string>
 #include <vector>
+
+#include <rclcpp/logger.hpp>
+#include <rclcpp/logging.hpp>
 
 #include "drone_localization/ekf.hpp"
 
 namespace drone_localization
 {
 
-enum class LogLevel { Debug, Info, Warn, Error };
-
 struct LocalizerConfig
 {
   ProcessNoise noise;
 
-  // Initialisation.
-  int init_gps_samples = 10;          // GPS fixes to collect (2 s at 5 Hz)
-  double init_yaw = M_PI / 2.0;       // known initial ENU yaw [rad]
-  double init_yaw_sigma = 0.052;      // [rad] (3 deg): spawn heading is known
-  double init_velocity_sigma = 0.2;   // [m/s]
-  double init_bias_sigma = 0.03;      // [rad/s] when not estimated from the gyro
-  bool init_bias_from_gyro = true;    // gyro mean while waiting for GPS (drone at rest)
-  double init_bias_min_sigma = 0.003; // [rad/s] floor on the ground-mean bias sigma
+  // Initialisation (drone at rest on the ground).
+  int init_gps_samples = 10;           // median of the first N GPS fixes -> position
+  double init_yaw = M_PI / 2.0;        // known spawn heading in ENU [rad]
+  double init_yaw_sigma = 0.052;       // [rad] (3 deg)
+  double init_velocity_sigma = 0.2;    // [m/s]
+  double init_bias_sigma = 0.03;       // [rad/s] if too few gyro samples arrived before init
+  double init_bias_min_sigma = 0.003;  // [rad/s] floor on the gyro-mean bias sigma
 
-  // Timing.
-  double max_measurement_lag = 0.05;  // [s] older measurements are dropped
+  double max_measurement_lag = 0.05;   // [s]
 
-  // GPS.
-  bool gps_use_message_covariance = true;
-  std::array<double, 3> gps_sigma{0.6, 0.6, 0.9};  // used if the message has none
-  double gps_sigma_scale = 1.0;       // multiplies the GPS standard deviation
-  double gps_gate_chi2 = 16.27;       // chi2(3 dof) at 99.9 %; <= 0 disables
-  // After this many *consecutive* GPS rejections the filter, not GPS, is
-  // assumed wrong: position covariance is inflated so GPS can pull it back
-  // (smoothly, through the Kalman gain — the state is never reset).
+  // Chi-square gates at 99.9 %, used by every update of that dimension.
+  double gate_chi2_1dof = 10.83;
+  double gate_chi2_3dof = 16.27;
+
+  // After this many consecutive GPS rejections the estimate (not GPS) is assumed
+  // wrong and the position covariance is inflated so GPS can pull it back.
   int gps_max_consecutive_rejections = 5;
 
-  // VO body velocity (nonlinear in yaw).
-  bool vo_velocity_enabled = true;
-  // [m/s] floor on the per-axis sigma. Deliberately much larger than the
-  // per-sample noise (0.03): the VO bias and scale error are correlated in
-  // time, and fusing them at 30 Hz as white noise made the filter
-  // overconfident. Tuned offline to 0.2, raised to 0.3 after a live run 900 s
-  // after simulator start, when the VO bias random walk had grown to ~0.025 m/s.
-  double vo_velocity_sigma = 0.3;
-  double vo_velocity_gate_chi2 = 16.27;
+  // VO body velocity. Sigma floor well above the 0.03 m/s sample noise because
+  // the VO bias and scale error are correlated in time.
+  double vo_velocity_sigma = 0.3;      // [m/s]
 
-  // VO yaw. The message covariance (0.3 deg) only describes per-sample noise,
-  // not the slow vo_odom drift, so it is not used for the absolute update.
-  // Off by default: vo_odom yaw drifts away from map (random walk + rate bias)
-  // from the moment the sensor simulator starts, so it is a biased heading;
-  // fusing it made yaw inconsistent after an idle period.
-  bool vo_yaw_absolute = false;       // fuse VO yaw as absolute heading
-  double vo_yaw_sigma = 0.05;         // [rad] absolute: must cover accumulated drift
-  double vo_yaw_period = 1.0;         // [s] decimation of the absolute update
-  bool vo_yaw_relative = true;        // bias from (gyro integral - VO yaw change)
-  double vo_yaw_window = 2.0;         // [s] baseline of the relative measurement
-  double vo_pose_yaw_sigma = 0.0052;  // [rad] VO per-sample yaw noise (0.3 deg)
-  // [rad/s] VO's own yaw-rate drift. It is a random walk from simulator start
-  // (~0.0015 rad/s seen live after ~490 s) and constant over a flight, so it
-  // is not averaged away; a large value keeps this update a weak fallback.
-  double vo_yaw_rate_sigma = 0.005;
-  double vo_yaw_gate_chi2 = 10.83;    // chi2(1 dof) at 99.9 %
+  // Gyro bias from VO yaw: (gyro turn - VO turn) / window over `vo_yaw_window`.
+  double vo_yaw_window = 2.0;          // [s]
+  double vo_pose_yaw_sigma = 0.0052;   // [rad] VO per-sample yaw noise (0.3 deg)
+  double vo_yaw_rate_sigma = 0.005;    // [rad/s] VO's own yaw-rate drift
 
-  // Resting on the ground: zero-angular-rate update (ZARU) and zero-velocity
-  // update (ZUPT). While resting, the true yaw rate and velocity are zero, so
-  // each window's gyro mean measures the bias and v = 0 is a measurement.
-  // "Resting" is judged from the estimate only (no MAVROS, no truth), with
-  // hysteresis: enter after `rest_enter_time` with height < rest_enter_height
-  // above the ground estimate and speed < rest_enter_speed; leave as soon as
-  // height > rest_exit_height or speed > rest_exit_speed, or the ZUPT is
-  // rejected by its gate (VO says we are moving -> takeoff).
-  bool zaru_enabled = true;
-  bool zupt_enabled = true;
-  double zaru_window = 1.0;           // [s] averaging window = update period
-  double rest_enter_height = 0.3;     // [m] above the ground estimate
-  double rest_exit_height = 0.4;      // [m]
-  double rest_enter_speed = 0.1;      // [m/s]
-  double rest_exit_speed = 0.25;      // [m/s]
-  double rest_enter_time = 1.0;       // [s]
-  double zaru_rate_sigma = 2e-4;      // [rad/s] allowance for residual true rotation
-  double zupt_sigma = 0.03;           // [m/s] zero-velocity pseudo-measurement
-  double zupt_gate_chi2 = 16.27;      // chi2(3 dof) 99.9 %
+  // Resting on the ground (detected from the estimate, with hysteresis). While
+  // resting the true yaw rate and velocity are zero: the gyro mean measures the
+  // bias (ZARU) and v = 0 is fused (ZUPT). A rejected ZUPT means takeoff.
+  double rest_enter_height = 0.3;      // [m] above the ground-height estimate
+  double rest_exit_height = 0.4;       // [m]
+  double rest_enter_speed = 0.1;       // [m/s]
+  double rest_exit_speed = 0.25;       // [m/s]
+  double rest_enter_time = 1.0;        // [s] conditions must hold this long
+  double rest_update_period = 1.0;     // [s] ZARU/ZUPT period (gyro averaging window)
+  double zaru_rate_sigma = 2e-4;       // [rad/s] allowance for residual rotation
+  double zupt_sigma = 0.03;            // [m/s]
 
-  // Sensor timeouts (sim time, checked on every IMU step). Only used to log
-  // loss/recovery transitions and to restart the relative VO yaw baseline;
-  // the filter itself simply keeps predicting.
-  double gps_timeout = 1.0;           // [s] 5 missed fixes at 5 Hz
-  double vo_timeout = 0.3;            // [s] ~9 missed frames at 30 Hz
-  double imu_timeout = 0.1;           // [s] 10 missed samples at 100 Hz
-};
-
-// Per-sensor connection state for timeout/recovery logging.
-struct LinkState
-{
-  bool lost = false;
-  double lost_since = 0.0;      // last data stamp before the loss
-  std::size_t outages = 0;
+  // A sensor is reported lost after this long without data (sim time).
+  double gps_timeout = 1.0;            // [s]
+  double vo_timeout = 0.3;             // [s]
+  double imu_timeout = 0.1;            // [s]
 };
 
 struct SensorStats
 {
-  std::size_t received = 0;
-  std::size_t accepted = 0;
-  std::size_t rejected = 0;   // failed the innovation gate
-  std::size_t stale = 0;      // older than max_measurement_lag
-  std::size_t late = 0;       // slightly older than the filter, applied anyway
-  double last_stamp = 0.0;
-  double last_nis = 0.0;
+  int accepted = 0;
+  int rejected = 0;  // failed the chi-square gate
+  int dropped = 0;   // too old to apply
+};
+
+// Tracks whether a sensor is delivering data, for loss/recovery logging.
+struct SensorLink
+{
+  std::string name;
+  double timeout = 0.0;
+  double last_stamp = -1.0;  // < 0: no data yet
+  bool lost = false;
 };
 
 class Localizer
 {
 public:
-  using LogFn = std::function<void (LogLevel, const std::string &)>;
-
-  explicit Localizer(const LocalizerConfig & config = LocalizerConfig{});
-
-  void set_logger(LogFn fn) {log_ = std::move(fn);}
-  void set_config(const LocalizerConfig & config);
-  const LocalizerConfig & config() const {return config_;}
+  explicit Localizer(
+    const LocalizerConfig & config = LocalizerConfig{},
+    const rclcpp::Logger & logger = rclcpp::get_logger("localizer"));
 
   void on_imu(double t, double gyro_z);
-  // `cov` is the 3x3 position covariance from the message (may be zero).
-  void on_gps(double t, const Eigen::Vector3d & position, const Eigen::Matrix3d & cov);
-  // `vo_yaw` in vo_odom, `body_velocity` in base_link, `velocity_var` per axis
-  // from the message twist covariance (may be zero).
+  // `covariance`: 3x3 position covariance from the GPS message.
+  void on_gps(double t, const Eigen::Vector3d & position, const Eigen::Matrix3d & covariance);
+  // `vo_yaw` in vo_odom, `body_velocity` in base_link, `velocity_variance` per axis.
   void on_vo(
     double t, double vo_yaw, const Eigen::Vector3d & body_velocity,
-    const Eigen::Vector3d & velocity_var);
+    const Eigen::Vector3d & velocity_variance);
 
   bool initialized() const {return ekf_.initialized();}
   const Ekf & ekf() const {return ekf_;}
-  const SensorStats & gps_stats() const {return gps_;}
-  const SensorStats & imu_stats() const {return imu_;}
-  const SensorStats & vo_velocity_stats() const {return vo_vel_;}
-  const SensorStats & vo_yaw_stats() const {return vo_yaw_;}
-  const SensorStats & zaru_stats() const {return zaru_;}
-  const SensorStats & zupt_stats() const {return zupt_;}
+  const LocalizerConfig & config() const {return config_;}
   bool resting() const {return resting_;}
-  const LinkState & gps_link() const {return gps_link_;}
-  const LinkState & vo_link() const {return vo_link_;}
-  const LinkState & imu_link() const {return imu_link_;}
-  std::size_t numerical_failures() const {return numerical_failures_;}
+
+  const SensorStats & gps_stats() const {return gps_stats_;}
+  const SensorStats & vo_stats() const {return vo_stats_;}
+  const SensorStats & vo_yaw_stats() const {return vo_yaw_stats_;}
+  const SensorStats & zaru_stats() const {return zaru_stats_;}
+  const SensorStats & zupt_stats() const {return zupt_stats_;}
+  const SensorLink & gps_link() const {return gps_link_;}
+  const SensorLink & vo_link() const {return vo_link_;}
+  const SensorLink & imu_link() const {return imu_link_;}
+  int numerical_failures() const {return numerical_failures_;}
 
 private:
-  void log(LogLevel level, const std::string & msg) const;
-  void try_initialize();
-  // Bring the filter to time t before an update. False = drop the measurement.
-  bool align_to(double t, SensorStats & stats, const char * sensor);
-  Eigen::Matrix3d gps_noise(const Eigen::Matrix3d & cov) const;
+  void initialize_from_ground_data();
+  // Moves the filter to the measurement time. False: the measurement is too old.
+  bool predict_to(double t, SensorStats & stats);
+  void update_bias_from_vo_yaw(double t, double vo_yaw);
+  void update_while_resting(double t, double gyro_z);
+  void update_resting_state(double t);
+
+  // Sensor-loss bookkeeping: `mark_data` returns true when the sensor has just
+  // recovered, `check_lost` returns true when it has just been declared lost.
+  bool mark_data(SensorLink & link, double t);
+  bool check_lost(SensorLink & link, double t);
+  void report_numerical_failure(const char * update, double t);
 
   LocalizerConfig config_;
+  rclcpp::Logger logger_;
   Ekf ekf_;
-  LogFn log_;
 
-  // Integral of the raw gyro over IMU stamps, evaluated at any time t by
-  // extending the last sample (aligns the gyro with VO stamps).
-  double gyro_integral_at(double t) const;
-  void vo_yaw_updates(double t, double vo_yaw);
-
-  void zaru(double t, double gyro_z);
-  void check_timeouts(double t);
-  // Called when data arrives on a link; logs recovery. Returns outage length (0 if none).
-  double link_alive(LinkState & link, const char * name, double t);
-  void note_numerical_failure(const char * what, double t);
-
-  LinkState gps_link_, vo_link_, imu_link_;
+  SensorStats gps_stats_, vo_stats_, vo_yaw_stats_, zaru_stats_, zupt_stats_;
+  SensorLink gps_link_, vo_link_, imu_link_;
   int gps_consecutive_rejections_ = 0;
-  std::size_t numerical_failures_ = 0;
-  double vo_last_data_ = 0.0;
-  double gps_last_data_ = 0.0;
-
-  SensorStats gps_, imu_, vo_vel_, vo_yaw_, zaru_, zupt_;
-  double ground_height_ = 0.0;
-  bool resting_ = false;
-  double rest_candidate_since_ = -1.0;
-  double zaru_start_ = 0.0, zaru_sum_ = 0.0;
-  std::size_t zaru_n_ = 0;
-  double gyro_integral_ = 0.0;
-  double gyro_integral_stamp_ = 0.0;
-  bool have_vo_anchor_ = false;
-  double vo_anchor_t_ = 0.0, vo_anchor_yaw_ = 0.0, vo_anchor_gyro_ = 0.0;
-  double last_abs_yaw_t_ = -1e9;
+  int numerical_failures_ = 0;
   double last_gyro_ = 0.0;
-  bool have_gyro_ = false;
 
-  // Initialisation buffers.
-  std::vector<Eigen::Vector3d> init_gps_;
-  std::vector<Eigen::Matrix3d> init_gps_cov_;
-  double init_gps_stamp_ = 0.0;
-  double gyro_sum_ = 0.0;
-  double gyro_sq_sum_ = 0.0;
-  std::size_t gyro_n_ = 0;
+  // Data collected on the ground before initialisation.
+  std::vector<Eigen::Vector3d> init_positions_;
+  Eigen::Matrix3d init_covariance_sum_ = Eigen::Matrix3d::Zero();
+  double init_gyro_sum_ = 0.0;
+  double init_gyro_square_sum_ = 0.0;
+  int init_gyro_count_ = 0;
+
+  // Gyro integral since initialisation, for the VO yaw bias measurement.
+  double gyro_integral_ = 0.0;
+  double gyro_integral_time_ = 0.0;
+  bool have_vo_reference_ = false;
+  double vo_reference_time_ = 0.0;
+  double vo_reference_yaw_ = 0.0;
+  double vo_reference_gyro_integral_ = 0.0;
+
+  // Resting detector and ZARU/ZUPT averaging.
+  bool resting_ = false;
+  double ground_height_ = 0.0;
+  double rest_candidate_since_ = -1.0;  // < 0: rest conditions not met
+  double rest_window_start_ = 0.0;
+  double rest_gyro_sum_ = 0.0;
+  int rest_gyro_count_ = 0;
 };
 
 }  // namespace drone_localization

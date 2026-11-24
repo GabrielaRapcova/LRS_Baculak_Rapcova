@@ -137,12 +137,6 @@ def gyro_bias(imu, truth):
     return out
 
 
-def gyro_bias_truth_free(imu, t0, t1):
-    """Mean gyro Z between t0 and t1 — the bias if the drone did not turn."""
-    m = (imu[:, IMU_T] >= t0) & (imu[:, IMU_T] <= t1)
-    return float(imu[m, IMU_WZ].mean()) if m.any() else float('nan')
-
-
 def summarize(data):
     """Return a JSON-friendly summary of everything measurable in ``data``."""
     out = {'rates': {k: rate_stats(v[:, 0]) for k, v in data.items()}}

@@ -1,125 +1,94 @@
-// §1 Sensor acquisition and characterisation.
+// §1 live sensor check.
 //
-// Subscribes to the three public localisation sensors with sensor-data QoS and
-// reports, every `window_s` of *simulation* time (taken from IMU header
-// stamps, so the window holds the same amount of data at any real-time factor):
-//   * rate measured from header stamps (simulation time) and from arrival;
-//   * frame_id / child_frame_id checks against the sensor contract;
-//   * duplicate and out-of-order stamps;
-//   * truth-free statistics that make the corruption visible:
-//       - GPS sample mean / std over the window (noise while hovering),
-//       - gyro Z mean / std over the window (bias while not turning),
-//       - VO pose displacement since the window start and mean body speed
-//         (drift while stationary).
-//
-// This node never subscribes to ground truth or MAVROS localisation.
+// Subscribes to the three localisation sensors and, every `window_s` of
+// simulation time (measured on IMU stamps), reports per sensor:
+//   * rate from header stamps and from wall-clock arrival, largest stamp gap,
+//     out-of-order stamps and unexpected frame ids;
+//   * truth-free statistics that show the corruption while the drone is still:
+//     GPS spread (noise), mean gyro Z (bias), VO displacement (drift).
+// It never subscribes to ground truth or MAVROS.
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
-#include <limits>
-#include <mutex>
+#include <memory>
 #include <string>
 
-#include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
-#include "nav_msgs/msg/odometry.hpp"
-#include "rclcpp/rclcpp.hpp"
-#include "sensor_msgs/msg/imu.hpp"
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/imu.hpp>
+#include <tf2/utils.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 namespace drone_localization
 {
 
-namespace
+// Mean and standard deviation of a series of values.
+struct Statistic
 {
+  int count = 0;
+  double sum = 0.0;
+  double sum_of_squares = 0.0;
 
-double stamp_seconds(const builtin_interfaces::msg::Time & t)
-{
-  return static_cast<double>(t.sec) + 1e-9 * static_cast<double>(t.nanosec);
-}
-
-double yaw_from_quaternion(const geometry_msgs::msg::Quaternion & q)
-{
-  return std::atan2(2.0 * (q.w * q.z + q.x * q.y),
-                    1.0 - 2.0 * (q.y * q.y + q.z * q.z));
-}
-
-// Welford running mean / variance for one scalar.
-struct RunningStat
-{
-  std::size_t n = 0;
-  double mean = 0.0;
-  double m2 = 0.0;
-
-  void add(double v)
+  void add(double value)
   {
-    ++n;
-    const double d = v - mean;
-    mean += d / static_cast<double>(n);
-    m2 += d * (v - mean);
+    ++count;
+    sum += value;
+    sum_of_squares += value * value;
   }
+  double mean() const {return count > 0 ? sum / count : 0.0;}
   double stddev() const
   {
-    return n > 1 ? std::sqrt(m2 / static_cast<double>(n - 1)) : 0.0;
+    if (count < 2) {
+      return 0.0;
+    }
+    const double variance = (sum_of_squares - sum * sum / count) / (count - 1);
+    return std::sqrt(std::max(variance, 0.0));
   }
 };
 
-// Timing bookkeeping shared by every stream.
-struct StreamStats
+// Timing of one sensor stream over the current window.
+struct StreamTiming
 {
-  std::size_t count = 0;
-  std::size_t duplicates = 0;
-  std::size_t out_of_order = 0;
-  std::size_t frame_errors = 0;
-  double first_stamp = std::numeric_limits<double>::quiet_NaN();
-  double last_stamp = std::numeric_limits<double>::quiet_NaN();
+  int count = 0;
+  int out_of_order = 0;
+  int frame_errors = 0;
+  double first_stamp = 0.0;
+  double last_stamp = 0.0;
   double max_gap = 0.0;
-  rclcpp::Time first_arrival;
-  rclcpp::Time last_arrival;
-  bool have_arrival = false;
+  double first_arrival = 0.0;  // steady clock [s]
+  double last_arrival = 0.0;
 
-  // Returns false for duplicate / out-of-order stamps.
-  bool add(double stamp, const rclcpp::Time & arrival)
+  // Returns false for a stamp that is not newer than the previous one.
+  bool add(double stamp, double arrival)
   {
-    if (!have_arrival) {
-      first_arrival = arrival;
-      have_arrival = true;
+    if (count > 0 && stamp <= last_stamp) {
+      ++out_of_order;
+      return false;
     }
-    last_arrival = arrival;
-    if (count > 0) {
-      if (stamp == last_stamp) {
-        ++duplicates;
-        return false;
-      }
-      if (stamp < last_stamp) {
-        ++out_of_order;
-        return false;
-      }
-      max_gap = std::max(max_gap, stamp - last_stamp);
-    } else {
+    if (count == 0) {
       first_stamp = stamp;
+      first_arrival = arrival;
+    } else {
+      max_gap = std::max(max_gap, stamp - last_stamp);
     }
     last_stamp = stamp;
+    last_arrival = arrival;
     ++count;
     return true;
   }
-
   double stamp_rate() const
   {
-    const double span = last_stamp - first_stamp;
-    return (count > 1 && span > 0.0) ?
-           static_cast<double>(count - 1) / span : 0.0;
+    return (count > 1) ? (count - 1) / (last_stamp - first_stamp) : 0.0;
   }
-
   double arrival_rate() const
   {
-    if (!have_arrival || count < 2) {return 0.0;}
-    const double span = (last_arrival - first_arrival).seconds();
-    return span > 0.0 ? static_cast<double>(count - 1) / span : 0.0;
+    const double span = last_arrival - first_arrival;
+    return (count > 1 && span > 0.0) ? (count - 1) / span : 0.0;
   }
 };
-
-}  // namespace
 
 class SensorCheckNode : public rclcpp::Node
 {
@@ -127,180 +96,137 @@ public:
   SensorCheckNode()
   : Node("sensor_check_node")
   {
-    gps_topic_ = declare_parameter<std::string>("gps_topic", "/localization/gps");
-    vo_topic_ = declare_parameter<std::string>("vo_topic", "/localization/vo");
-    imu_topic_ = declare_parameter<std::string>("imu_topic", "/localization/imu");
     map_frame_ = declare_parameter<std::string>("map_frame", "map");
     vo_frame_ = declare_parameter<std::string>("vo_frame", "vo_odom");
     body_frame_ = declare_parameter<std::string>("body_frame", "base_link");
-    window_s_ = declare_parameter<double>("window_s", 10.0);
-    const double stall_period =
-      declare_parameter<double>("stall_warning_s", 10.0);
+    window_s_ = declare_parameter("window_s", 10.0);
 
     const auto qos = rclcpp::SensorDataQoS();
     gps_sub_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
-      gps_topic_, qos,
-      [this](geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr m) {on_gps(*m);});
+      "/localization/gps", qos,
+      [this](geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr msg) {on_gps(*msg);});
     vo_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-      vo_topic_, qos,
-      [this](nav_msgs::msg::Odometry::ConstSharedPtr m) {on_vo(*m);});
+      "/localization/vo", qos,
+      [this](nav_msgs::msg::Odometry::ConstSharedPtr msg) {on_vo(*msg);});
     imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
-      imu_topic_, qos,
-      [this](sensor_msgs::msg::Imu::ConstSharedPtr m) {on_imu(*m);});
+      "/localization/imu", qos,
+      [this](sensor_msgs::msg::Imu::ConstSharedPtr msg) {on_imu(*msg);});
 
-    // Wall timer only to complain when no sensor data arrives at all.
-    stall_timer_ = create_wall_timer(
-      std::chrono::duration<double>(stall_period), [this]() {check_stall();});
-
-    RCLCPP_INFO(get_logger(),
-      "sensor_check: GPS=%s VO=%s IMU=%s (use_sim_time=%s)",
-      gps_topic_.c_str(), vo_topic_.c_str(), imu_topic_.c_str(),
-      get_parameter("use_sim_time").as_bool() ? "true" : "false");
+    // Wall timer only to complain when no data arrives at all.
+    stall_timer_ = create_wall_timer(std::chrono::seconds(10), [this]() {
+          if (imu_messages_ == imu_messages_at_last_check_) {
+            RCLCPP_WARN(get_logger(), "no IMU data: is the sensor simulator running?");
+          }
+          imu_messages_at_last_check_ = imu_messages_;
+        });
+    RCLCPP_INFO(get_logger(), "sensor check: reporting every %.0f s of simulation time",
+      window_s_);
   }
 
 private:
-  void check_frame(
-    const char * sensor, const char * field, const std::string & got,
-    const std::string & expected, StreamStats & stats)
-  {
-    if (got == expected) {return;}
-    ++stats.frame_errors;
-    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-      "%s %s is '%s', expected '%s'", sensor, field, got.c_str(), expected.c_str());
-  }
+  double arrival_seconds() const {return steady_clock_.now().seconds();}
 
-  void on_gps(const geometry_msgs::msg::PoseWithCovarianceStamped & m)
+  void check_frame(const std::string & actual, const std::string & expected, StreamTiming & s)
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    check_frame("GPS", "frame_id", m.header.frame_id, map_frame_, gps_);
-    if (!gps_.add(stamp_seconds(m.header.stamp), steady_clock_.now())) {return;}
-    gps_x_.add(m.pose.pose.position.x);
-    gps_y_.add(m.pose.pose.position.y);
-    gps_z_.add(m.pose.pose.position.z);
-    gps_sigma_ = {std::sqrt(m.pose.covariance[0]),
-      std::sqrt(m.pose.covariance[7]), std::sqrt(m.pose.covariance[14])};
-  }
-
-  void on_vo(const nav_msgs::msg::Odometry & m)
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    check_frame("VO", "frame_id", m.header.frame_id, vo_frame_, vo_);
-    check_frame("VO", "child_frame_id", m.child_frame_id, body_frame_, vo_);
-    if (!vo_.add(stamp_seconds(m.header.stamp), steady_clock_.now())) {return;}
-    const auto & p = m.pose.pose.position;
-    const double yaw = yaw_from_quaternion(m.pose.pose.orientation);
-    if (!vo_window_started_) {
-      vo_start_ = {p.x, p.y, p.z};
-      vo_start_yaw_ = yaw;
-      vo_window_started_ = true;
+    if (actual != expected) {
+      ++s.frame_errors;
     }
-    vo_last_ = {p.x, p.y, p.z};
-    vo_last_yaw_ = yaw;
-    const auto & v = m.twist.twist.linear;  // body frame (base_link)
-    vo_body_speed_.add(std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z));
   }
 
-  void on_imu(const sensor_msgs::msg::Imu & m)
+  void on_gps(const geometry_msgs::msg::PoseWithCovarianceStamped & msg)
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    check_frame("IMU", "frame_id", m.header.frame_id, body_frame_, imu_);
-    const double stamp = stamp_seconds(m.header.stamp);
-    if (!imu_.add(stamp, steady_clock_.now())) {return;}
-    gyro_z_.add(m.angular_velocity.z);
-    gyro_var_ = m.angular_velocity_covariance[8];
-    imu_orientation_flag_ = m.orientation_covariance[0];
-    ++total_imu_;
+    check_frame(msg.header.frame_id, map_frame_, gps_);
+    if (!gps_.add(rclcpp::Time(msg.header.stamp).seconds(), arrival_seconds())) {
+      return;
+    }
+    gps_x_.add(msg.pose.pose.position.x);
+    gps_y_.add(msg.pose.pose.position.y);
+    gps_z_.add(msg.pose.pose.position.z);
+  }
+
+  void on_vo(const nav_msgs::msg::Odometry & msg)
+  {
+    check_frame(msg.header.frame_id, vo_frame_, vo_);
+    check_frame(msg.child_frame_id, body_frame_, vo_);
+    if (!vo_.add(rclcpp::Time(msg.header.stamp).seconds(), arrival_seconds())) {
+      return;
+    }
+    const auto & p = msg.pose.pose.position;
+    const double yaw = tf2::getYaw(msg.pose.pose.orientation);
+    if (vo_.count == 1) {
+      vo_start_ = {p.x, p.y, p.z, yaw};
+    }
+    vo_end_ = {p.x, p.y, p.z, yaw};
+    const auto & v = msg.twist.twist.linear;
+    vo_speed_.add(std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z));
+  }
+
+  void on_imu(const sensor_msgs::msg::Imu & msg)
+  {
+    check_frame(msg.header.frame_id, body_frame_, imu_);
+    ++imu_messages_;
+    const double stamp = rclcpp::Time(msg.header.stamp).seconds();
+    if (!imu_.add(stamp, arrival_seconds())) {
+      return;
+    }
+    gyro_z_.add(msg.angular_velocity.z);
     if (stamp - imu_.first_stamp >= window_s_) {
-      report(stamp - imu_.first_stamp);
+      report();
+      reset_window();
     }
   }
 
-  void check_stall()
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (total_imu_ == last_total_imu_) {
-      RCLCPP_WARN(get_logger(),
-        "no IMU data in the last wall-clock period: is the sensor simulator running?");
-    }
-    last_total_imu_ = total_imu_;
-  }
-
-  void report_stream(const char * name, const StreamStats & s)
+  void report_stream(const char * name, const StreamTiming & s)
   {
     RCLCPP_INFO(get_logger(),
-      "  %-3s n=%-5zu stamp-rate=%6.2f Hz  arrival-rate=%6.2f Hz  max-gap=%.3f s  "
-      "dup=%zu ooo=%zu frame-err=%zu",
-      name, s.count, s.stamp_rate(), s.arrival_rate(), s.max_gap,
-      s.duplicates, s.out_of_order, s.frame_errors);
+      "  %-3s n=%-5d stamp-rate=%6.2f Hz  arrival-rate=%6.2f Hz  max-gap=%.3f s  "
+      "out-of-order=%d frame-errors=%d", name, s.count, s.stamp_rate(), s.arrival_rate(),
+      s.max_gap, s.out_of_order, s.frame_errors);
   }
 
-  // Called with mutex_ held.
-  void report(double sim_span)
+  void report()
   {
-    const double wall_span = (imu_.last_arrival - imu_.first_arrival).seconds();
+    const double sim_span = imu_.last_stamp - imu_.first_stamp;
+    const double wall_span = imu_.last_arrival - imu_.first_arrival;
     RCLCPP_INFO(get_logger(),
-      "---- sensor window: %.1f s sim time in %.1f s wall (real-time factor %.2f) ----",
+      "---- %.1f s simulation time in %.1f s wall time (real-time factor %.2f) ----",
       sim_span, wall_span, wall_span > 0.0 ? sim_span / wall_span : 0.0);
     report_stream("GPS", gps_);
     report_stream("VO", vo_);
     report_stream("IMU", imu_);
-
-    if (gps_x_.n > 1) {
-      RCLCPP_INFO(get_logger(),
-        "  GPS mean=(%.2f, %.2f, %.2f) std=(%.2f, %.2f, %.2f) m  "
-        "[reported sigma=(%.2f, %.2f, %.2f)]",
-        gps_x_.mean, gps_y_.mean, gps_z_.mean,
-        gps_x_.stddev(), gps_y_.stddev(), gps_z_.stddev(),
-        gps_sigma_[0], gps_sigma_[1], gps_sigma_[2]);
-    }
-    if (gyro_z_.n > 1) {
-      RCLCPP_INFO(get_logger(),
-        "  gyro_z mean=%+.4f rad/s (%+.2f deg/s) std=%.4f  "
-        "[reported var=%.2e -> sigma=%.4f, orientation flag=%.0f]",
-        gyro_z_.mean, gyro_z_.mean * 180.0 / M_PI, gyro_z_.stddev(),
-        gyro_var_, std::sqrt(std::max(gyro_var_, 0.0)), imu_orientation_flag_);
-    }
-    if (vo_window_started_) {
-      const double dx = vo_last_[0] - vo_start_[0];
-      const double dy = vo_last_[1] - vo_start_[1];
-      const double dz = vo_last_[2] - vo_start_[2];
-      double dyaw = vo_last_yaw_ - vo_start_yaw_;
-      dyaw = std::remainder(dyaw, 2.0 * M_PI);
-      RCLCPP_INFO(get_logger(),
-        "  VO displacement over window=(%+.3f, %+.3f, %+.3f) m, dyaw=%+.2f deg, "
-        "mean |v_body|=%.3f m/s",
-        dx, dy, dz, dyaw * 180.0 / M_PI, vo_body_speed_.mean);
-    }
+    RCLCPP_INFO(get_logger(), "  GPS mean=(%.2f, %.2f, %.2f) std=(%.2f, %.2f, %.2f) m",
+      gps_x_.mean(), gps_y_.mean(), gps_z_.mean(),
+      gps_x_.stddev(), gps_y_.stddev(), gps_z_.stddev());
+    RCLCPP_INFO(get_logger(), "  gyro_z mean=%+.4f rad/s (%+.2f deg/s) std=%.4f rad/s",
+      gyro_z_.mean(), gyro_z_.mean() * 180.0 / M_PI, gyro_z_.stddev());
     RCLCPP_INFO(get_logger(),
-      "  (while stationary: GPS std = noise, gyro mean = bias, VO displacement = drift)");
-
-    // Start a fresh window so each report characterises the last period only.
-    gps_ = vo_ = imu_ = StreamStats{};
-    gps_x_ = gps_y_ = gps_z_ = gyro_z_ = vo_body_speed_ = RunningStat{};
-    vo_window_started_ = false;
+      "  VO displacement=(%+.3f, %+.3f, %+.3f) m, yaw change=%+.2f deg, mean |v|=%.3f m/s",
+      vo_end_[0] - vo_start_[0], vo_end_[1] - vo_start_[1], vo_end_[2] - vo_start_[2],
+      std::remainder(vo_end_[3] - vo_start_[3], 2.0 * M_PI) * 180.0 / M_PI, vo_speed_.mean());
+    RCLCPP_INFO(get_logger(),
+      "  (drone still: GPS std = noise, gyro mean = bias, VO displacement = drift)");
   }
 
-  std::string gps_topic_, vo_topic_, imu_topic_;
+  void reset_window()
+  {
+    gps_ = vo_ = imu_ = StreamTiming{};
+    gps_x_ = gps_y_ = gps_z_ = gyro_z_ = vo_speed_ = Statistic{};
+  }
+
   std::string map_frame_, vo_frame_, body_frame_;
+  double window_s_ = 10.0;
+  rclcpp::Clock steady_clock_{RCL_STEADY_TIME};
+
+  StreamTiming gps_, vo_, imu_;
+  Statistic gps_x_, gps_y_, gps_z_, gyro_z_, vo_speed_;
+  std::array<double, 4> vo_start_{}, vo_end_{};  // x, y, z, yaw
+  long imu_messages_ = 0;  // total, for the stall warning
+  long imu_messages_at_last_check_ = 0;
 
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr gps_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr vo_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::TimerBase::SharedPtr stall_timer_;
-  double window_s_ = 10.0;
-  std::size_t total_imu_ = 0, last_total_imu_ = 0;
-
-  // Arrival is measured on a steady wall clock, independent of /clock.
-  rclcpp::Clock steady_clock_{RCL_STEADY_TIME};
-  std::mutex mutex_;
-  StreamStats gps_, vo_, imu_;
-  RunningStat gps_x_, gps_y_, gps_z_, gyro_z_, vo_body_speed_;
-  std::array<double, 3> gps_sigma_{0.0, 0.0, 0.0};
-  double gyro_var_ = 0.0;
-  double imu_orientation_flag_ = 0.0;
-  bool vo_window_started_ = false;
-  std::array<double, 3> vo_start_{}, vo_last_{};
-  double vo_start_yaw_ = 0.0, vo_last_yaw_ = 0.0;
 };
 
 }  // namespace drone_localization
