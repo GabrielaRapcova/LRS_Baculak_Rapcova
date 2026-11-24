@@ -16,6 +16,8 @@
 #include <string>
 #include <vector>
 
+#include <angles/angles.h>
+
 #include "drone_localization/localizer.hpp"
 #include "localization_flight/route_controller.hpp"
 
@@ -36,7 +38,9 @@ struct Result
   std::size_t gps_rejected = 0;
 };
 
-double segment_distance(const Eigen::Vector2d & p, const Eigen::Vector2d & a, const Eigen::Vector2d & b)
+// Distance from point p to the segment a-b.
+double segment_distance(
+  const Eigen::Vector2d & p, const Eigen::Vector2d & a, const Eigen::Vector2d & b)
 {
   const Eigen::Vector2d ab = b - a;
   const double t = std::clamp((p - a).dot(ab) / std::max(ab.squaredNorm(), 1e-9), 0.0, 1.0);
@@ -81,8 +85,8 @@ Result fly(unsigned seed, double gps_off_from, double gps_off_to, bool outlier_a
     p += v * dt;
     p.z() = std::max(p.z(), 0.0);
     if (p.z() == 0.0) {v.z() = std::max(v.z(), 0.0);}
-    yaw = lf::wrap_angle(yaw + wz * dt);
-    vo_yaw = lf::wrap_angle(vo_yaw + wz * dt + vo_yaw_drift * dt);
+    yaw = angles::normalize_angle(yaw + wz * dt);
+    vo_yaw = angles::normalize_angle(vo_yaw + wz * dt + vo_yaw_drift * dt);
 
     // Sensors.
     loc.on_imu(t, wz + gyro_bias + 0.004 * n(rng));
@@ -98,7 +102,7 @@ Result fly(unsigned seed, double gps_off_from, double gps_off_to, bool outlier_a
     if (i % 3 == 0) {
       const double c = std::cos(yaw), s = std::sin(yaw);
       const Eigen::Vector3d vb(c * v.x() + s * v.y(), -s * v.x() + c * v.y(), v.z());
-      loc.on_vo(t, lf::wrap_angle(vo_yaw + 0.005 * n(rng)),
+      loc.on_vo(t, angles::normalize_angle(vo_yaw + 0.005 * n(rng)),
         vo_scale * vb + vo_bias + 0.03 * Eigen::Vector3d(n(rng), n(rng), n(rng)),
         Eigen::Vector3d::Constant(0.0009));
     }

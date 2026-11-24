@@ -4,15 +4,10 @@
 #include <cmath>
 #include <cstdio>
 
+#include <angles/angles.h>
+
 namespace localization_flight
 {
-
-double wrap_angle(double a)
-{
-  a = std::fmod(a + M_PI, 2.0 * M_PI);
-  if (a < 0.0) {a += 2.0 * M_PI;}
-  return a - M_PI;
-}
 
 VelocityCommand RouteController::compute(
   const Eigen::Vector3d & position, double yaw,
@@ -27,7 +22,7 @@ VelocityCommand RouteController::compute(
   }
   cmd.velocity.z() = std::clamp(p_.kp_z * (target.z() - position.z()),
       -p_.max_speed_z, p_.max_speed_z);
-  cmd.yaw_rate = std::clamp(p_.kp_yaw * wrap_angle(yaw_ref - yaw),
+  cmd.yaw_rate = std::clamp(p_.kp_yaw * angles::shortest_angular_distance(yaw, yaw_ref),
       -p_.max_yaw_rate, p_.max_yaw_rate);
   return cmd;
 }

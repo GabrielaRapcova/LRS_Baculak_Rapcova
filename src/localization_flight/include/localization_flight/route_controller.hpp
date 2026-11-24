@@ -6,6 +6,7 @@
 // origin, and advances when the estimate is within the acceptance radius.
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <utility>
 #include <string>
@@ -15,8 +16,6 @@
 
 namespace localization_flight
 {
-
-double wrap_angle(double a);
 
 struct ControllerParams
 {
@@ -74,10 +73,12 @@ public:
   bool update(const Eigen::Vector3d & position);
 
   bool done() const {return index_ >= route_.size();}
-  std::size_t index() const {return index_;}
+  std::size_t index() const {return index_;}  // number of waypoints reached
   std::size_t size() const {return route_.size();}
-  const Waypoint & current() const {return route_[index_ < route_.size() ? index_ : route_.size() - 1];}
-  const std::vector<Waypoint> & route() const {return route_;}
+  // Waypoint being flown to (the last one once the mission is done).
+  const Waypoint & current() const {return route_[std::min(index_, route_.size() - 1)];}
+  // Waypoint reached most recently (requires index() > 0).
+  const Waypoint & previous() const {return route_[index_ - 1];}
 
 private:
   std::vector<Waypoint> route_;

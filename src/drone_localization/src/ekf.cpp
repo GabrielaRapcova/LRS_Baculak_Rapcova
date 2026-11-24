@@ -3,82 +3,124 @@
 #include <algorithm>
 #include <cmath>
 
+#include <angles/angles.h>
+
 namespace drone_localization
 {
 
-double wrap_angle(double a)
+Ekf::Ekf(const ProcessNoise & noise)
+: noise_(noise)
 {
-  a = std::fmod(a + M_PI, 2.0 * M_PI);
-  if (a < 0.0) {a += 2.0 * M_PI;}
-  return a - M_PI;
 }
 
-Ekf::Ekf(const ProcessNoise & noise)
-: noise_(noise) {}
-
-void Ekf::initialize(double t, const StateVec & x0, const StateMat & P0)
+void Ekf::initialize(double time, const StateVector & x0, const StateMatrix & P0)
 {
-  t_ = t;
+  time_ = time;
   x_ = x0;
-  x_(YAW) = wrap_angle(x_(YAW));
-  P_ = P0;
-  enforce_symmetry();
+  x_(YAW) = angles::normalize_angle(x_(YAW));
+  P_ = 0.5 * (P0 + P0.transpose());
   initialized_ = true;
 }
 
-bool Ekf::predict(double t, double gyro_z)
+bool Ekf::predict(double time, double gyro_z)
 {
-  const double dt = t - t_;
-  if (!initialized_ || !(dt > 0.0) || !std::isfinite(gyro_z)) {return false;}
-  const StateVec x_prev = x_;
+  const double dt = time - time_;
+  if (!initialized_ || !(dt > 0.0) || !std::isfinite(gyro_z)) {
+    return false;
+  }
 
-  // State transition.
-  x_.segment<3>(PX) += x_.segment<3>(VX) * dt;
-  x_(YAW) = wrap_angle(x_(YAW) + (gyro_z - x_(BIAS)) * dt);
+  StateVector x = x_;
+  x.segment<3>(PX) += x.segment<3>(VX) * dt;
+  x(YAW) = angles::normalize_angle(x(YAW) + (gyro_z - x(BIAS)) * dt);
 
-  // Jacobian F.
-  StateMat F = StateMat::Identity();
+  // Jacobian of the process model.
+  StateMatrix F = StateMatrix::Identity();
   F.block<3, 3>(PX, VX) = Eigen::Matrix3d::Identity() * dt;
   F(YAW, BIAS) = -dt;
 
-  // Discrete process noise.
-  StateMat Q = StateMat::Zero();
-  const double dt2 = dt * dt;
-  const double dt3 = dt2 * dt;
+  // Discrete process noise: white acceleration per axis, gyro noise into yaw,
+  // random walk into the bias.
+  StateMatrix Q = StateMatrix::Zero();
   for (int axis = 0; axis < 3; ++axis) {
-    const double q = axis < 2 ? noise_.accel_xy : noise_.accel_z;
-    Q(PX + axis, PX + axis) = q * dt3 / 3.0;
-    Q(PX + axis, VX + axis) = q * dt2 / 2.0;
-    Q(VX + axis, PX + axis) = q * dt2 / 2.0;
-    Q(VX + axis, VX + axis) = q * dt;
+    const double q = (axis < 2) ? noise_.accel_xy : noise_.accel_z;
+    const int p = PX + axis;
+    const int v = VX + axis;
+    Q(p, p) = q * dt * dt * dt / 3.0;
+    Q(p, v) = q * dt * dt / 2.0;
+    Q(v, p) = q * dt * dt / 2.0;
+    Q(v, v) = q * dt;
   }
-  // Gyro white noise: per-sample sigma at gyro_rate -> spectral density
-  // sigma^2 / rate, integrated into yaw over dt.
   Q(YAW, YAW) = noise_.gyro_noise * noise_.gyro_noise / noise_.gyro_rate * dt;
   Q(BIAS, BIAS) = noise_.bias_walk * noise_.bias_walk * dt;
 
-  const StateMat P_new = F * P_ * F.transpose() + Q;
-  if (!x_.allFinite() || !P_new.allFinite()) {
-    x_ = x_prev;  // never let NaN/Inf into the filter
+  StateMatrix P = F * P_ * F.transpose() + Q;
+  P = 0.5 * (P + P.transpose());
+  if (!x.allFinite() || !P.allFinite()) {
     return false;
   }
-  P_ = P_new;
-  enforce_symmetry();
-  t_ = t;
+  x_ = x;
+  P_ = P;
+  time_ = time;
   return true;
 }
 
-UpdateResult Ekf::update_position(
-  const Eigen::Vector3d & z, const Eigen::Matrix3d & R, double gate_chi2)
+UpdateResult Ekf::update(
+  const Eigen::VectorXd & innovation, const Eigen::MatrixXd & H,
+  const Eigen::MatrixXd & R, double gate_chi2)
 {
-  Eigen::Matrix<double, 3, kStateDim> H = Eigen::Matrix<double, 3, kStateDim>::Zero();
+  UpdateResult result;
+  const Eigen::MatrixXd S = H * P_ * H.transpose() + R;
+  const Eigen::LDLT<Eigen::MatrixXd> S_ldlt(S);
+  if (!innovation.allFinite() || !S.allFinite() ||
+    S_ldlt.info() != Eigen::Success || !S_ldlt.isPositive())
+  {
+    result.numerical_failure = true;
+    return result;
+  }
+
+  result.nis = innovation.dot(S_ldlt.solve(innovation));
+  if (result.nis > gate_chi2) {
+    return result;
+  }
+
+  // Kalman gain K = P H' S^-1, computed as (S^-1 H P)' because S and P are symmetric.
+  const Eigen::MatrixXd K = S_ldlt.solve(H * P_).transpose();
+  StateVector x = x_ + K * innovation;
+  x(YAW) = angles::normalize_angle(x(YAW));
+
+  // Joseph form keeps P symmetric and positive semi-definite.
+  const StateMatrix I_KH = StateMatrix::Identity() - K * H;
+  StateMatrix P = I_KH * P_ * I_KH.transpose() + K * R * K.transpose();
+  P = 0.5 * (P + P.transpose());
+
+  if (!x.allFinite() || !P.allFinite()) {
+    result.numerical_failure = true;
+    return result;
+  }
+  x_ = x;
+  P_ = P;
+  result.accepted = true;
+  return result;
+}
+
+UpdateResult Ekf::update_position(
+  const Eigen::Vector3d & position, const Eigen::Matrix3d & R, double gate_chi2)
+{
+  Eigen::MatrixXd H = Eigen::MatrixXd::Zero(3, kStateSize);
   H.block<3, 3>(0, PX) = Eigen::Matrix3d::Identity();
-  const Eigen::Vector3d innovation = z - x_.segment<3>(PX);
-  return update<3>(innovation, H, R, gate_chi2);
+  return update(position - x_.segment<3>(PX), H, R, gate_chi2);
+}
+
+UpdateResult Ekf::update_velocity(
+  const Eigen::Vector3d & velocity, const Eigen::Matrix3d & R, double gate_chi2)
+{
+  Eigen::MatrixXd H = Eigen::MatrixXd::Zero(3, kStateSize);
+  H.block<3, 3>(0, VX) = Eigen::Matrix3d::Identity();
+  return update(velocity - x_.segment<3>(VX), H, R, gate_chi2);
 }
 
 Eigen::Vector3d Ekf::body_velocity_model(
-  const StateVec & x, Eigen::Matrix<double, 3, kStateDim> * H)
+  const StateVector & x, Eigen::Matrix<double, 3, kStateSize> * H)
 {
   const double c = std::cos(x(YAW));
   const double s = std::sin(x(YAW));
@@ -88,53 +130,37 @@ Eigen::Vector3d Ekf::body_velocity_model(
     H->setZero();
     (*H)(0, VX) = c;
     (*H)(0, VY) = s;
+    (*H)(0, YAW) = -s * vx + c * vy;
     (*H)(1, VX) = -s;
     (*H)(1, VY) = c;
+    (*H)(1, YAW) = -c * vx - s * vy;
     (*H)(2, VZ) = 1.0;
-    (*H)(0, YAW) = -s * vx + c * vy;   // d h0 / d yaw
-    (*H)(1, YAW) = -c * vx - s * vy;   // d h1 / d yaw
   }
-  // World velocity rotated into the yaw-only body frame (roll/pitch ignored).
   return Eigen::Vector3d(c * vx + s * vy, -s * vx + c * vy, x(VZ));
 }
 
 UpdateResult Ekf::update_body_velocity(
-  const Eigen::Vector3d & z, const Eigen::Matrix3d & R, double gate_chi2)
+  const Eigen::Vector3d & body_velocity, const Eigen::Matrix3d & R, double gate_chi2)
 {
-  Eigen::Matrix<double, 3, kStateDim> H;
-  const Eigen::Vector3d h = body_velocity_model(x_, &H);
-  return update<3>(z - h, H, R, gate_chi2);
+  Eigen::Matrix<double, 3, kStateSize> H;
+  const Eigen::Vector3d predicted = body_velocity_model(x_, &H);
+  return update(body_velocity - predicted, H, R, gate_chi2);
 }
 
-UpdateResult Ekf::update_yaw(double z, double variance, double gate_chi2)
+UpdateResult Ekf::update_bias(double bias, double variance, double gate_chi2)
 {
-  Eigen::Matrix<double, 1, kStateDim> H = Eigen::Matrix<double, 1, kStateDim>::Zero();
-  H(0, YAW) = 1.0;
-  Eigen::Matrix<double, 1, 1> y(z - x_(YAW));
-  Eigen::Matrix<double, 1, 1> R(variance);
-  Eigen::Matrix<bool, 1, 1> angle(true);
-  return update<1>(y, H, R, gate_chi2, angle);
-}
-
-UpdateResult Ekf::update_bias(double z, double variance, double gate_chi2)
-{
-  Eigen::Matrix<double, 1, kStateDim> H = Eigen::Matrix<double, 1, kStateDim>::Zero();
+  Eigen::MatrixXd H = Eigen::MatrixXd::Zero(1, kStateSize);
   H(0, BIAS) = 1.0;
-  Eigen::Matrix<double, 1, 1> y(z - x_(BIAS));
-  Eigen::Matrix<double, 1, 1> R(variance);
-  return update<1>(y, H, R, gate_chi2);
+  const Eigen::VectorXd innovation = Eigen::VectorXd::Constant(1, bias - x_(BIAS));
+  const Eigen::MatrixXd R = Eigen::MatrixXd::Constant(1, 1, variance);
+  return update(innovation, H, R, gate_chi2);
 }
 
-void Ekf::inflate(int index, int size, double variance)
+void Ekf::inflate_position_variance(const Eigen::Vector3d & variance)
 {
-  for (int i = index; i < index + size; ++i) {
-    P_(i, i) = std::max(P_(i, i), variance);
+  for (int axis = 0; axis < 3; ++axis) {
+    P_(PX + axis, PX + axis) = std::max(P_(PX + axis, PX + axis), variance(axis));
   }
-}
-
-void Ekf::enforce_symmetry()
-{
-  P_ = 0.5 * (P_ + P_.transpose());
 }
 
 }  // namespace drone_localization
